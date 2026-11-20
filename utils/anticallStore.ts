@@ -1,6 +1,12 @@
-import fs from 'fs';
 import path from 'path';
-import { loadConfig, normalizePhone } from '../config/bot.config.ts';
+import { normalizePhone } from '../config/bot.config.ts';
+import {
+  dbGetSync,
+  dbSetSync,
+  migrateLegacyJsonIfMissing,
+  registerDbHydrationHook,
+  resolveDataDir,
+} from './db.ts';
 import { jidUserPart, normalizeBareJid } from './jidHelper.ts';
 
 export interface BlockedCallerEntry {
@@ -10,35 +16,30 @@ export interface BlockedCallerEntry {
   addedAt: string;
 }
 
-const dbDir = loadConfig().databaseDir;
-const anticallFile = path.join(dbDir, 'anticall.json');
+const anticallFile = path.join(resolveDataDir(), 'anticall.json');
 
 let cache: BlockedCallerEntry[] | null = null;
+registerDbHydrationHook(() => {
+  cache = null;
+});
 
 function readEntries(): BlockedCallerEntry[] {
-  if (cache && fs.existsSync(anticallFile)) {
+  if (cache) return cache;
+  const fromDb =
+    dbGetSync<BlockedCallerEntry[]>('anticall') ??
+    migrateLegacyJsonIfMissing<BlockedCallerEntry[]>('anticall', anticallFile);
+  if (Array.isArray(fromDb)) {
+    cache = fromDb;
     return cache;
   }
-  fs.mkdirSync(path.dirname(anticallFile), { recursive: true });
-  if (!fs.existsSync(anticallFile)) {
-    fs.writeFileSync(anticallFile, JSON.stringify([], null, 2), 'utf-8');
-    cache = [];
-    return cache;
-  }
-  try {
-    const parsed = JSON.parse(fs.readFileSync(anticallFile, 'utf-8')) as BlockedCallerEntry[];
-    cache = Array.isArray(parsed) ? parsed : [];
-    return cache;
-  } catch {
-    cache = [];
-    return cache;
-  }
+  cache = [];
+  dbSetSync('anticall', cache);
+  return cache;
 }
 
 function writeEntries(entries: BlockedCallerEntry[]): void {
   cache = entries;
-  fs.mkdirSync(path.dirname(anticallFile), { recursive: true });
-  fs.writeFileSync(anticallFile, JSON.stringify(entries, null, 2), 'utf-8');
+  dbSetSync('anticall', entries);
 }
 
 function entryMatchesCandidate(entry: BlockedCallerEntry, rawCandidate: string): boolean {

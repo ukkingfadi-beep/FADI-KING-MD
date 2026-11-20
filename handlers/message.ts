@@ -6,7 +6,7 @@ import { extractBodyText, resolveSenderInfo } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { commandRateLimiter, getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { vipStore } from '../utils/vipStore.ts';
-import { enforceAntilink, handleAntidelete } from './group.ts';
+import { enforceAntilink, enforceAntiScam, handleAntidelete } from './group.ts';
 
 const processedMsgIds = new Set<string>();
 
@@ -65,6 +65,20 @@ export async function handleIncomingMessage(
     const isVip = isOwner || vipStore.isVip(senderNumber);
 
     const body = extractBodyText(msg.message).trim();
+
+    // Enforce group Anti-Scam (stickers, profanity, scam, flood) BEFORE empty-body exit
+    if (isGroup) {
+      const scamBlocked = await enforceAntiScam(
+        sock,
+        msg,
+        body,
+        chatId,
+        senderCandidates,
+        isOwner
+      );
+      if (scamBlocked) return;
+    }
+
     if (!body) return;
 
     // Enforce group antilink before command parsing

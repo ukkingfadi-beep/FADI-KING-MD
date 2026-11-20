@@ -1,6 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+import {
+  dbGetSync,
+  dbSetSync,
+  migrateLegacyJsonIfMissing,
+  registerDbHydrationHook,
+  resolveDataDir,
+} from '../utils/db.ts';
 
 dotenv.config();
 
@@ -36,14 +43,15 @@ export interface BotConfig {
   autoJoinChannelInvite: string;
   sendConnectSelfMessage: boolean;
   anticallGlobal: boolean;
+  antiScamGlobal: boolean;
+  antiScamBlockAllStickers: boolean;
   stickerPack: string;
   stickerAuthor: string;
   sessionDir: string;
   databaseDir: string;
 }
 
-const rootDir = process.cwd();
-const databaseDir = path.resolve(rootDir, 'database');
+const databaseDir = resolveDataDir();
 const settingsFile = path.join(databaseDir, 'settings.json');
 
 export function normalizePhone(input: string): string {
@@ -86,9 +94,13 @@ const defaultConfig: BotConfig = {
   autoJoinChannelInvite: process.env.AUTO_JOIN_CHANNEL_INVITE || '',
   sendConnectSelfMessage: process.env.SEND_CONNECT_SELF_MESSAGE !== 'false',
   anticallGlobal: process.env.ANTICALL_GLOBAL === 'true',
+  antiScamGlobal: process.env.ANTI_SCAM_GLOBAL === 'true',
+  antiScamBlockAllStickers: process.env.ANTI_SCAM_BLOCK_ALL_STICKERS === 'true',
   stickerPack: process.env.STICKER_PACK || 'FADI KING MD',
   stickerAuthor: process.env.STICKER_AUTHOR || 'VIP BOT',
-  sessionDir: path.resolve(rootDir, process.env.SESSION_DIR || 'database/sessions'),
+  sessionDir: process.env.SESSION_DIR
+    ? path.resolve(process.cwd(), process.env.SESSION_DIR)
+    : path.join(databaseDir, 'sessions'),
   databaseDir,
 };
 
@@ -98,25 +110,29 @@ function ensureDirectories(): void {
 }
 
 let cachedConfig: BotConfig | null = null;
+registerDbHydrationHook(() => {
+  cachedConfig = null;
+});
 
 export function loadConfig(): BotConfig {
-  if (cachedConfig && fs.existsSync(settingsFile)) return cachedConfig;
+  if (cachedConfig) return cachedConfig;
   ensureDirectories();
   try {
-    if (fs.existsSync(settingsFile)) {
-      const raw = fs.readFileSync(settingsFile, 'utf-8');
-      const saved = JSON.parse(raw) as Partial<BotConfig>;
+    const fromDb =
+      dbGetSync<Partial<BotConfig>>('settings') ||
+      migrateLegacyJsonIfMissing<Partial<BotConfig>>('settings', settingsFile);
+    if (fromDb) {
       cachedConfig = {
         ...defaultConfig,
-        ...saved,
-        ownerNumber: normalizePhone(saved.ownerNumber || defaultConfig.ownerNumber),
+        ...fromDb,
+        ownerNumber: normalizePhone(fromDb.ownerNumber || defaultConfig.ownerNumber),
         sessionDir: defaultConfig.sessionDir,
         databaseDir: defaultConfig.databaseDir,
       };
       return cachedConfig;
     }
   } catch {
-    // Fallback to defaults if settings file is corrupted
+    // Fallback to defaults if DB/settings is unreadable
   }
   cachedConfig = { ...defaultConfig };
   saveConfig(cachedConfig);
@@ -125,7 +141,7 @@ export function loadConfig(): BotConfig {
 
 export function saveConfig(partial: Partial<BotConfig>): BotConfig {
   ensureDirectories();
-  const current = cachedConfig || { ...defaultConfig };
+  const current = cachedConfig || loadConfig();
   const minBroadcast = Math.max(
     1000,
     Math.min(20000, Number(partial.broadcastDelayMinMs ?? partial.broadcastDelayMs ?? current.broadcastDelayMinMs))
@@ -200,6 +216,14 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof partial.anticallGlobal === 'boolean'
         ? partial.anticallGlobal
         : current.anticallGlobal,
+    antiScamGlobal:
+      typeof partial.antiScamGlobal === 'boolean'
+        ? partial.antiScamGlobal
+        : current.antiScamGlobal,
+    antiScamBlockAllStickers:
+      typeof partial.antiScamBlockAllStickers === 'boolean'
+        ? partial.antiScamBlockAllStickers
+        : current.antiScamBlockAllStickers,
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };
@@ -234,9 +258,14 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     autoJoinChannelInvite: next.autoJoinChannelInvite,
     sendConnectSelfMessage: next.sendConnectSelfMessage,
     anticallGlobal: next.anticallGlobal,
+    antiScamGlobal: next.antiScamGlobal,
+    antiScamBlockAllStickers: next.antiScamBlockAllStickers,
     stickerPack: next.stickerPack,
     stickerAuthor: next.stickerAuthor,
   };
-  fs.writeFileSync(settingsFile, JSON.stringify(persistable, null, 2), 'utf-8');
+  dbSetSync('settings', persistable);
+  void fs.promises
+    .writeFile(settingsFile, JSON.stringify(persistable, null, 2), 'utf-8')
+    .catch(() => {});
   return next;
 }

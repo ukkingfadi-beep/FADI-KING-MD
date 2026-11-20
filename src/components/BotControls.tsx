@@ -40,6 +40,8 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
     autoJoinChannelInvite: '',
     sendConnectSelfMessage: true,
     anticallGlobal: false,
+    antiScamGlobal: false,
+    antiScamBlockAllStickers: false,
     stickerPack: 'FADI KING MD',
     stickerAuthor: 'VIP BOT',
   });
@@ -96,7 +98,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
       });
       const data = await res.json();
       if (data.ok) {
-        setSaveFeedback('Configuration persisted to database/settings.json.');
+        setSaveFeedback('Configuration saved to persistent database (survives restarts & redeploys).');
         await onRefresh();
       }
     } finally {
@@ -142,7 +144,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
 
   async function toggleGroupSetting(
     groupId: string,
-    field: 'welcome' | 'goodbye',
+    field: 'welcome' | 'goodbye' | 'antiScam',
     value: boolean
   ) {
     await fetch(`/api/groups/${encodeURIComponent(groupId)}`, {
@@ -167,7 +169,13 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
         'Content-Type': 'application/json',
         Authorization: `Bearer ${adminToken}`,
       },
-      body: JSON.stringify({ antilink: true, antilinkMode: 'warn', welcome: true, goodbye: false }),
+      body: JSON.stringify({
+        antilink: true,
+        antilinkMode: 'warn',
+        antiScam: true,
+        welcome: true,
+        goodbye: false,
+      }),
     });
     setNewGroupId('');
     await onRefresh();
@@ -582,6 +590,26 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 />
                 Auto-Recording Presence
               </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.antiScamGlobal}
+                  onChange={(e) => setForm({ ...form, antiScamGlobal: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Global Anti-Scam Shield (Stickers, Gaaliyan & Spam)
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.antiScamBlockAllStickers}
+                  onChange={(e) => setForm({ ...form, antiScamBlockAllStickers: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Strict Mode: Delete Non-Admin Stickers
+              </label>
             </div>
 
             <button
@@ -660,6 +688,24 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                         <option value="warn">Antilink: 3-Warn Auto-Kick</option>
                         <option value="kick">Antilink: Instant Kick</option>
                       </select>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          toggleGroupSetting(
+                            g.groupId,
+                            'antiScam',
+                            !(g.antiScam ?? form.antiScamGlobal)
+                          )
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                          (g.antiScam ?? form.antiScamGlobal)
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-white/[0.06] text-[#9E97C2]'
+                        }`}
+                      >
+                        Anti-Scam: {(g.antiScam ?? form.antiScamGlobal) ? 'On' : 'Off'}
+                      </button>
 
                       {(['welcome', 'goodbye'] as const).map((field) => (
                         <button

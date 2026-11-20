@@ -83,6 +83,8 @@ export interface BotConfigView {
   autoJoinChannelInvite: string;
   sendConnectSelfMessage: boolean;
   anticallGlobal: boolean;
+  antiScamGlobal: boolean;
+  antiScamBlockAllStickers: boolean;
   stickerPack: string;
   stickerAuthor: string;
 }
@@ -176,6 +178,7 @@ export interface GroupConfig {
   groupId: string;
   antilink: boolean;
   antilinkMode?: AntilinkMode;
+  antiScam?: boolean;
   welcome: boolean;
   goodbye: boolean;
 }

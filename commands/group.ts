@@ -6,7 +6,8 @@ import {
   type GroupParticipant,
   type WAMessage,
 } from '@whiskeysockets/baileys';
-import { isValidPhone, loadConfig, normalizePhone } from '../config/bot.config.ts';
+import { isValidPhone, loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
+import { normalizeFileSha256 } from '../handlers/group.ts';
 import {
   extractFirstUrl,
   extractRawTargetCandidates,
@@ -624,6 +625,178 @@ export const groupCommands: BotCommand[] = [
     },
   },
   {
+    name: 'antiscam',
+    aliases: ['antispam', 'antigaali', 'antigali'],
+    category: 'group',
+    description: 'Ghatiya stickers, gaaliyan, scam aur spam messages delete kare (ON/OFF + Global/Strict)',
+    usage: 'antiscam <on|off|global on|global off|strict on|strict off>',
+    execute: async (ctx) => {
+      const sub = ctx.args[0]?.toLowerCase();
+      const val = ctx.args[1]?.toLowerCase();
+
+      if (sub === 'global') {
+        if (!ctx.isOwner) {
+          const msg = 'Only Bot Owner can change Global Anti-Scam mode.';
+          await ctx.reply(msg);
+          return msg;
+        }
+        if (val !== 'on' && val !== 'off') {
+          const current = loadConfig().antiScamGlobal;
+          const msg = `Global Anti-Scam Shield is currently *${current ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}antiscam global on\` or \`off\``;
+          await ctx.reply(msg);
+          return msg;
+        }
+        saveConfig({ antiScamGlobal: val === 'on' });
+        const msg = `Global Anti-Scam Shield turned *${val.toUpperCase()}* across default groups (saved in database).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (sub === 'strict') {
+        if (!ctx.isOwner) {
+          const msg = 'Only Bot Owner can change Strict Sticker Anti-Scam mode.';
+          await ctx.reply(msg);
+          return msg;
+        }
+        if (val !== 'on' && val !== 'off') {
+          const current = loadConfig().antiScamBlockAllStickers;
+          const msg = `Strict Sticker Blocker is currently *${current ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}antiscam strict on\` or \`off\``;
+          await ctx.reply(msg);
+          return msg;
+        }
+        saveConfig({ antiScamBlockAllStickers: val === 'on' });
+        const msg = `Strict Anti-Scam Sticker Blocker turned *${val.toUpperCase()}* (deletes all non-admin stickers when Anti-Scam is ON).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.isGroup && !ctx.isSimulated) {
+        const msg = [
+          `*Anti-Scam Shield Commands*`,
+          `• In a group: \`${ctx.prefix}antiscam on\` / \`off\``,
+          `• Global default: \`${ctx.prefix}antiscam global on\` / \`off\``,
+          `• Block all non-admin stickers: \`${ctx.prefix}antiscam strict on\` / \`off\``,
+          `• Ban a vulgar sticker: reply to it with \`${ctx.prefix}bansticker\``,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (sub !== 'on' && sub !== 'off') {
+        const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+        const cfg = loadConfig();
+        const msg = [
+          `*Group Anti-Scam Shield:* *${groupCfg.antiScam ? 'ON' : 'OFF'}*`,
+          `• Global Default: *${cfg.antiScamGlobal ? 'ON' : 'OFF'}*`,
+          `• Strict Sticker Mode: *${cfg.antiScamBlockAllStickers ? 'ON' : 'OFF'}*`,
+          `• Banned Stickers Saved: *${vipStore.listBannedStickers().length}*`,
+          ``,
+          `Usage: \`${ctx.prefix}antiscam on\` / \`off\` | \`${ctx.prefix}antiscam global on\` | \`${ctx.prefix}bansticker\``,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let botAdminNote = '';
+      if (!ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          await ctx.reply(check.reason!);
+          return check.reason!;
+        }
+        if (sub === 'on' && !check.botIsAdmin) {
+          botAdminNote = '\n_Note: Promote the bot to Group Admin so it can delete bad stickers, gaaliyan & spam._';
+        }
+      }
+
+      vipStore.updateGroupConfig(ctx.chatId, { antiScam: sub === 'on' });
+      const msg =
+        sub === 'on'
+          ? `Group *Anti-Scam Shield* turned *ON* (Bad stickers, gaaliyan, scams & spam will be auto-deleted; 3 warnings = auto-kick).${botAdminNote}`
+          : 'Group *Anti-Scam Shield* turned *OFF*.';
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'bansticker',
+    aliases: ['blocksticker', 'unbansticker'],
+    category: 'group',
+    description: 'Kisi ghatiya sticker par reply karke usay database mein ban/unban kare',
+    usage: 'bansticker [list|unban]',
+    execute: async (ctx) => {
+      if (ctx.args[0]?.toLowerCase() === 'list') {
+        const count = vipStore.listBannedStickers().length;
+        const msg = `Total banned stickers in database: *${count}*`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (ctx.isGroup && !ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          await ctx.reply(check.reason!);
+          return check.reason!;
+        }
+      } else if (!ctx.isOwner) {
+        const msg = 'Only Bot Owner or Group Admins can ban stickers.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.msg || ctx.isSimulated) {
+        const msg = `Reply to any bad sticker with \`${ctx.prefix}bansticker\` to block it in all Anti-Scam groups.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const quoted = extractQuotedMessage(ctx.msg);
+      const sticker = quoted?.stickerMessage;
+      if (!sticker) {
+        const msg = `Reply to a sticker with \`${ctx.prefix}bansticker\` (or \`${ctx.prefix}unbansticker\` to remove).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const sha = normalizeFileSha256(sticker.fileSha256);
+      if (!sha) {
+        const msg = 'Could not read sticker hash. Try replying to a freshly sent sticker.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (ctx.commandName === 'unbansticker' || ctx.args[0]?.toLowerCase() === 'off' || ctx.args[0]?.toLowerCase() === 'unban') {
+        const removed = vipStore.unbanSticker(sha);
+        const msg = removed
+          ? 'Sticker removed from the banned list.'
+          : 'This sticker was not in the banned list.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      vipStore.banSticker(sha, ctx.text || 'Banned by Admin');
+      if (ctx.isGroup && ctx.sock) {
+        const ctxInfo = ctx.msg.message?.extendedTextMessage?.contextInfo;
+        if (ctxInfo?.stanzaId) {
+          await ctx.sock
+            .sendMessage(ctx.chatId, {
+              delete: {
+                remoteJid: ctx.chatId,
+                fromMe: false,
+                id: ctxInfo.stanzaId,
+                participant: ctxInfo.participant || undefined,
+              },
+            })
+            .catch(() => {});
+        }
+      }
+
+      const msg = 'Sticker banned in persistent database! Any member sending it in Anti-Scam groups will have it deleted.';
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
     name: 'antidelete',
     category: 'group',
     description: 'Deleted group messages ko auto-recover kare',
@@ -1015,6 +1188,7 @@ export const groupCommands: BotCommand[] = [
         `• JID: \`${meta.id}\``,
         `• Members: ${meta.participants.length} (${admins.length} Admins)`,
         `• Antilink: ${antilinkLabel}`,
+        `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'}`,
         `• Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
         `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
         ...(meta.desc ? ['', `*Description:*\n${meta.desc.slice(0, 300)}`] : []),

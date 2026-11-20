@@ -1,6 +1,12 @@
 import fs from 'fs';
 import path from 'path';
-import { loadConfig } from '../config/bot.config.ts';
+import {
+  dbGetSync,
+  dbSetSync,
+  migrateLegacyJsonIfMissing,
+  registerDbHydrationHook,
+  resolveDataDir,
+} from './db.ts';
 
 export type LiveMediaType = 'none' | 'image' | 'video';
 export type AlertLevel = 'info' | 'important' | 'urgent';
@@ -22,7 +28,7 @@ export interface AdminAlert {
   createdAt: string;
 }
 
-const dbDir = loadConfig().databaseDir;
+const dbDir = resolveDataDir();
 const mediaDir = path.join(dbDir, 'media');
 const liveScreenFile = path.join(dbDir, 'live_screen.json');
 const alertsFile = path.join(dbDir, 'notifications.json');
@@ -40,17 +46,16 @@ let storageInitialized = false;
 let liveScreenCache: LiveScreenState | null = null;
 let alertsCache: AdminAlert[] | null = null;
 
+registerDbHydrationHook(() => {
+  liveScreenCache = null;
+  alertsCache = null;
+});
+
 function ensureStorage(): void {
   if (storageInitialized) return;
   fs.mkdirSync(dbDir, { recursive: true });
   fs.mkdirSync(mediaDir, { recursive: true });
   storageInitialized = true;
-}
-
-function scheduleJsonWrite(filePath: string, payload: unknown): void {
-  ensureStorage();
-  const content = JSON.stringify(payload, null, 2);
-  void fs.promises.writeFile(filePath, content, 'utf-8').catch(() => {});
 }
 
 export const liveStore = {
@@ -62,18 +67,16 @@ export const liveStore = {
   getLiveScreen(): LiveScreenState {
     if (liveScreenCache) return liveScreenCache;
     ensureStorage();
-    if (!fs.existsSync(liveScreenFile)) {
-      liveScreenCache = { ...defaultLiveScreen };
-      scheduleJsonWrite(liveScreenFile, liveScreenCache);
+    const fromDb =
+      dbGetSync<LiveScreenState>('live_screen') ??
+      migrateLegacyJsonIfMissing<LiveScreenState>('live_screen', liveScreenFile);
+    if (fromDb) {
+      liveScreenCache = fromDb;
       return liveScreenCache;
     }
-    try {
-      liveScreenCache = JSON.parse(fs.readFileSync(liveScreenFile, 'utf-8')) as LiveScreenState;
-      return liveScreenCache;
-    } catch {
-      liveScreenCache = { ...defaultLiveScreen };
-      return liveScreenCache;
-    }
+    liveScreenCache = { ...defaultLiveScreen };
+    dbSetSync('live_screen', liveScreenCache);
+    return liveScreenCache;
   },
 
   updateLiveScreen(patch: Partial<LiveScreenState>): LiveScreenState {
@@ -93,25 +96,23 @@ export const liveStore = {
       updatedAt: new Date().toISOString(),
     };
     liveScreenCache = next;
-    scheduleJsonWrite(liveScreenFile, next);
+    dbSetSync('live_screen', next);
     return next;
   },
 
   getAlerts(limit = 30): AdminAlert[] {
     if (alertsCache) return alertsCache.slice(0, limit);
     ensureStorage();
-    if (!fs.existsSync(alertsFile)) {
-      alertsCache = [];
-      scheduleJsonWrite(alertsFile, alertsCache);
-      return [];
-    }
-    try {
-      alertsCache = JSON.parse(fs.readFileSync(alertsFile, 'utf-8')) as AdminAlert[];
+    const fromDb =
+      dbGetSync<AdminAlert[]>('alerts') ??
+      migrateLegacyJsonIfMissing<AdminAlert[]>('alerts', alertsFile);
+    if (Array.isArray(fromDb)) {
+      alertsCache = fromDb;
       return alertsCache.slice(0, limit);
-    } catch {
-      alertsCache = [];
-      return [];
     }
+    alertsCache = [];
+    dbSetSync('alerts', alertsCache);
+    return [];
   },
 
   addAlert(input: { title: string; message: string; level?: AlertLevel }): AdminAlert {
@@ -128,7 +129,7 @@ export const liveStore = {
     list.unshift(created);
     if (list.length > 50) list.length = 50;
     alertsCache = list;
-    scheduleJsonWrite(alertsFile, list);
+    dbSetSync('alerts', list);
     return created;
   },
 
@@ -136,13 +137,13 @@ export const liveStore = {
     ensureStorage();
     const list = this.getAlerts(100).filter((a) => a.id !== id);
     alertsCache = list;
-    scheduleJsonWrite(alertsFile, list);
+    dbSetSync('alerts', list);
   },
 
   clearAlerts(): void {
     ensureStorage();
     alertsCache = [];
-    scheduleJsonWrite(alertsFile, []);
+    dbSetSync('alerts', []);
   },
 
   saveUploadedMedia(base64Data: string, mimeType: string): { filename: string; url: string } {

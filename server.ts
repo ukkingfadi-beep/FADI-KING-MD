@@ -25,6 +25,7 @@ import {
 } from './utils/adminAuth.ts';
 import { liveStore, type AlertLevel } from './utils/liveStore.ts';
 import { anticallStore } from './utils/anticallStore.ts';
+import { initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
 import { pairingRateLimiter } from './utils/rateLimiter.ts';
 import { vipStore, type VipTier } from './utils/vipStore.ts';
@@ -59,6 +60,7 @@ const SOURCE_FILES = [
   'utils/adminAuth.ts',
   'utils/liveStore.ts',
   'utils/anticallStore.ts',
+  'utils/db.ts',
   'server.ts',
   '.env.example',
   'package.json',
@@ -66,6 +68,7 @@ const SOURCE_FILES = [
 ];
 
 async function startServer(): Promise<void> {
+  await initDatabase();
   const app = express();
   const envPort = Number(process.env.PORT || 0);
   const nginxPort = Number(process.env.NGINX_PORT || 0);
@@ -390,6 +393,8 @@ async function startServer(): Promise<void> {
         autoJoinChannelInvite: cfg.autoJoinChannelInvite,
         sendConnectSelfMessage: cfg.sendConnectSelfMessage,
         anticallGlobal: cfg.anticallGlobal,
+        antiScamGlobal: cfg.antiScamGlobal,
+        antiScamBlockAllStickers: cfg.antiScamBlockAllStickers,
         stickerPack: cfg.stickerPack,
         stickerAuthor: cfg.stickerAuthor,
       },
@@ -486,6 +491,12 @@ async function startServer(): Promise<void> {
         typeof body.sendConnectSelfMessage === 'boolean' ? body.sendConnectSelfMessage : undefined,
       anticallGlobal:
         typeof body.anticallGlobal === 'boolean' ? body.anticallGlobal : undefined,
+      antiScamGlobal:
+        typeof body.antiScamGlobal === 'boolean' ? body.antiScamGlobal : undefined,
+      antiScamBlockAllStickers:
+        typeof body.antiScamBlockAllStickers === 'boolean'
+          ? body.antiScamBlockAllStickers
+          : undefined,
       stickerPack: typeof body.stickerPack === 'string' ? body.stickerPack : undefined,
       stickerAuthor: typeof body.stickerAuthor === 'string' ? body.stickerAuthor : undefined,
     });
@@ -568,6 +579,7 @@ async function startServer(): Promise<void> {
             ? req.body.antilink
             : undefined,
       antilinkMode,
+      antiScam: typeof req.body?.antiScam === 'boolean' ? req.body.antiScam : undefined,
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });
