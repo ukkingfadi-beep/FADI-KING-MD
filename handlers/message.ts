@@ -2,11 +2,17 @@ import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import { findCommand } from '../commands/index.ts';
 import type { CommandContext } from '../commands/types.ts';
-import { extractBodyText, resolveSenderInfo } from '../utils/jidHelper.ts';
+import { extractBodyText, jidUserPart, resolveSenderInfo } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { commandRateLimiter, getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { vipStore } from '../utils/vipStore.ts';
-import { enforceAntilink, enforceAntiScam, handleAntidelete } from './group.ts';
+import {
+  dispatchOpenGcProtectedPost,
+  enforceAntilink,
+  enforceAntiScam,
+  enforceAntiStatusMention,
+  handleAntidelete,
+} from './group.ts';
 
 const processedMsgIds = new Set<string>();
 
@@ -66,8 +72,18 @@ export async function handleIncomingMessage(
 
     const body = extractBodyText(msg.message).trim();
 
-    // Enforce group Anti-Scam (stickers, profanity, scam, flood) BEFORE empty-body exit
+    // Enforce group Anti-Status-Mention & Anti-Scam BEFORE empty-body exit
     if (isGroup) {
+      const mentionBlocked = await enforceAntiStatusMention(
+        sock,
+        msg,
+        body,
+        chatId,
+        senderCandidates,
+        isOwner
+      );
+      if (mentionBlocked) return;
+
       const scamBlocked = await enforceAntiScam(
         sock,
         msg,
@@ -90,7 +106,30 @@ export async function handleIncomingMessage(
     const activePrefix = cfg.prefix;
     const supportedPrefixes = Array.from(new Set([activePrefix, '.', '/']));
     const matchedPrefix = supportedPrefixes.find((p) => body.startsWith(p));
-    if (!matchedPrefix) return;
+    if (!matchedPrefix) {
+      // If Owner has Auto-IB-Forward enabled and posts a non-command link/text inside the Bot's own IB,
+      // dispatch it automatically to all Open GCs with Anti-Delete Lock!
+      if (!isGroup && isOwner && cfg.autoForwardIbToOpenGcs) {
+        const ownBotPhone = normalizePhone(jidUserPart(sock.user?.id));
+        const chatPhone = normalizePhone(jidUserPart(chatId));
+        const isOwnBotInbox =
+          (ownBotPhone && chatPhone === ownBotPhone) ||
+          (!msg.key.fromMe && senderNumber === normalizePhone(cfg.ownerNumber));
+        if (isOwnBotInbox && !body.startsWith('*Protected Open-GC') && !body.startsWith('Delivered to ')) {
+          const result = await dispatchOpenGcProtectedPost(sock, body);
+          await sock
+            .sendMessage(
+              chatId,
+              {
+                text: `Delivered to *${result.sent}/${result.totalOpen}* Open Group(s) with Anti-Delete Lock.`,
+              },
+              { quoted: msg }
+            )
+            .catch(() => {});
+        }
+      }
+      return;
+    }
 
     // Mode guard: self mode allows only Owner or VIPs
     if (cfg.mode === 'self' && !isOwner && !isVip) return;

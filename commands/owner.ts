@@ -1,12 +1,15 @@
 import { loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
+import { dispatchOpenGcProtectedPost } from '../handlers/group.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
 import {
+  extractBodyText,
   extractRawTargetCandidates,
   isLidUser,
   jidUserPart,
   normalizeBareJid,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { extractQuotedMessage } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import type { BotCommand, CommandContext } from './types.ts';
 
@@ -402,6 +405,68 @@ export const ownerCommands: BotCommand[] = [
       }
       saveConfig({ autoRecording: arg === 'on' });
       const msg = `Auto-Recording turned *${arg.toUpperCase()}*.`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'opengc',
+    aliases: ['ibsend', 'sendopen', 'encrypt', 'locksend', 'autoshare'],
+    category: 'owner',
+    description: 'Link ya text ko sab Open GCs mein bheje (Admin Anti-Delete Lock ke sath)',
+    usage: 'opengc <text / link> (or reply to message)',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const payload = ctx.text.trim() || quotedText;
+
+      if (!payload) {
+        const msg = [
+          `*Protected Open-GC Dispatch*`,
+          `• Send a link/message to ALL Open GCs (auto-reposts if an admin deletes it):`,
+          `  \`${ctx.prefix}opengc https://chat.whatsapp.com/...\``,
+          `• Auto-forward anything you send in your IB: \`${ctx.prefix}ibpost on\``,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated Open-GC Lock] Protected message queued for all Open GCs:\n"${payload}"`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const result = await dispatchOpenGcProtectedPost(ctx.sock, payload);
+      const msg =
+        result.totalOpen === 0
+          ? 'No open WhatsApp groups found right now.'
+          : `Delivered to *${result.sent}/${result.totalOpen}* Open Group(s) with Anti-Delete Lock (auto-restores if deleted).`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'ibpost',
+    aliases: ['ibforward', 'autoopengc'],
+    category: 'owner',
+    description: 'Apni IB mein likha har link/text automatic sab Open GCs mein bhejne ka toggle',
+    usage: 'ibpost <on|off>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const arg = ctx.args[0]?.toLowerCase();
+      const cfg = loadConfig();
+      if (arg !== 'on' && arg !== 'off') {
+        const msg = `Auto IB -> Open-GC Forward is currently *${cfg.autoForwardIbToOpenGcs ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ibpost on\` or \`${ctx.prefix}ibpost off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      saveConfig({ autoForwardIbToOpenGcs: arg === 'on' });
+      const msg =
+        arg === 'on'
+          ? 'Auto IB -> Open-GC Forward turned *ON*! Any link or text you send in your bot IB will automatically go to all Open GCs with Anti-Delete Lock.'
+          : 'Auto IB -> Open-GC Forward turned *OFF*.';
       await ctx.reply(msg);
       return msg;
     },

@@ -1,8 +1,9 @@
-import type { BaileysEventMap, WAMessage, WASocket } from '@whiskeysockets/baileys';
+import { getUrlInfo, type BaileysEventMap, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
 import { loadConfig } from '../config/bot.config.ts';
 import {
   extractBodyText,
   extractContextInfo,
+  extractFirstUrl,
   findParticipant,
   getBotJids,
   getCachedGroupMetadata,
@@ -18,13 +19,13 @@ const LINK_REGEX =
   /(https?:\/\/[^\s]+|www\.[^\s]+|chat\.whatsapp\.com\/[A-Za-z0-9]+|whatsapp\.com\/channel\/[A-Za-z0-9]+|wa\.me\/[0-9]+|t\.me\/[A-Za-z0-9_]+|youtu\.be\/[^\s]+|discord\.gg\/[A-Za-z0-9]+|bit\.ly\/[^\s]+|\b[a-z0-9-]+\.(?:com|net|org|pk|in|io|app|me|xyz|tv|link|gg|co)\/[^\s]*)/i;
 
 const ABUSIVE_WORDS_REGEX =
-  /\b(madarchod|maderchod|bhenchod|behenchod|bhosdike|bhosdi|chutiya|chutiye|harami|haramzada|haramzadi|kamina|kameena|kutti|kutta|kutte|gandu|randi|randwa|lund|lauda|lavda|chodu|chodna|bhadwa|bhadwe|kanjar|tatti|ullu\s+ka\s+pattha|fuck(?:ing|er|ed)?|motherfucker|bitch(?:es)?|asshole|bastard|dickhead|slut|whore|cunt)\b/i;
+  /(?:\b(madarchod|maderchod|madar\s*chod|bhenchod|behenchod|bhosdike|bhosdika|bhosdi|bsdk|bkl|mc|bc|mkc|bhen\s*ke\s*lode|chutiya|chutiye|chutiyapa|chut|choot|harami|haramzada|haramzadi|haramkhor|kamina|kameena|kameene|kutti|kutta|kutte|kamine|gandu|gaand|gand|randi|randwa|randi\s*ka|lund|lauda|lavda|loda|lodu|chodu|chodna|chod|bhadwa|bhadwe|kanjar|kanjri|tatti|suwar|suar|ullu\s+ka\s+pattha|teri\s+ma+|teri\s+behan|maa\s+ki\s+chut|fuck(?:ing|er|ed|off)?|motherfucker|bitch(?:es|ing)?|asshole|bastard|dickhead|dick|cock|pussy|slut|whore|cunt|bullshit|shit)\b|(?:m[\W_]*a[\W_]*d[\W_]*a[\W_]*r[\W_]*c[\W_]*h[\W_]*o[\W_]*d|b[\W_]*h[\W_]*e[\W_]*n[\W_]*c[\W_]*h[\W_]*o[\W_]*d|c[\W_]*h[\W_]*u[\W_]*t[\W_]*i[\W_]*y[\W_]*a|b[\W_]*h[\W_]*o[\W_]*s[\W_]*d[\W_]*i))/i;
 
 const SCAM_PHRASE_REGEX =
   /((?:send|share|bhej|bhejo|batayen|batao)\s+(?:your\s+)?(?:otp|pin|mpin|password|verification\s*code|cvv)|(?:jazzcash|easypaisa|sadapay|nayapay).{0,45}(?:double|win|prize|reward|claim|urgent\s+verify|account\s+block)|(?:you\s+(?:have\s+)?won|congratulations.{0,30}winner|lottery\s+winner|lucky\s+draw\s+winner)|(?:earn\s+\$?\d+\s*(?:daily|per\s+day|hourly)|double\s+your\s+(?:money|investment|crypto|btc|usdt))|(?:whatsapp|bank|account)\s+(?:will\s+be\s+)?(?:banned|suspended|blocked).{0,40}(?:verify|click|otp)|aviator\s+hack|1xbet\s+hack|teen\s+patti\s+hack|crypto\s+airdrop\s+claim)/i;
 
-const BAD_STICKER_LABEL_REGEX =
-  /(18\+|nsfw|porn|xxx|nude|sex|hentai|abuse|gali|scam|fraud|betting|aviator|casino)/i;
+const BAD_MEDIA_LABEL_REGEX =
+  /\b(18\+|nsfw|porn|porno|xxx|nude|nudes|naked|sex|sexy|hentai|xvideos|xnxx|onlyfans|adult\s*video|gandi|chudai|chod|lund|chut|randi|abuse|gali|scam|fraud|betting|aviator|casino)\b/i;
 
 const stickerFloodTracker = new Map<string, number[]>();
 const msgFloodTracker = new Map<string, number[]>();
@@ -203,6 +204,9 @@ export async function enforceAntiScam(
   const cfg = loadConfig();
   const inner = unwrapMessage(msg.message);
   const sticker = inner?.stickerMessage;
+  const imageMsg = inner?.imageMessage;
+  const videoMsg = inner?.videoMessage;
+  const docMsg = inner?.documentMessage;
   const contextInfo = extractContextInfo(msg.message);
   const forwardingScore = Number(contextInfo?.forwardingScore || 0);
   const mentionedCount = contextInfo?.mentionedJid?.length || 0;
@@ -222,11 +226,37 @@ export async function enforceAntiScam(
       violation = 'Forwarded Spam Sticker';
     } else if (
       sticker.accessibilityLabel &&
-      BAD_STICKER_LABEL_REGEX.test(sticker.accessibilityLabel)
+      BAD_MEDIA_LABEL_REGEX.test(sticker.accessibilityLabel)
     ) {
       violation = 'Inappropriate Sticker';
     } else if (recordFloodHit(stickerFloodTracker, `${chatId}:${userTrackKey}`, 12_000, 3)) {
       violation = 'Sticker Flood Spam';
+    }
+  }
+
+  if (!violation && (imageMsg || videoMsg || docMsg)) {
+    const mediaSha = normalizeFileSha256(
+      imageMsg?.fileSha256 || videoMsg?.fileSha256 || docMsg?.fileSha256
+    );
+    const mediaMetaText = [
+      imageMsg?.accessibilityLabel,
+      imageMsg?.caption,
+      videoMsg?.accessibilityLabel,
+      videoMsg?.caption,
+      docMsg?.fileName,
+      docMsg?.caption,
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    if (mediaSha && vipStore.isStickerBanned(mediaSha)) {
+      violation = imageMsg ? 'Banned/Inappropriate Photo' : videoMsg ? 'Banned/Inappropriate Video' : 'Banned File';
+    } else if (mediaMetaText && (BAD_MEDIA_LABEL_REGEX.test(mediaMetaText) || ABUSIVE_WORDS_REGEX.test(mediaMetaText))) {
+      violation = imageMsg ? 'Inappropriate Photo (18+/Abuse)' : videoMsg ? 'Inappropriate Video (18+/Abuse)' : 'Inappropriate Media';
+    } else if (forwardingScore >= 4 && (imageMsg || videoMsg)) {
+      violation = imageMsg ? 'Viral Forwarded Spam Photo' : 'Viral Forwarded Spam Video';
+    } else if ((imageMsg || videoMsg) && recordFloodHit(stickerFloodTracker, `${chatId}:media:${userTrackKey}`, 12_000, 4)) {
+      violation = 'Media Flood Spam';
     }
   }
 
@@ -311,6 +341,122 @@ export async function enforceAntiScam(
   return false;
 }
 
+export async function enforceAntiStatusMention(
+  sock: WASocket,
+  msg: WAMessage,
+  body: string,
+  chatId: string,
+  senderCandidates: string[],
+  isOwner: boolean
+): Promise<boolean> {
+  if (!chatId.endsWith('@g.us') || isOwner || msg.key?.fromMe) return false;
+  const groupCfg = vipStore.getGroupConfig(chatId);
+  if (!groupCfg.antiStatusMention) return false;
+
+  const inner = unwrapMessage(msg.message);
+  const ctxInfo = extractContextInfo(msg.message) as
+    | (Record<string, unknown> & { statusMentionMessageInfo?: unknown; statusMentions?: unknown[] })
+    | undefined;
+  const rawMsg = (msg.message || {}) as Record<string, unknown>;
+  const msgCtx = rawMsg.messageContextInfo as
+    | { statusMentionMessageInfo?: unknown; statusMentions?: unknown[] }
+    | undefined;
+
+  const isStatusMention = Boolean(
+    rawMsg.groupStatusMentionMessage ||
+      rawMsg.statusMentionMessage ||
+      inner?.groupStatusMentionMessage ||
+      inner?.statusMentionMessage ||
+      msgCtx?.statusMentionMessageInfo ||
+      (Array.isArray(msgCtx?.statusMentions) && msgCtx.statusMentions.length > 0) ||
+      ctxInfo?.statusMentionMessageInfo ||
+      (Array.isArray(ctxInfo?.statusMentions) && ctxInfo.statusMentions.length > 0) ||
+      (body && /status\s*mention|mentioned\s+this\s+group\s+in\s+(?:their|a)\s+status/i.test(body))
+  );
+
+  if (!isStatusMention) return false;
+
+  try {
+    let meta = await getCachedGroupMetadata(sock, chatId);
+    const senderParticipant = findParticipant(meta.participants, senderCandidates);
+    if (isParticipantAdmin(senderParticipant)) return false;
+
+    const botJids = await getBotJids(sock);
+    let botParticipant = findParticipant(meta.participants, botJids);
+
+    if (!isParticipantAdmin(botParticipant)) {
+      meta = await getCachedGroupMetadata(sock, chatId, true);
+      botParticipant = findParticipant(meta.participants, botJids);
+    }
+
+    if (!isParticipantAdmin(botParticipant)) {
+      logger.warn('antiMention', `Status mention detected in ${chatId} but bot is not Group Admin.`);
+      return false;
+    }
+
+    const senderJid = senderParticipant?.id || senderCandidates[0] || chatId;
+    const senderDisplay = jidUserPart(senderParticipant?.phoneNumber || senderJid);
+
+    const deleteKey = {
+      remoteJid: chatId,
+      fromMe: false,
+      id: msg.key.id,
+      participant: msg.key.participant || senderParticipant?.id || senderJid,
+    };
+    await sock.sendMessage(chatId, { delete: deleteKey });
+    await sock.sendMessage(chatId, {
+      text: `*Anti-Mention Status*\n@${senderDisplay}, mentioning this group in your WhatsApp Status is not allowed here.`,
+      mentions: [senderJid],
+    });
+    logger.security('antiMention', `Deleted group status mention from +${senderDisplay} in ${chatId}`);
+    return true;
+  } catch (err) {
+    logger.warn('antiMention', `Anti-Status-Mention check failed: ${(err as Error).message}`);
+  }
+  return false;
+}
+
+export async function dispatchOpenGcProtectedPost(
+  sock: WASocket,
+  textPayload: string
+): Promise<{ sent: number; totalOpen: number }> {
+  const groupsMap = await sock.groupFetchAllParticipating();
+  const openGroups = Object.values(groupsMap).filter((g) => !g.announce && !g.isCommunityAnnounce);
+  if (openGroups.length === 0) {
+    return { sent: 0, totalOpen: 0 };
+  }
+
+  let urlInfo: Awaited<ReturnType<typeof getUrlInfo>> | undefined;
+  if (extractFirstUrl(textPayload)) {
+    urlInfo = await getUrlInfo(textPayload, {
+      thumbnailWidth: 192,
+      fetchOpts: { timeout: 3500 },
+      uploadImage: sock.waUploadToServer,
+    }).catch(() => undefined);
+  }
+
+  let sent = 0;
+  for (let i = 0; i < openGroups.length; i += 1) {
+    const gc = openGroups[i];
+    try {
+      const result = await sock.sendMessage(
+        gc.id,
+        urlInfo ? { text: textPayload, linkPreview: urlInfo } : { text: textPayload }
+      );
+      sent += 1;
+      if (result?.key?.id) {
+        vipStore.registerProtectedPost(result.key.id, gc.id, textPayload, 0);
+      }
+    } catch (err) {
+      logger.warn('protectedPost', `Failed open-GC send to ${gc.id}: ${(err as Error).message}`);
+    }
+    if (i < openGroups.length - 1) {
+      await new Promise((r) => setTimeout(r, 350));
+    }
+  }
+  return { sent, totalOpen: openGroups.length };
+}
+
 export async function handleAntidelete(
   sock: WASocket,
   revokedMsg: WAMessage,
@@ -321,6 +467,27 @@ export async function handleAntidelete(
     const protocolMsg = revokedMsg.message?.protocolMessage;
     if (!chatId || !protocolMsg || protocolMsg.type !== 0 || !protocolMsg.key?.id) return;
     if (!chatId.endsWith('@g.us')) return;
+
+    // 1. Protected Open-GC Anti-Delete Lock: even if a Group Admin deletes it, immediately repost!
+    const protectedPost = vipStore.consumeProtectedPost(chatId, protocolMsg.key.id);
+    if (protectedPost) {
+      if (protectedPost.repostCount < 10) {
+        const resent = await sock.sendMessage(chatId, { text: protectedPost.text }).catch(() => null);
+        if (resent?.key?.id) {
+          vipStore.registerProtectedPost(
+            resent.key.id,
+            chatId,
+            protectedPost.text,
+            protectedPost.repostCount + 1
+          );
+        }
+        logger.security(
+          'protectedPost',
+          `Deleted protected Open-GC message in ${chatId}; auto-restored (attempt ${protectedPost.repostCount + 1}).`
+        );
+      }
+      return;
+    }
 
     const groupCfg = vipStore.getGroupConfig(chatId);
     if (!groupCfg.antidelete) return;

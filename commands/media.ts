@@ -388,10 +388,12 @@ export const mediaCommands: BotCommand[] = [
             audio: voice.buffer,
             mimetype: voice.mimetype,
             ptt: voice.ptt,
+            ...(typeof voice.seconds === 'number' ? { seconds: voice.seconds } : {}),
+            ...(voice.waveform ? { waveform: voice.waveform } : {}),
           },
           ctx.msg ? { quoted: ctx.msg } : undefined
         );
-        return `TTS voice note sent (${voice.lang}).`;
+        return `TTS voice note sent (${voice.lang}, ${voice.seconds || 1}s).`;
       } catch (err) {
         const msg = `TTS failed: ${(err as Error).message}`;
         await ctx.reply(msg);

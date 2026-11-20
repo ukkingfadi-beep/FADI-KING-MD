@@ -30,10 +30,19 @@ export interface GroupConfig {
   antilinkMode?: 'off' | 'delete' | 'warn' | 'kick';
   antidelete?: boolean;
   antiScam?: boolean;
+  antiStatusMention?: boolean;
   welcome: boolean;
   goodbye: boolean;
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
+}
+
+export interface ProtectedPostEntry {
+  msgId: string;
+  chatId: string;
+  text: string;
+  repostCount: number;
+  createdAt: number;
 }
 
 export interface BannedStickerEntry {
@@ -61,12 +70,14 @@ let vipsCache: VipUser[] | null = null;
 let groupsCache: Record<string, GroupConfig> | null = null;
 let pairingLogsCache: PairingAuditEntry[] | null = null;
 let bannedStickersCache: BannedStickerEntry[] | null = null;
+let protectedPostsCache: Record<string, ProtectedPostEntry> | null = null;
 
 registerDbHydrationHook(() => {
   vipsCache = null;
   groupsCache = null;
   pairingLogsCache = null;
   bannedStickersCache = null;
+  protectedPostsCache = null;
 });
 
 function readStoreKey<T>(key: string, legacyPath: string, fallback: T): T {
@@ -247,6 +258,7 @@ export const vipStore = {
         antilinkMode: 'off',
         antidelete: false,
         antiScam: cfg.antiScamGlobal,
+        antiStatusMention: cfg.antiStatusMentionGlobal,
         welcome: true,
         goodbye: false,
       };
@@ -256,6 +268,10 @@ export const vipStore = {
       antilinkMode: found.antilinkMode || (found.antilink ? 'delete' : 'off'),
       antidelete: Boolean(found.antidelete),
       antiScam: typeof found.antiScam === 'boolean' ? found.antiScam : cfg.antiScamGlobal,
+      antiStatusMention:
+        typeof found.antiStatusMention === 'boolean'
+          ? found.antiStatusMention
+          : cfg.antiStatusMentionGlobal,
     };
   },
 
@@ -266,6 +282,10 @@ export const vipStore = {
       antilinkMode: g.antilinkMode || (g.antilink ? 'delete' : 'off'),
       antidelete: Boolean(g.antidelete),
       antiScam: typeof g.antiScam === 'boolean' ? g.antiScam : cfg.antiScamGlobal,
+      antiStatusMention:
+        typeof g.antiStatusMention === 'boolean'
+          ? g.antiStatusMention
+          : cfg.antiStatusMentionGlobal,
     }));
   },
 
@@ -291,6 +311,9 @@ export const vipStore = {
     }
     if (typeof patch.antidelete === 'boolean') cleanPatch.antidelete = patch.antidelete;
     if (typeof patch.antiScam === 'boolean') cleanPatch.antiScam = patch.antiScam;
+    if (typeof patch.antiStatusMention === 'boolean') {
+      cleanPatch.antiStatusMention = patch.antiStatusMention;
+    }
     if (typeof patch.welcome === 'boolean') cleanPatch.welcome = patch.welcome;
     if (typeof patch.goodbye === 'boolean') cleanPatch.goodbye = patch.goodbye;
     if (patch.warnings && typeof patch.warnings === 'object') cleanPatch.warnings = patch.warnings;
@@ -360,5 +383,42 @@ export const vipStore = {
       pairingLogsCache = readStoreKey<PairingAuditEntry[]>('pairing_logs', pairingLogsFile, []);
     }
     return pairingLogsCache.slice(0, limit);
+  },
+
+  registerProtectedPost(msgId: string, chatId: string, text: string, repostCount = 0): void {
+    if (!msgId || !chatId || !text) return;
+    if (!protectedPostsCache) {
+      protectedPostsCache = dbGetSync<Record<string, ProtectedPostEntry>>('protected_posts') || {};
+    }
+    protectedPostsCache[`${chatId}:${msgId}`] = {
+      msgId,
+      chatId,
+      text,
+      repostCount,
+      createdAt: Date.now(),
+    };
+    const keys = Object.keys(protectedPostsCache);
+    if (keys.length > 400) {
+      keys
+        .sort((a, b) => protectedPostsCache![a].createdAt - protectedPostsCache![b].createdAt)
+        .slice(0, keys.length - 400)
+        .forEach((k) => {
+          delete protectedPostsCache![k];
+        });
+    }
+    dbSetSync('protected_posts', protectedPostsCache);
+  },
+
+  consumeProtectedPost(chatId: string, msgId: string): ProtectedPostEntry | null {
+    if (!msgId || !chatId) return null;
+    if (!protectedPostsCache) {
+      protectedPostsCache = dbGetSync<Record<string, ProtectedPostEntry>>('protected_posts') || {};
+    }
+    const key = `${chatId}:${msgId}`;
+    const entry = protectedPostsCache[key];
+    if (!entry) return null;
+    delete protectedPostsCache[key];
+    dbSetSync('protected_posts', protectedPostsCache);
+    return entry;
   },
 };

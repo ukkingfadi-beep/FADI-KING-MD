@@ -395,6 +395,8 @@ async function startServer(): Promise<void> {
         anticallGlobal: cfg.anticallGlobal,
         antiScamGlobal: cfg.antiScamGlobal,
         antiScamBlockAllStickers: cfg.antiScamBlockAllStickers,
+        antiStatusMentionGlobal: cfg.antiStatusMentionGlobal,
+        autoForwardIbToOpenGcs: cfg.autoForwardIbToOpenGcs,
         stickerPack: cfg.stickerPack,
         stickerAuthor: cfg.stickerAuthor,
       },
@@ -497,6 +499,14 @@ async function startServer(): Promise<void> {
         typeof body.antiScamBlockAllStickers === 'boolean'
           ? body.antiScamBlockAllStickers
           : undefined,
+      antiStatusMentionGlobal:
+        typeof body.antiStatusMentionGlobal === 'boolean'
+          ? body.antiStatusMentionGlobal
+          : undefined,
+      autoForwardIbToOpenGcs:
+        typeof body.autoForwardIbToOpenGcs === 'boolean'
+          ? body.autoForwardIbToOpenGcs
+          : undefined,
       stickerPack: typeof body.stickerPack === 'string' ? body.stickerPack : undefined,
       stickerAuthor: typeof body.stickerAuthor === 'string' ? body.stickerAuthor : undefined,
     });
@@ -580,6 +590,8 @@ async function startServer(): Promise<void> {
             : undefined,
       antilinkMode,
       antiScam: typeof req.body?.antiScam === 'boolean' ? req.body.antiScam : undefined,
+      antiStatusMention:
+        typeof req.body?.antiStatusMention === 'boolean' ? req.body.antiStatusMention : undefined,
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });

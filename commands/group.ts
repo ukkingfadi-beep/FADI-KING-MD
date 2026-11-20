@@ -387,7 +387,7 @@ export const groupCommands: BotCommand[] = [
 
       let rawBody = ctx.text.trim();
       let targetGroupJid = ctx.isGroup ? ctx.chatId : '';
-      let autoRemoveSec = 15; // Auto-remove after 15s by default
+      let autoRemoveSec = 0; // Default 0 = stays 24 hours on WhatsApp (no 15s auto-delete)
 
       // Parse optional target group via `1 | text` or `120363...@g.us | text`
       if (rawBody.includes('|')) {
@@ -397,7 +397,7 @@ export const groupCommands: BotCommand[] = [
 
         if (/^\d{1,3}s$/i.test(targetSpec)) {
           autoRemoveSec = Math.max(3, Math.min(300, Number(targetSpec.slice(0, -1))));
-        } else if (targetSpec.toLowerCase() === 'keep') {
+        } else if (targetSpec.toLowerCase() === 'keep' || targetSpec.toLowerCase() === '24h') {
           autoRemoveSec = 0;
         } else if (targetSpec.endsWith('@g.us')) {
           targetGroupJid = targetSpec;
@@ -426,7 +426,6 @@ export const groupCommands: BotCommand[] = [
           }
         }
       } else if (!ctx.isGroup && ctx.args[0]) {
-        // From DM without `|`: e.g. `.gcstatus 1 Hello everyone` or `.gcstatus 120363xxx@g.us Hello`
         const first = ctx.args[0];
         if (first.endsWith('@g.us')) {
           targetGroupJid = first;
@@ -442,36 +441,47 @@ export const groupCommands: BotCommand[] = [
         }
       }
 
-      if (!targetGroupJid || !targetGroupJid.endsWith('@g.us')) {
-        const msg = [
-          `*GC Status Usage:*`,
-          `• Inside a group: \`${ctx.prefix}gcstatus Your status text\``,
-          `• To any group from anywhere: \`${ctx.prefix}gcstatus 1 | Your status text\` (see \`${ctx.prefix}gclist\`)`,
-          `• With image/video/audio: reply to media with \`${ctx.prefix}gcstatus\``,
-          `• Custom auto-remove: \`${ctx.prefix}gcstatus 10s Your text\` (default 15s auto-remove)`,
-        ].join('\n');
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      // Parse optional leading duration token like `10s`, `10s | text`, or `keep`
+      // Parse optional leading duration token like `10s | text` or `keep`
       const firstToken = rawBody.split(/\s+/)[0]?.toLowerCase() || '';
       if (/^\d{1,3}s$/.test(firstToken)) {
         autoRemoveSec = Math.max(3, Math.min(300, Number(firstToken.slice(0, -1))));
         rawBody = rawBody.slice(firstToken.length).replace(/^\s*\|\s*/, '').trim();
-      } else if (firstToken === 'keep') {
+      } else if (firstToken === 'keep' || firstToken === '24h') {
         autoRemoveSec = 0;
         rawBody = rawBody.slice(firstToken.length).replace(/^\s*\|\s*/, '').trim();
       }
 
-      // Check permissions on target group
-      const adminCheck = await verifyGroupAdmins(ctx, {
-        requireBotAdmin: false,
-        targetGroupId: targetGroupJid,
-      });
-      if (!adminCheck.ok) {
-        await ctx.reply(adminCheck.reason!);
-        return adminCheck.reason!;
+      // Resolve target list: either single group OR all Open GCs when run from Owner's IB/DM
+      let targetGroupIds: string[] = [];
+      if (targetGroupJid && targetGroupJid.endsWith('@g.us')) {
+        const adminCheck = await verifyGroupAdmins(ctx, {
+          requireBotAdmin: false,
+          targetGroupId: targetGroupJid,
+        });
+        if (!adminCheck.ok) {
+          await ctx.reply(adminCheck.reason!);
+          return adminCheck.reason!;
+        }
+        targetGroupIds = [targetGroupJid];
+      } else if (!ctx.isGroup) {
+        if (!ctx.isOwner) {
+          const msg = 'Only Bot Owner can post GC Status to all open groups from DM/IB.';
+          await ctx.reply(msg);
+          return msg;
+        }
+        const groupsMap = await ctx.sock.groupFetchAllParticipating();
+        targetGroupIds = Object.values(groupsMap)
+          .filter((g) => !g.announce && !g.isCommunityAnnounce)
+          .map((g) => g.id);
+        if (targetGroupIds.length === 0) {
+          const msg = 'No open WhatsApp groups found. Pass a specific group index like `.gcstatus 1 | text`.';
+          await ctx.reply(msg);
+          return msg;
+        }
+      } else {
+        const msg = `Provide a link, status text, or reply to media with \`${ctx.prefix}gcstatus\`.`;
+        await ctx.reply(msg);
+        return msg;
       }
 
       // Determine payload (text OR replied media)
@@ -524,40 +534,65 @@ export const groupCommands: BotCommand[] = [
         return msg;
       }
 
-      let sentKey: WAMessage['key'] | undefined;
-      try {
-        const innerContent = await generateWAMessageContent(anyContent, {
-          upload: ctx.sock.waUploadToServer,
-        });
-        const built = generateWAMessageFromContent(
-          targetGroupJid,
-          { groupStatusMessageV2: { message: innerContent } },
-          { userJid: ctx.sock.user?.id || `${loadConfig().ownerNumber}@s.whatsapp.net` }
-        );
-        await ctx.sock.relayMessage(targetGroupJid, built.message!, {
-          messageId: built.key.id!,
-        });
-        sentKey = built.key;
-      } catch {
-        // Fallback if groupStatusMessageV2 isn't accepted in a specific group
-        const sent = await ctx.sock.sendMessage(targetGroupJid, anyContent);
-        sentKey = sent?.key;
+      const innerContent = await generateWAMessageContent(anyContent, {
+        upload: ctx.sock.waUploadToServer,
+      });
+
+      let postedCount = 0;
+      const ownerFallbackJid = `${loadConfig().ownerNumber}@s.whatsapp.net`;
+      for (let i = 0; i < targetGroupIds.length; i += 1) {
+        const gid = targetGroupIds[i];
+        let sentKey: WAMessage['key'] | undefined;
+        try {
+          const built = generateWAMessageFromContent(
+            gid,
+            { groupStatusMessageV2: { message: innerContent } },
+            { userJid: ctx.sock.user?.id || ownerFallbackJid }
+          );
+          await ctx.sock.relayMessage(gid, built.message!, {
+            messageId: built.key.id!,
+          });
+          sentKey = built.key;
+          postedCount += 1;
+        } catch {
+          try {
+            const sent = await ctx.sock.sendMessage(gid, anyContent);
+            sentKey = sent?.key;
+            postedCount += 1;
+          } catch {
+            // Skip failed group
+          }
+        }
+
+        if (autoRemoveSec > 0 && sentKey) {
+          const sockRef = ctx.sock;
+          const keyToDelete = sentKey;
+          setTimeout(() => {
+            void sockRef.sendMessage(gid, { delete: keyToDelete }).catch(() => {});
+          }, autoRemoveSec * 1000);
+        }
+
+        if (i < targetGroupIds.length - 1) {
+          await new Promise((r) => setTimeout(r, 350));
+        }
       }
 
-      if (autoRemoveSec > 0 && sentKey) {
-        const sockRef = ctx.sock;
-        const keyToDelete = sentKey;
-        setTimeout(() => {
-          void sockRef.sendMessage(targetGroupJid, { delete: keyToDelete }).catch(() => {});
-        }, autoRemoveSec * 1000);
+      if (targetGroupIds.length === 1) {
+        const gid = targetGroupIds[0];
+        const meta = await getCachedGroupMetadata(ctx.sock, gid).catch(() => null);
+        const gcName = meta?.subject || gid;
+        const doneMsg =
+          autoRemoveSec > 0
+            ? `GC Status posted on *${gcName}*! It will auto-remove in *${autoRemoveSec}s*.`
+            : `24-hour GC Status posted on *${gcName}*!`;
+        await ctx.reply(doneMsg);
+        return doneMsg;
       }
 
-      const meta = await getCachedGroupMetadata(ctx.sock, targetGroupJid).catch(() => null);
-      const gcName = meta?.subject || targetGroupJid;
       const doneMsg =
         autoRemoveSec > 0
-          ? `GC Status posted on *${gcName}*! It will auto-remove in *${autoRemoveSec}s*.`
-          : `GC Status posted on *${gcName}* (kept in chat).`;
+          ? `GC Status posted on *${postedCount}/${targetGroupIds.length}* Open Group(s) (removes in *${autoRemoveSec}s*).`
+          : `24-hour GC Status posted on *${postedCount}/${targetGroupIds.length}* Open Group(s)!`;
       await ctx.reply(doneMsg);
       return doneMsg;
     },
@@ -719,15 +754,77 @@ export const groupCommands: BotCommand[] = [
     },
   },
   {
-    name: 'bansticker',
-    aliases: ['blocksticker', 'unbansticker'],
+    name: 'antimention',
+    aliases: ['antistatusmention', 'mentionstatus', 'antistatus'],
     category: 'group',
-    description: 'Kisi ghatiya sticker par reply karke usay database mein ban/unban kare',
+    description: 'Group mein status mention karne walon ke messages auto-delete kare (ON/OFF)',
+    usage: 'antimention <on|off|global on|global off>',
+    execute: async (ctx) => {
+      const sub = ctx.args[0]?.toLowerCase();
+      const val = ctx.args[1]?.toLowerCase();
+
+      if (sub === 'global') {
+        if (!ctx.isOwner) {
+          const msg = 'Only Bot Owner can change Global Anti-Mention Status mode.';
+          await ctx.reply(msg);
+          return msg;
+        }
+        if (val !== 'on' && val !== 'off') {
+          const current = loadConfig().antiStatusMentionGlobal;
+          const msg = `Global Anti-Mention Status is currently *${current ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}antimention global on\` or \`off\``;
+          await ctx.reply(msg);
+          return msg;
+        }
+        saveConfig({ antiStatusMentionGlobal: val === 'on' });
+        const msg = `Global Anti-Mention Status turned *${val.toUpperCase()}* (saved in database).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.isGroup && !ctx.isSimulated) {
+        const msg = `Use \`${ctx.prefix}antimention on\` / \`off\` inside a group, or \`${ctx.prefix}antimention global on\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (sub !== 'on' && sub !== 'off') {
+        const current = vipStore.getGroupConfig(ctx.chatId).antiStatusMention;
+        const msg = `Anti-Mention Status is currently *${current ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}antimention on\` or \`${ctx.prefix}antimention off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let botAdminNote = '';
+      if (!ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          await ctx.reply(check.reason!);
+          return check.reason!;
+        }
+        if (sub === 'on' && !check.botIsAdmin) {
+          botAdminNote = '\n_Note: Promote the bot to Group Admin so it can delete status mentions._';
+        }
+      }
+
+      vipStore.updateGroupConfig(ctx.chatId, { antiStatusMention: sub === 'on' });
+      const msg =
+        sub === 'on'
+          ? `Group *Anti-Mention Status* turned *ON* (Status mentions in this group will be deleted).${botAdminNote}`
+          : 'Group *Anti-Mention Status* turned *OFF*.';
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'bansticker',
+    aliases: ['blocksticker', 'unbansticker', 'banmedia'],
+    category: 'group',
+    description: 'Kisi ghatiya sticker, photo ya video par reply karke database mein ban kare',
     usage: 'bansticker [list|unban]',
     execute: async (ctx) => {
       if (ctx.args[0]?.toLowerCase() === 'list') {
         const count = vipStore.listBannedStickers().length;
-        const msg = `Total banned stickers in database: *${count}*`;
+        const msg = `Total banned stickers/media in database: *${count}*`;
         await ctx.reply(msg);
         return msg;
       }
@@ -739,28 +836,32 @@ export const groupCommands: BotCommand[] = [
           return check.reason!;
         }
       } else if (!ctx.isOwner) {
-        const msg = 'Only Bot Owner or Group Admins can ban stickers.';
+        const msg = 'Only Bot Owner or Group Admins can ban stickers/media.';
         await ctx.reply(msg);
         return msg;
       }
 
       if (!ctx.msg || ctx.isSimulated) {
-        const msg = `Reply to any bad sticker with \`${ctx.prefix}bansticker\` to block it in all Anti-Scam groups.`;
+        const msg = `Reply to any bad sticker, photo, or video with \`${ctx.prefix}bansticker\` to block it across Anti-Scam groups.`;
         await ctx.reply(msg);
         return msg;
       }
 
       const quoted = extractQuotedMessage(ctx.msg);
-      const sticker = quoted?.stickerMessage;
-      if (!sticker) {
-        const msg = `Reply to a sticker with \`${ctx.prefix}bansticker\` (or \`${ctx.prefix}unbansticker\` to remove).`;
+      const targetMedia =
+        quoted?.stickerMessage ||
+        quoted?.imageMessage ||
+        quoted?.videoMessage ||
+        quoted?.documentMessage;
+      if (!targetMedia) {
+        const msg = `Reply to a bad sticker, photo, or video with \`${ctx.prefix}bansticker\` (or \`${ctx.prefix}unbansticker\` to remove).`;
         await ctx.reply(msg);
         return msg;
       }
 
-      const sha = normalizeFileSha256(sticker.fileSha256);
+      const sha = normalizeFileSha256(targetMedia.fileSha256);
       if (!sha) {
-        const msg = 'Could not read sticker hash. Try replying to a freshly sent sticker.';
+        const msg = 'Could not read media hash. Reply to a freshly sent sticker, photo, or video.';
         await ctx.reply(msg);
         return msg;
       }
@@ -768,8 +869,8 @@ export const groupCommands: BotCommand[] = [
       if (ctx.commandName === 'unbansticker' || ctx.args[0]?.toLowerCase() === 'off' || ctx.args[0]?.toLowerCase() === 'unban') {
         const removed = vipStore.unbanSticker(sha);
         const msg = removed
-          ? 'Sticker removed from the banned list.'
-          : 'This sticker was not in the banned list.';
+          ? 'Media removed from the banned list.'
+          : 'This sticker/media was not in the banned list.';
         await ctx.reply(msg);
         return msg;
       }
@@ -791,7 +892,7 @@ export const groupCommands: BotCommand[] = [
         }
       }
 
-      const msg = 'Sticker banned in persistent database! Any member sending it in Anti-Scam groups will have it deleted.';
+      const msg = 'Sticker/Media banned in persistent database! Any member sending it in Anti-Scam groups will have it deleted.';
       await ctx.reply(msg);
       return msg;
     },
@@ -1189,6 +1290,7 @@ export const groupCommands: BotCommand[] = [
         `• Members: ${meta.participants.length} (${admins.length} Admins)`,
         `• Antilink: ${antilinkLabel}`,
         `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'}`,
+        `• Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'}`,
         `• Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
         `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
         ...(meta.desc ? ['', `*Description:*\n${meta.desc.slice(0, 300)}`] : []),

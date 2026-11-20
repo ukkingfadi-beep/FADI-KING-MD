@@ -18,11 +18,11 @@ function formatUptime(seconds: number): string {
 }
 
 const categoryLabels: Record<CommandCategory, string> = {
-  general: 'A. General & Info',
-  vip: 'B. VIP & Pairing',
-  group: 'C. Group Admin & Moderation',
-  media: 'D. Utility & Media',
-  owner: 'E. Owner / System',
+  general: '📌 GENERAL & BOT INFO',
+  vip: '💎 VIP & PAIRING ACCESS',
+  group: '🛡️ GROUP GUARD & STATUS',
+  media: '🎧 MEDIA & SMART TOOLS',
+  owner: '👑 OWNER & OPEN-GC LOCK',
 };
 
 export const generalCommands: BotCommand[] = [
@@ -30,7 +30,7 @@ export const generalCommands: BotCommand[] = [
     name: 'menu',
     aliases: ['help', 'commands'],
     category: 'general',
-    description: 'Category-wise clean command list show kare',
+    description: 'Saaf suthra aur complete command menu show kare',
     usage: 'menu [category]',
     cooldownSeconds: 3,
     execute: async (ctx) => {
@@ -42,23 +42,27 @@ export const generalCommands: BotCommand[] = [
       const targetCategories =
         filterCat && categories.includes(filterCat) ? [filterCat] : categories;
 
+      const roleLabel = ctx.isOwner ? 'OWNER' : ctx.isVip ? 'VIP' : 'MEMBER';
       const lines: string[] = [
-        `*${cfg.botName} — Command Directory*`,
-        `Prefix: \`${cfg.prefix}\` | Mode: *${cfg.mode.toUpperCase()}* | Role: *${ctx.isOwner ? 'OWNER' : ctx.isVip ? 'VIP' : 'USER'}*`,
+        `╔══════════════════════════╗`,
+        `   *${cfg.botName}*  (${cmds.length} Commands)`,
+        `╚══════════════════════════╝`,
+        `• *Prefix:* \`${cfg.prefix}\`   • *Mode:* *${cfg.mode.toUpperCase()}*`,
+        `• *Role:* *${roleLabel}*   • *Anti-Scam:* *${cfg.antiScamGlobal ? 'ON' : 'OFF'}*`,
         '',
       ];
 
       for (const cat of targetCategories) {
         const list = cmds.filter((c) => c.category === cat);
-        lines.push(`*${categoryLabels[cat]}*`);
+        lines.push(`┌─ *${categoryLabels[cat]}* (${list.length})`);
         for (const cmd of list) {
-          const aliasText = cmd.aliases?.length ? ` (${cmd.aliases.join(', ')})` : '';
-          lines.push(`  • \`${cfg.prefix}${cmd.name}\`${aliasText} — ${cmd.description}`);
+          lines.push(`│ ▸ \`${cfg.prefix}${cmd.name}\` — ${cmd.description}`);
         }
+        lines.push(`└──────────────────────────`);
         lines.push('');
       }
 
-      lines.push(`Use \`${cfg.prefix}menu <category>\` (general, vip, group, media, owner) to filter.`);
+      lines.push(`Tip: Filter with \`${cfg.prefix}menu group\`, \`${cfg.prefix}menu owner\`, or \`${cfg.prefix}menu media\`.`);
       const output = lines.join('\n').trim();
       await ctx.reply(output);
       return output;

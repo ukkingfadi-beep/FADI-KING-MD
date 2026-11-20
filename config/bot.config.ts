@@ -45,6 +45,8 @@ export interface BotConfig {
   anticallGlobal: boolean;
   antiScamGlobal: boolean;
   antiScamBlockAllStickers: boolean;
+  antiStatusMentionGlobal: boolean;
+  autoForwardIbToOpenGcs: boolean;
   stickerPack: string;
   stickerAuthor: string;
   sessionDir: string;
@@ -96,6 +98,8 @@ const defaultConfig: BotConfig = {
   anticallGlobal: process.env.ANTICALL_GLOBAL === 'true',
   antiScamGlobal: process.env.ANTI_SCAM_GLOBAL === 'true',
   antiScamBlockAllStickers: process.env.ANTI_SCAM_BLOCK_ALL_STICKERS === 'true',
+  antiStatusMentionGlobal: process.env.ANTI_STATUS_MENTION_GLOBAL === 'true',
+  autoForwardIbToOpenGcs: process.env.AUTO_FORWARD_IB_TO_OPEN_GCS === 'true',
   stickerPack: process.env.STICKER_PACK || 'FADI KING MD',
   stickerAuthor: process.env.STICKER_AUTHOR || 'VIP BOT',
   sessionDir: process.env.SESSION_DIR
@@ -224,6 +228,14 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof partial.antiScamBlockAllStickers === 'boolean'
         ? partial.antiScamBlockAllStickers
         : current.antiScamBlockAllStickers,
+    antiStatusMentionGlobal:
+      typeof partial.antiStatusMentionGlobal === 'boolean'
+        ? partial.antiStatusMentionGlobal
+        : current.antiStatusMentionGlobal,
+    autoForwardIbToOpenGcs:
+      typeof partial.autoForwardIbToOpenGcs === 'boolean'
+        ? partial.autoForwardIbToOpenGcs
+        : current.autoForwardIbToOpenGcs,
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };
@@ -260,6 +272,8 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     anticallGlobal: next.anticallGlobal,
     antiScamGlobal: next.antiScamGlobal,
     antiScamBlockAllStickers: next.antiScamBlockAllStickers,
+    antiStatusMentionGlobal: next.antiStatusMentionGlobal,
+    autoForwardIbToOpenGcs: next.autoForwardIbToOpenGcs,
     stickerPack: next.stickerPack,
     stickerAuthor: next.stickerAuthor,
   };

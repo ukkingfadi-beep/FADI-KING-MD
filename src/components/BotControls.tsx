@@ -42,6 +42,8 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
     anticallGlobal: false,
     antiScamGlobal: false,
     antiScamBlockAllStickers: false,
+    antiStatusMentionGlobal: false,
+    autoForwardIbToOpenGcs: false,
     stickerPack: 'FADI KING MD',
     stickerAuthor: 'VIP BOT',
   });
@@ -144,7 +146,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
 
   async function toggleGroupSetting(
     groupId: string,
-    field: 'welcome' | 'goodbye' | 'antiScam',
+    field: 'welcome' | 'goodbye' | 'antiScam' | 'antiStatusMention',
     value: boolean
   ) {
     await fetch(`/api/groups/${encodeURIComponent(groupId)}`, {
@@ -173,6 +175,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
         antilink: true,
         antilinkMode: 'warn',
         antiScam: true,
+        antiStatusMention: true,
         welcome: true,
         goodbye: false,
       }),
@@ -610,6 +613,26 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 />
                 Strict Mode: Delete Non-Admin Stickers
               </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.antiStatusMentionGlobal}
+                  onChange={(e) => setForm({ ...form, antiStatusMentionGlobal: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Global Anti-Mention Status (Delete Group Status Mentions)
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.autoForwardIbToOpenGcs}
+                  onChange={(e) => setForm({ ...form, autoForwardIbToOpenGcs: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Auto IB → Open GCs (Anti-Delete Protected Broadcast)
+              </label>
             </div>
 
             <button
@@ -705,6 +728,24 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                         }`}
                       >
                         Anti-Scam: {(g.antiScam ?? form.antiScamGlobal) ? 'On' : 'Off'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          toggleGroupSetting(
+                            g.groupId,
+                            'antiStatusMention',
+                            !(g.antiStatusMention ?? form.antiStatusMentionGlobal)
+                          )
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                          (g.antiStatusMention ?? form.antiStatusMentionGlobal)
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-white/[0.06] text-[#9E97C2]'
+                        }`}
+                      >
+                        Anti-Mention Status: {(g.antiStatusMention ?? form.antiStatusMentionGlobal) ? 'On' : 'Off'}
                       </button>
 
                       {(['welcome', 'goodbye'] as const).map((field) => (

@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import ffmpegStatic from 'ffmpeg-static';
 import { downloadMediaMessage, getContentType, proto, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
@@ -11,9 +12,16 @@ import { extractContextInfo, unwrapMessage } from './jidHelper.ts';
 const execFileAsync = promisify(execFile);
 const silentLogger = pino({ level: 'silent' });
 
+function resolveFfmpegBin(): string {
+  if (typeof ffmpegStatic === 'string' && ffmpegStatic && fs.existsSync(ffmpegStatic)) {
+    return ffmpegStatic;
+  }
+  return 'ffmpeg';
+}
+
 export async function isFfmpegAvailable(): Promise<boolean> {
   try {
-    await execFileAsync('ffmpeg', ['-version'], { timeout: 3000 });
+    await execFileAsync(resolveFfmpegBin(), ['-version'], { timeout: 3000 });
     return true;
   } catch {
     return false;
@@ -57,6 +65,7 @@ export async function convertMediaToWebpSticker(inputBuffer: Buffer, isVideo: bo
     throw new Error('FFmpeg is not installed on this server. Install ffmpeg to convert images/videos into WebP stickers.');
   }
 
+  const bin = resolveFfmpegBin();
   const tmpDir = os.tmpdir();
   const id = `fkmd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const inPath = path.join(tmpDir, `${id}.${isVideo ? 'mp4' : 'png'}`);
@@ -90,7 +99,7 @@ export async function convertMediaToWebpSticker(inputBuffer: Buffer, isVideo: bo
           outPath,
         ];
 
-    await execFileAsync('ffmpeg', args, { timeout: 20000 });
+    await execFileAsync(bin, args, { timeout: 20000 });
     return await fs.promises.readFile(outPath);
   } finally {
     await fs.promises.unlink(inPath).catch(() => {});
@@ -104,6 +113,7 @@ export async function convertStickerToPng(webpBuffer: Buffer): Promise<Buffer> {
     throw new Error('FFmpeg is not installed on this server. Install ffmpeg to convert WebP stickers back to PNG.');
   }
 
+  const bin = resolveFfmpegBin();
   const tmpDir = os.tmpdir();
   const id = `fkmd_img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const inPath = path.join(tmpDir, `${id}.webp`);
@@ -111,7 +121,7 @@ export async function convertStickerToPng(webpBuffer: Buffer): Promise<Buffer> {
 
   try {
     await fs.promises.writeFile(inPath, webpBuffer);
-    await execFileAsync('ffmpeg', ['-y', '-i', inPath, outPath], { timeout: 15000 });
+    await execFileAsync(bin, ['-y', '-i', inPath, outPath], { timeout: 15000 });
     return await fs.promises.readFile(outPath);
   } finally {
     await fs.promises.unlink(inPath).catch(() => {});
@@ -147,30 +157,134 @@ function splitTtsChunks(text: string, maxLen = 180): string[] {
   return chunks.slice(0, 4);
 }
 
-export async function convertAudioToOggOpus(mp3Buffer: Buffer): Promise<Buffer> {
+function computePcmWaveformAndSeconds(pcmBuffer: Buffer, sampleRate = 8000): {
+  seconds: number;
+  waveform: Uint8Array;
+} {
+  const totalSamples = Math.floor(pcmBuffer.length / 2);
+  const seconds = Math.max(1, Math.round(totalSamples / sampleRate));
+  const bars = 64;
+  const waveform = new Uint8Array(bars);
+
+  if (totalSamples < bars) {
+    waveform.fill(35);
+    return { seconds, waveform };
+  }
+
+  const blockSize = Math.max(1, Math.floor(totalSamples / bars));
+  const amplitudes: number[] = [];
+  let maxAmp = 1;
+
+  for (let i = 0; i < bars; i += 1) {
+    const startSample = i * blockSize;
+    let sum = 0;
+    let count = 0;
+    for (let j = 0; j < blockSize && startSample + j < totalSamples; j += 1) {
+      const val = Math.abs(pcmBuffer.readInt16LE((startSample + j) * 2));
+      sum += val;
+      count += 1;
+    }
+    const avg = count > 0 ? sum / count : 0;
+    amplitudes.push(avg);
+    if (avg > maxAmp) maxAmp = avg;
+  }
+
+  for (let i = 0; i < bars; i += 1) {
+    waveform[i] = Math.min(100, Math.max(8, Math.round((amplitudes[i] / maxAmp) * 100)));
+  }
+
+  return { seconds, waveform };
+}
+
+export async function convertAudioPartsToWhatsAppVoice(audioParts: Buffer[]): Promise<{
+  buffer: Buffer;
+  seconds: number;
+  waveform: Uint8Array;
+}> {
+  const bin = resolveFfmpegBin();
   const tmpDir = os.tmpdir();
   const id = `fkmd_tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  const inPath = path.join(tmpDir, `${id}.mp3`);
-  const outPath = path.join(tmpDir, `${id}.ogg`);
+  const partPaths: string[] = [];
+  const concatListPath = path.join(tmpDir, `${id}_list.txt`);
+  const outOggPath = path.join(tmpDir, `${id}.ogg`);
+  const outPcmPath = path.join(tmpDir, `${id}.pcm`);
 
   try {
-    await fs.promises.writeFile(inPath, mp3Buffer);
+    for (let i = 0; i < audioParts.length; i += 1) {
+      const p = path.join(tmpDir, `${id}_part${i}.mp3`);
+      await fs.promises.writeFile(p, audioParts[i]);
+      partPaths.push(p);
+    }
+
+    let inputArgs: string[];
+    if (partPaths.length === 1) {
+      inputArgs = ['-i', partPaths[0]];
+    } else {
+      const listContent = partPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+      await fs.promises.writeFile(concatListPath, listContent, 'utf-8');
+      inputArgs = ['-f', 'concat', '-safe', '0', '-i', concatListPath];
+    }
+
+    // 1. Produce clean WhatsApp-compliant OGG/Opus PTT voice note
     await execFileAsync(
-      'ffmpeg',
-      ['-y', '-i', inPath, '-c:a', 'libopus', '-b:a', '48k', '-ar', '48000', '-ac', '1', outPath],
-      { timeout: 15000 }
+      bin,
+      [
+        '-y',
+        ...inputArgs,
+        '-map_metadata', '-1',
+        '-vn',
+        '-c:a', 'libopus',
+        '-application', 'voip',
+        '-b:a', '32k',
+        '-ar', '48000',
+        '-ac', '1',
+        '-avoid_negative_ts', 'make_zero',
+        '-f', 'ogg',
+        outOggPath,
+      ],
+      { timeout: 18000 }
     );
-    return await fs.promises.readFile(outPath);
+
+    // 2. Decode the generated OGG to lightweight 8kHz mono s16le PCM to compute exact seconds + waveform
+    await execFileAsync(
+      bin,
+      ['-y', '-i', outOggPath, '-f', 's16le', '-ac', '1', '-ar', '8000', outPcmPath],
+      { timeout: 12000 }
+    );
+
+    const [oggBuffer, pcmBuffer] = await Promise.all([
+      fs.promises.readFile(outOggPath),
+      fs.promises.readFile(outPcmPath),
+    ]);
+    const { seconds, waveform } = computePcmWaveformAndSeconds(pcmBuffer, 8000);
+
+    return { buffer: oggBuffer, seconds, waveform };
   } finally {
-    await fs.promises.unlink(inPath).catch(() => {});
-    await fs.promises.unlink(outPath).catch(() => {});
+    await Promise.all([
+      ...partPaths.map((p) => fs.promises.unlink(p).catch(() => {})),
+      fs.promises.unlink(concatListPath).catch(() => {}),
+      fs.promises.unlink(outOggPath).catch(() => {}),
+      fs.promises.unlink(outPcmPath).catch(() => {}),
+    ]);
   }
+}
+
+export async function convertAudioToOggOpus(mp3Buffer: Buffer): Promise<Buffer> {
+  const res = await convertAudioPartsToWhatsAppVoice([mp3Buffer]);
+  return res.buffer;
 }
 
 export async function synthesizeTtsVoiceNote(
   rawText: string,
   langHint?: string
-): Promise<{ buffer: Buffer; mimetype: string; ptt: boolean; lang: string }> {
+): Promise<{
+  buffer: Buffer;
+  mimetype: string;
+  ptt: boolean;
+  lang: string;
+  seconds?: number;
+  waveform?: Uint8Array;
+}> {
   const clean = rawText.trim().slice(0, 650);
   if (!clean) {
     throw new Error('Provide text or reply to a message for `.tts`.');
@@ -205,26 +319,28 @@ export async function synthesizeTtsVoiceNote(
     throw new Error('Could not synthesize voice audio for that text.');
   }
 
-  const mp3Buffer = Buffer.concat(audioParts);
   const hasFfmpeg = await isFfmpegAvailable();
   if (hasFfmpeg) {
     try {
-      const oggBuffer = await convertAudioToOggOpus(mp3Buffer);
+      const voice = await convertAudioPartsToWhatsAppVoice(audioParts);
       return {
-        buffer: oggBuffer,
+        buffer: voice.buffer,
         mimetype: 'audio/ogg; codecs=opus',
         ptt: true,
         lang: detectedLang,
+        seconds: voice.seconds,
+        waveform: voice.waveform,
       };
     } catch {
-      // Fallback cleanly to MP3 voice note if libopus fails
+      // Fallback cleanly below
     }
   }
 
+  // Fallback as standard audio (ptt: false) because WhatsApp cannot open MP3 with ptt: true
   return {
-    buffer: mp3Buffer,
+    buffer: audioParts[0],
     mimetype: 'audio/mpeg',
-    ptt: true,
+    ptt: false,
     lang: detectedLang,
   };
 }

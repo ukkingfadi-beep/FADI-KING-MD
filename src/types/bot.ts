@@ -85,6 +85,8 @@ export interface BotConfigView {
   anticallGlobal: boolean;
   antiScamGlobal: boolean;
   antiScamBlockAllStickers: boolean;
+  antiStatusMentionGlobal: boolean;
+  autoForwardIbToOpenGcs: boolean;
   stickerPack: string;
   stickerAuthor: string;
 }
@@ -179,6 +181,7 @@ export interface GroupConfig {
   antilink: boolean;
   antilinkMode?: AntilinkMode;
   antiScam?: boolean;
+  antiStatusMention?: boolean;
   welcome: boolean;
   goodbye: boolean;
 }
