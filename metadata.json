@@ -1,0 +1,6 @@
+{
+  "name": "FADI KING MD",
+  "description": "Professional WhatsApp Multi-Device Bot & VIP Pairing Control Board with 8-digit pairing codes, modular commands, and session security.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
