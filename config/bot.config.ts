@@ -144,7 +144,22 @@ export function loadConfig(): BotConfig {
       cachedConfig = {
         ...defaultConfig,
         ...fromDb,
+        botName: String(fromDb.botName || '').trim() || defaultConfig.botName,
+        ownerName: String(fromDb.ownerName || '').trim() || defaultConfig.ownerName,
         ownerNumber: normalizePhone(fromDb.ownerNumber || defaultConfig.ownerNumber),
+        prefix: String(fromDb.prefix || '').trim().slice(0, 3) || defaultConfig.prefix,
+        mode: fromDb.mode === 'self' ? 'self' : 'public',
+        vipOnlyPairing:
+          typeof fromDb.vipOnlyPairing === 'boolean'
+            ? fromDb.vipOnlyPairing
+            : defaultConfig.vipOnlyPairing,
+        stickerPack: String(fromDb.stickerPack || '').trim() || defaultConfig.stickerPack,
+        stickerAuthor: String(fromDb.stickerAuthor || '').trim() || defaultConfig.stickerAuthor,
+        menuImageUrl: String(fromDb.menuImageUrl || '').trim() || defaultConfig.menuImageUrl,
+        menuChannelJid: String(fromDb.menuChannelJid || '').trim(),
+        menuChannelName:
+          String(fromDb.menuChannelName || '').trim() || defaultConfig.menuChannelName,
+        menuChannelUrl: String(fromDb.menuChannelUrl || '').trim(),
         sessionDir: defaultConfig.sessionDir,
         databaseDir: defaultConfig.databaseDir,
       };
@@ -161,124 +176,215 @@ export function loadConfig(): BotConfig {
 export function saveConfig(partial: Partial<BotConfig>): BotConfig {
   ensureDirectories();
   const current = cachedConfig || loadConfig();
+  const cleanPartial: Partial<BotConfig> = {};
+  for (const [key, value] of Object.entries(partial)) {
+    if (value !== undefined) {
+      (cleanPartial as Record<string, unknown>)[key] = value;
+    }
+  }
+
   const minBroadcast = Math.max(
     1000,
-    Math.min(20000, Number(partial.broadcastDelayMinMs ?? partial.broadcastDelayMs ?? current.broadcastDelayMinMs))
+    Math.min(
+      20000,
+      Number(cleanPartial.broadcastDelayMinMs ?? cleanPartial.broadcastDelayMs ?? current.broadcastDelayMinMs) ||
+        defaultConfig.broadcastDelayMinMs
+    )
   );
   const maxBroadcast = Math.max(
     minBroadcast,
-    Math.min(30000, Number(partial.broadcastDelayMaxMs ?? current.broadcastDelayMaxMs))
+    Math.min(
+      30000,
+      Number(cleanPartial.broadcastDelayMaxMs ?? current.broadcastDelayMaxMs) ||
+        defaultConfig.broadcastDelayMaxMs
+    )
   );
 
   const minHumanDelay = Math.max(
     0,
-    Math.min(5000, Number(partial.humanDelayMinMs ?? current.humanDelayMinMs))
+    Math.min(
+      5000,
+      Number(cleanPartial.humanDelayMinMs ?? current.humanDelayMinMs) || 0
+    )
   );
   const maxHumanDelay = Math.max(
     minHumanDelay,
-    Math.min(8000, Number(partial.humanDelayMaxMs ?? current.humanDelayMaxMs))
+    Math.min(
+      8000,
+      Number(cleanPartial.humanDelayMaxMs ?? current.humanDelayMaxMs) ||
+        defaultConfig.humanDelayMaxMs
+    )
   );
 
   const next: BotConfig = {
     ...current,
-    ...partial,
-    ownerNumber: normalizePhone(partial.ownerNumber ?? current.ownerNumber),
-    prefix: (partial.prefix ?? current.prefix).trim().slice(0, 3) || '.',
-    mode: partial.mode === 'self' ? 'self' : partial.mode === 'public' ? 'public' : current.mode,
-    maxPairAttempts: Math.max(1, Math.min(20, Number(partial.maxPairAttempts ?? current.maxPairAttempts))),
-    pairWindowMinutes: Math.max(1, Math.min(120, Number(partial.pairWindowMinutes ?? current.pairWindowMinutes))),
-    pairCooldownSeconds: Math.max(5, Math.min(600, Number(partial.pairCooldownSeconds ?? current.pairCooldownSeconds))),
-    cmdCooldownSeconds: Math.max(0, Math.min(60, Number(partial.cmdCooldownSeconds ?? current.cmdCooldownSeconds))),
-    groupCmdCooldownSeconds: Math.max(0, Math.min(60, Number(partial.groupCmdCooldownSeconds ?? current.groupCmdCooldownSeconds))),
-    tagCooldownSeconds: Math.max(15, Math.min(1800, Number(partial.tagCooldownSeconds ?? current.tagCooldownSeconds))),
-    tagMaxPerHour: Math.max(1, Math.min(30, Number(partial.tagMaxPerHour ?? current.tagMaxPerHour))),
+    ...cleanPartial,
+    botName:
+      (typeof cleanPartial.botName === 'string' ? cleanPartial.botName.trim() : '') ||
+      String(current.botName || '').trim() ||
+      defaultConfig.botName,
+    ownerName:
+      (typeof cleanPartial.ownerName === 'string' ? cleanPartial.ownerName.trim() : '') ||
+      String(current.ownerName || '').trim() ||
+      defaultConfig.ownerName,
+    ownerNumber: normalizePhone(cleanPartial.ownerNumber ?? current.ownerNumber ?? defaultConfig.ownerNumber),
+    prefix:
+      (typeof cleanPartial.prefix === 'string' ? cleanPartial.prefix : current.prefix || '.')
+        .trim()
+        .slice(0, 3) || '.',
+    mode:
+      cleanPartial.mode === 'self'
+        ? 'self'
+        : cleanPartial.mode === 'public'
+          ? 'public'
+          : current.mode === 'self'
+            ? 'self'
+            : 'public',
+    vipOnlyPairing:
+      typeof cleanPartial.vipOnlyPairing === 'boolean'
+        ? cleanPartial.vipOnlyPairing
+        : Boolean(current.vipOnlyPairing),
+    maxPairAttempts: Math.max(
+      1,
+      Math.min(20, Number(cleanPartial.maxPairAttempts ?? current.maxPairAttempts) || defaultConfig.maxPairAttempts)
+    ),
+    pairWindowMinutes: Math.max(
+      1,
+      Math.min(120, Number(cleanPartial.pairWindowMinutes ?? current.pairWindowMinutes) || defaultConfig.pairWindowMinutes)
+    ),
+    pairCooldownSeconds: Math.max(
+      5,
+      Math.min(
+        600,
+        Number(cleanPartial.pairCooldownSeconds ?? current.pairCooldownSeconds) || defaultConfig.pairCooldownSeconds
+      )
+    ),
+    cmdCooldownSeconds: Math.max(
+      0,
+      Math.min(60, Number(cleanPartial.cmdCooldownSeconds ?? current.cmdCooldownSeconds) || 0)
+    ),
+    groupCmdCooldownSeconds: Math.max(
+      0,
+      Math.min(60, Number(cleanPartial.groupCmdCooldownSeconds ?? current.groupCmdCooldownSeconds) || 0)
+    ),
+    tagCooldownSeconds: Math.max(
+      15,
+      Math.min(
+        1800,
+        Number(cleanPartial.tagCooldownSeconds ?? current.tagCooldownSeconds) || defaultConfig.tagCooldownSeconds
+      )
+    ),
+    tagMaxPerHour: Math.max(
+      1,
+      Math.min(30, Number(cleanPartial.tagMaxPerHour ?? current.tagMaxPerHour) || defaultConfig.tagMaxPerHour)
+    ),
     broadcastDelayMs: minBroadcast,
     broadcastDelayMinMs: minBroadcast,
     broadcastDelayMaxMs: maxBroadcast,
-    maxBroadcastTargets: Math.max(1, Math.min(100, Number(partial.maxBroadcastTargets ?? current.maxBroadcastTargets))),
-    maxReconnectAttempts: Math.max(1, Math.min(20, Number(partial.maxReconnectAttempts ?? current.maxReconnectAttempts))),
+    maxBroadcastTargets: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(cleanPartial.maxBroadcastTargets ?? current.maxBroadcastTargets) || defaultConfig.maxBroadcastTargets
+      )
+    ),
+    maxReconnectAttempts: Math.max(
+      1,
+      Math.min(
+        20,
+        Number(cleanPartial.maxReconnectAttempts ?? current.maxReconnectAttempts) || defaultConfig.maxReconnectAttempts
+      )
+    ),
     autoReadMessages:
-      typeof partial.autoReadMessages === 'boolean'
-        ? partial.autoReadMessages
-        : current.autoReadMessages,
+      typeof cleanPartial.autoReadMessages === 'boolean'
+        ? cleanPartial.autoReadMessages
+        : Boolean(current.autoReadMessages),
     autoStatusSeen:
-      typeof partial.autoStatusSeen === 'boolean'
-        ? partial.autoStatusSeen
-        : current.autoStatusSeen,
+      typeof cleanPartial.autoStatusSeen === 'boolean'
+        ? cleanPartial.autoStatusSeen
+        : Boolean(current.autoStatusSeen),
     autoTyping:
-      typeof partial.autoTyping === 'boolean'
-        ? partial.autoTyping
-        : current.autoTyping,
+      typeof cleanPartial.autoTyping === 'boolean'
+        ? cleanPartial.autoTyping
+        : Boolean(current.autoTyping),
     autoRecording:
-      typeof partial.autoRecording === 'boolean'
-        ? partial.autoRecording
-        : current.autoRecording,
+      typeof cleanPartial.autoRecording === 'boolean'
+        ? cleanPartial.autoRecording
+        : Boolean(current.autoRecording),
     humanDelayEnabled:
-      typeof partial.humanDelayEnabled === 'boolean'
-        ? partial.humanDelayEnabled
-        : current.humanDelayEnabled,
+      typeof cleanPartial.humanDelayEnabled === 'boolean'
+        ? cleanPartial.humanDelayEnabled
+        : Boolean(current.humanDelayEnabled),
     humanDelayMinMs: minHumanDelay,
     humanDelayMaxMs: maxHumanDelay,
     autoJoinGroupInvite:
-      typeof partial.autoJoinGroupInvite === 'string'
-        ? partial.autoJoinGroupInvite.trim()
-        : current.autoJoinGroupInvite,
+      typeof cleanPartial.autoJoinGroupInvite === 'string'
+        ? cleanPartial.autoJoinGroupInvite.trim()
+        : String(current.autoJoinGroupInvite ?? ''),
     autoJoinChannelInvite:
-      typeof partial.autoJoinChannelInvite === 'string'
-        ? partial.autoJoinChannelInvite.trim()
-        : current.autoJoinChannelInvite,
+      typeof cleanPartial.autoJoinChannelInvite === 'string'
+        ? cleanPartial.autoJoinChannelInvite.trim()
+        : String(current.autoJoinChannelInvite ?? ''),
     sendConnectSelfMessage:
-      typeof partial.sendConnectSelfMessage === 'boolean'
-        ? partial.sendConnectSelfMessage
-        : current.sendConnectSelfMessage,
+      typeof cleanPartial.sendConnectSelfMessage === 'boolean'
+        ? cleanPartial.sendConnectSelfMessage
+        : Boolean(current.sendConnectSelfMessage ?? true),
     anticallGlobal:
-      typeof partial.anticallGlobal === 'boolean'
-        ? partial.anticallGlobal
-        : current.anticallGlobal,
+      typeof cleanPartial.anticallGlobal === 'boolean'
+        ? cleanPartial.anticallGlobal
+        : Boolean(current.anticallGlobal),
     antiScamGlobal:
-      typeof partial.antiScamGlobal === 'boolean'
-        ? partial.antiScamGlobal
-        : current.antiScamGlobal,
+      typeof cleanPartial.antiScamGlobal === 'boolean'
+        ? cleanPartial.antiScamGlobal
+        : Boolean(current.antiScamGlobal),
     antiScamBlockAllStickers:
-      typeof partial.antiScamBlockAllStickers === 'boolean'
-        ? partial.antiScamBlockAllStickers
-        : current.antiScamBlockAllStickers,
+      typeof cleanPartial.antiScamBlockAllStickers === 'boolean'
+        ? cleanPartial.antiScamBlockAllStickers
+        : Boolean(current.antiScamBlockAllStickers),
     antiStatusMentionGlobal:
-      typeof partial.antiStatusMentionGlobal === 'boolean'
-        ? partial.antiStatusMentionGlobal
-        : current.antiStatusMentionGlobal,
+      typeof cleanPartial.antiStatusMentionGlobal === 'boolean'
+        ? cleanPartial.antiStatusMentionGlobal
+        : Boolean(current.antiStatusMentionGlobal),
     autoForwardIbToOpenGcs:
-      typeof partial.autoForwardIbToOpenGcs === 'boolean'
-        ? partial.autoForwardIbToOpenGcs
-        : current.autoForwardIbToOpenGcs,
+      typeof cleanPartial.autoForwardIbToOpenGcs === 'boolean'
+        ? cleanPartial.autoForwardIbToOpenGcs
+        : Boolean(current.autoForwardIbToOpenGcs),
     autoReact:
-      typeof partial.autoReact === 'boolean'
-        ? partial.autoReact
-        : current.autoReact,
+      typeof cleanPartial.autoReact === 'boolean'
+        ? cleanPartial.autoReact
+        : Boolean(current.autoReact),
     aiEnabled:
-      typeof partial.aiEnabled === 'boolean'
-        ? partial.aiEnabled
-        : current.aiEnabled,
+      typeof cleanPartial.aiEnabled === 'boolean'
+        ? cleanPartial.aiEnabled
+        : Boolean(current.aiEnabled),
     singleTick:
-      typeof partial.singleTick === 'boolean'
-        ? partial.singleTick
-        : current.singleTick,
+      typeof cleanPartial.singleTick === 'boolean'
+        ? cleanPartial.singleTick
+        : Boolean(current.singleTick),
+    stickerPack:
+      (typeof cleanPartial.stickerPack === 'string' ? cleanPartial.stickerPack.trim() : '') ||
+      String(current.stickerPack || '').trim() ||
+      defaultConfig.stickerPack,
+    stickerAuthor:
+      (typeof cleanPartial.stickerAuthor === 'string' ? cleanPartial.stickerAuthor.trim() : '') ||
+      String(current.stickerAuthor || '').trim() ||
+      defaultConfig.stickerAuthor,
     menuImageUrl:
-      typeof partial.menuImageUrl === 'string'
-        ? partial.menuImageUrl.trim() || defaultConfig.menuImageUrl
-        : current.menuImageUrl,
+      typeof cleanPartial.menuImageUrl === 'string'
+        ? cleanPartial.menuImageUrl.trim() || defaultConfig.menuImageUrl
+        : String(current.menuImageUrl || '').trim() || defaultConfig.menuImageUrl,
     menuChannelJid:
-      typeof partial.menuChannelJid === 'string'
-        ? partial.menuChannelJid.trim()
-        : current.menuChannelJid,
+      typeof cleanPartial.menuChannelJid === 'string'
+        ? cleanPartial.menuChannelJid.trim()
+        : String(current.menuChannelJid ?? ''),
     menuChannelName:
-      typeof partial.menuChannelName === 'string'
-        ? partial.menuChannelName.trim() || defaultConfig.menuChannelName
-        : current.menuChannelName,
+      typeof cleanPartial.menuChannelName === 'string'
+        ? cleanPartial.menuChannelName.trim() || defaultConfig.menuChannelName
+        : String(current.menuChannelName || '').trim() || defaultConfig.menuChannelName,
     menuChannelUrl:
-      typeof partial.menuChannelUrl === 'string'
-        ? partial.menuChannelUrl.trim()
-        : current.menuChannelUrl,
+      typeof cleanPartial.menuChannelUrl === 'string'
+        ? cleanPartial.menuChannelUrl.trim()
+        : String(current.menuChannelUrl ?? ''),
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };

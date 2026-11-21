@@ -259,15 +259,19 @@ export function buildStylishMenuCaption(
     filterCat && categories.includes(filterCat) ? [filterCat] : categories;
 
   const uptime = formatUptime(process.uptime());
+  const safeBotName = String(cfg.botName || 'FADI KING MD').trim() || 'FADI KING MD';
+  const safeOwnerName = String(cfg.ownerName || 'FADI KING').trim() || 'FADI KING';
+  const safePrefix = String(cfg.prefix || '.').trim() || '.';
+  const safeMode = cfg.mode === 'self' ? 'PRIVATE' : 'PUBLIC';
 
   const lines: string[] = [
     `╭──✦ 🤖 「 *${toMathBold('BOT INFO')}* 」 ✦`,
-    `│ ◈ 👑 *${toMathBold(cfg.botName.toUpperCase())}*`,
-    `│ ◈ 🔱 *${toMathBold('OWNER')}:* *${toMathBold(cfg.ownerName.toUpperCase())}*`,
+    `│ ◈ 👑 *${toMathBold(safeBotName.toUpperCase())}*`,
+    `│ ◈ 🔱 *${toMathBold('OWNER')}:* *${toMathBold(safeOwnerName.toUpperCase())}*`,
     `│ ◈ 📜 *${toMathBold('COMMANDS')}:* *${cmds.length}*`,
     `│ ◈ ⏱️ *${toMathBold('RUNTIME')}:* *${uptime}*`,
-    `│ ◈ 📦 *${toMathBold('PREFIX')}:* *${cfg.prefix}*`,
-    `│ ◈ ⚙️ *${toMathBold('MODE')}:* *${cfg.mode === 'self' ? toMathBold('PRIVATE') : toMathBold('PUBLIC')}*`,
+    `│ ◈ 📦 *${toMathBold('PREFIX')}:* *${safePrefix}*`,
+    `│ ◈ ⚙️ *${toMathBold('MODE')}:* *${toMathBold(safeMode)}*`,
     `╰─────────────✦`,
     '',
   ];
@@ -277,9 +281,11 @@ export function buildStylishMenuCaption(
     const meta = categoryBannerTitles[cat];
     lines.push(`╭──✦ ${meta.emoji} 「 *${toMathBold(meta.label)}* 」 ✦`);
     for (const cmd of list) {
-      const icon = commandEmojiMap[cmd.name.toLowerCase()] || '◈';
-      const cmdLabel = toMathBold(cmd.name.toUpperCase());
-      lines.push(`│ ${icon} *${cfg.prefix}${cmdLabel}*`);
+      const cmdRaw = String(cmd.name || '').trim();
+      if (!cmdRaw) continue;
+      const icon = commandEmojiMap[cmdRaw.toLowerCase()] || '◈';
+      const cmdLabel = toMathBold(cmdRaw.toUpperCase());
+      lines.push(`│ ${icon} *${safePrefix}${cmdLabel}*`);
     }
     lines.push(`╰─────────────✦`);
     lines.push('');
@@ -311,28 +317,47 @@ export const generalCommands: BotCommand[] = [
         ]);
 
         if (imgBuf) {
-          await ctx.sock.sendMessage(
-            ctx.chatId,
-            {
-              image: imgBuf,
-              caption: output,
-              ...(contextInfo ? { contextInfo } : {}),
-            },
-            { quoted: ctx.msg ?? undefined }
-          );
-          return output;
+          try {
+            await ctx.sock.sendMessage(
+              ctx.chatId,
+              {
+                image: imgBuf,
+                caption: output,
+                ...(contextInfo ? { contextInfo } : {}),
+              },
+              { quoted: ctx.msg ?? undefined }
+            );
+            return output;
+          } catch {
+            if (contextInfo) {
+              try {
+                await ctx.sock.sendMessage(
+                  ctx.chatId,
+                  { image: imgBuf, caption: output },
+                  { quoted: ctx.msg ?? undefined }
+                );
+                return output;
+              } catch {
+                // Fall back to text reply below
+              }
+            }
+          }
         }
 
         if (contextInfo) {
-          await ctx.sock.sendMessage(
-            ctx.chatId,
-            {
-              text: output,
-              contextInfo,
-            },
-            { quoted: ctx.msg ?? undefined }
-          );
-          return output;
+          try {
+            await ctx.sock.sendMessage(
+              ctx.chatId,
+              {
+                text: output,
+                contextInfo,
+              },
+              { quoted: ctx.msg ?? undefined }
+            );
+            return output;
+          } catch {
+            // Fall back to plain reply below
+          }
         }
       }
 
@@ -354,7 +379,7 @@ export const generalCommands: BotCommand[] = [
         : Date.now();
       const inboundDelta = Math.max(1, Math.round(Date.now() - msgTs));
       const execMs = Math.max(0.2, performance.now() - start).toFixed(2);
-      const output = `*${loadConfig().botName} Pong*\n• Handler Latency: ${execMs} ms\n• Inbound Delta: ${ctx.isSimulated ? '12 ms (Console)' : `${inboundDelta} ms`}`;
+      const output = `*${loadConfig().botName || 'FADI KING MD'} Pong*\n• Handler Latency: ${execMs} ms\n• Inbound Delta: ${ctx.isSimulated ? '12 ms (Console)' : `${inboundDelta} ms`}`;
       await ctx.reply(output);
       return output;
     },
@@ -371,13 +396,16 @@ export const generalCommands: BotCommand[] = [
       const uptime = formatUptime(process.uptime());
       const memMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
       const vipCount = vipStore.listVips().filter((v) => v.active).length;
+      const safeBotName = String(cfg.botName || 'FADI KING MD');
+      const safeMode = (cfg.mode || 'public').toUpperCase();
+      const safePrefix = String(cfg.prefix || '.');
       const output = [
-        `*${cfg.botName} is Online*`,
+        `*${safeBotName} is Online*`,
         `• Uptime: ${uptime}`,
-        `• Mode: ${cfg.mode.toUpperCase()} | Prefix: \`${cfg.prefix}\``,
+        `• Mode: ${safeMode} | Prefix: \`${safePrefix}\``,
         `• Memory: ${memMb} MB RSS (${os.platform()} ${os.arch()})`,
         `• Active VIPs: ${vipCount}`,
-        `• Owner: ${cfg.ownerName} (+${cfg.ownerNumber})`,
+        `• Owner: ${cfg.ownerName || 'FADI KING'} (+${cfg.ownerNumber})`,
       ].join('\n');
       await ctx.reply(output);
       return output;
