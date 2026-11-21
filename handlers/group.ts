@@ -100,10 +100,13 @@ export async function handleGroupParticipantsUpdate(
       const displayName = (notifyName && notifyName.trim()) || (num ? `+${num}` : 'Friend');
 
       if (update.action === 'add' && groupCfg.welcome) {
-        // Short, nice welcome directed solely to the joining user using their name — never mentions group name
+        // Short, nice welcome posted inside the group (never to user's private IB)
+        const greetingTarget =
+          notifyName && notifyName.trim() ? `*${notifyName.trim()}* (@${num})` : `@${num}`;
         await sock
-          .sendMessage(targetDm, {
-            text: `Hello *${displayName}*! Welcome — glad to have you here. ✨`,
+          .sendMessage(groupId, {
+            text: `Hello ${greetingTarget}! Welcome — glad to have you here. ✨`,
+            mentions: [rawJid],
           })
           .catch(() => {});
       } else if (update.action === 'remove' && groupCfg.goodbye) {
