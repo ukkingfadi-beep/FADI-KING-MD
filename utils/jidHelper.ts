@@ -83,6 +83,7 @@ export function hasValidMediaPayload(
   const media =
     message.imageMessage ||
     message.videoMessage ||
+    message.ptvMessage ||
     message.audioMessage ||
     message.stickerMessage ||
     message.documentMessage;
@@ -315,16 +316,20 @@ export function unwrapMessage(
   message: proto.IMessage | null | undefined
 ): proto.IMessage | undefined {
   if (!message) return undefined;
-  return (
-    extractMessageContent(message) ||
-    message.ephemeralMessage?.message ||
-    message.viewOnceMessage?.message ||
-    message.viewOnceMessageV2?.message ||
-    message.viewOnceMessageV2Extension?.message ||
-    message.documentWithCaptionMessage?.message ||
-    message.editedMessage?.message?.protocolMessage?.editedMessage ||
-    message
-  );
+  let current: proto.IMessage | undefined = message;
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    const next: proto.IMessage | null | undefined =
+      current.ephemeralMessage?.message ||
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
+      current.documentWithCaptionMessage?.message ||
+      current.editedMessage?.message?.protocolMessage?.editedMessage ||
+      current.associatedChildMessage?.message;
+    if (!next) break;
+    current = next;
+  }
+  return extractMessageContent(current) || current;
 }
 
 export function extractBodyText(message: proto.IMessage | null | undefined): string {

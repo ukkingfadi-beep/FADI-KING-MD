@@ -28,6 +28,7 @@ import {
   rememberUserName,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { precacheViewOnceMedia } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
@@ -68,6 +69,7 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 const vipSubSockets = new Map<string, { sock: WASocket; info: ActiveSessionInfo }>();
 const vipReconnectTimers = new Map<string, NodeJS.Timeout>();
 const messageCache = new Map<string, WAMessage>();
+const messageByIdCache = new Map<string, WAMessage>();
 const persistedSessionsCache = new Set<string>();
 let mainHasSavedCredsCache = false;
 let persistedCacheLoaded = false;
@@ -108,21 +110,32 @@ function cacheMessage(msg: WAMessage): void {
   const jid = msg.key?.remoteJid;
   const id = msg.key?.id;
   if (!jid || !id || !msg.message) return;
-  const cacheKey = `${jid}:${id}`;
+  const bareJid = normalizeBareJid(jid);
+  const cacheKey = `${bareJid}:${id}`;
   messageCache.set(cacheKey, msg);
+  messageByIdCache.set(id, msg);
   if (messageCache.size > 4000) {
     const oldest = messageCache.keys().next().value;
     if (oldest) messageCache.delete(oldest);
   }
+  if (messageByIdCache.size > 4000) {
+    const oldestId = messageByIdCache.keys().next().value;
+    if (oldestId) messageByIdCache.delete(oldestId);
+  }
 }
 
 function getCachedMessage(chatId: string, msgId: string): WAMessage | undefined {
-  return messageCache.get(`${chatId}:${msgId}`);
+  const bareChat = normalizeBareJid(chatId);
+  return (
+    messageCache.get(`${bareChat}:${msgId}`) ||
+    messageCache.get(`${chatId}:${msgId}`) ||
+    messageByIdCache.get(msgId)
+  );
 }
 
 async function getBaileysMessage(key: WAMessageKey) {
-  if (!key.remoteJid || !key.id) return undefined;
-  return messageCache.get(`${key.remoteJid}:${key.id}`)?.message || undefined;
+  if (!key.id) return undefined;
+  return getCachedMessage(key.remoteJid || '', key.id)?.message || undefined;
 }
 
 // Cache WA Web version in memory so pairing doesn't block on network fetch every request
@@ -693,10 +706,12 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
     });
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-      if (type !== 'notify') return;
       for (const msg of messages) {
         cacheMessage(msg);
-        void handleIncomingMessage(sock, msg, getCachedMessage);
+        void precacheViewOnceMedia(sock, msg);
+        if (type === 'notify') {
+          void handleIncomingMessage(sock, msg, getCachedMessage);
+        }
       }
     });
 
@@ -974,10 +989,12 @@ async function connectSubSession(params: {
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
     for (const m of messages) {
       cacheMessage(m);
-      void handleIncomingMessage(sock, m, getCachedMessage);
+      void precacheViewOnceMedia(sock, m);
+      if (type === 'notify') {
+        void handleIncomingMessage(sock, m, getCachedMessage);
+      }
     }
   });
 

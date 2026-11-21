@@ -7,7 +7,12 @@ import ffmpegStatic from 'ffmpeg-static';
 import { downloadMediaMessage, getContentType, proto, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
-import { extractContextInfo, unwrapMessage } from './jidHelper.ts';
+import {
+  extractContextInfo,
+  hasValidMediaPayload,
+  normalizeBareJid,
+  unwrapMessage,
+} from './jidHelper.ts';
 import { isGeminiConfigured, synthesizePakistaniFemaleTts } from './geminiService.ts';
 
 const execFileAsync = promisify(execFile);
@@ -35,21 +40,84 @@ export function extractQuotedMessage(msg: WAMessage): proto.IMessage | null {
   return unwrapMessage(ctx.quotedMessage) || ctx.quotedMessage;
 }
 
+export function isViewOnceMediaMessage(message: proto.IMessage | null | undefined): boolean {
+  let current: proto.IMessage | undefined = message || undefined;
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    if (
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message
+    ) {
+      return true;
+    }
+    if (
+      current.imageMessage?.viewOnce ||
+      current.videoMessage?.viewOnce ||
+      current.audioMessage?.viewOnce ||
+      current.ptvMessage?.viewOnce
+    ) {
+      return true;
+    }
+    const next: proto.IMessage | null | undefined =
+      current.ephemeralMessage?.message ||
+      current.documentWithCaptionMessage?.message ||
+      current.associatedChildMessage?.message;
+    if (!next) break;
+    current = next;
+  }
+  return false;
+}
+
 export function unwrapViewOnce(message: proto.IMessage | null | undefined): proto.IMessage | null {
   if (!message) return null;
-  const unwrapped = unwrapMessage(message) || message;
-  if (unwrapped.viewOnceMessage?.message) return unwrapped.viewOnceMessage.message;
-  if (unwrapped.viewOnceMessageV2?.message) return unwrapped.viewOnceMessageV2.message;
-  if (unwrapped.viewOnceMessageV2Extension?.message) return unwrapped.viewOnceMessageV2Extension.message;
-  return unwrapped.imageMessage || unwrapped.videoMessage || unwrapped.audioMessage ? unwrapped : null;
+  let current: proto.IMessage | undefined = message;
+  for (let depth = 0; depth < 6 && current; depth += 1) {
+    const next: proto.IMessage | null | undefined =
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
+      current.ephemeralMessage?.message ||
+      current.documentWithCaptionMessage?.message ||
+      current.associatedChildMessage?.message;
+    if (!next) break;
+    current = next;
+  }
+  const unwrapped = unwrapMessage(current) || current;
+  if (
+    unwrapped?.imageMessage ||
+    unwrapped?.videoMessage ||
+    unwrapped?.ptvMessage ||
+    unwrapped?.audioMessage
+  ) {
+    return unwrapped;
+  }
+  return null;
+}
+
+function ensureDownloadableUrl(message: proto.IMessage): proto.IMessage {
+  const clone: proto.IMessage = { ...message };
+  for (const key of ['imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage', 'stickerMessage', 'documentMessage'] as const) {
+    const media = clone[key];
+    if (media && !media.url && media.directPath) {
+      clone[key] = {
+        ...media,
+        url: `https://mmg.whatsapp.net${media.directPath}`,
+      } as typeof media;
+    }
+  }
+  return clone;
 }
 
 export async function downloadMessageMedia(
   sock: WASocket,
   targetMessage: WAMessage
 ): Promise<Buffer> {
+  const normalizedMessage = targetMessage.message
+    ? { ...targetMessage, message: ensureDownloadableUrl(unwrapMessage(targetMessage.message) || targetMessage.message) }
+    : targetMessage;
+
   const result = await downloadMediaMessage(
-    targetMessage,
+    normalizedMessage,
     'buffer',
     {},
     {
@@ -58,6 +126,107 @@ export async function downloadMessageMedia(
     }
   );
   return Buffer.isBuffer(result) ? result : Buffer.from(result);
+}
+
+export interface CachedViewOnceEntry {
+  type: 'image' | 'video' | 'audio';
+  buffer: Buffer;
+  mimetype?: string;
+  caption?: string;
+  ptt?: boolean;
+  seconds?: number;
+}
+
+const MAX_VIEW_ONCE_CACHE_ITEMS = 40;
+const MAX_VIEW_ONCE_CACHE_BYTES = 20 * 1024 * 1024;
+const viewOnceMediaCache = new Map<string, CachedViewOnceEntry>();
+const viewOnceInflight = new Map<string, Promise<void>>();
+
+export function getCachedViewOnceMedia(
+  chatId: string,
+  msgId: string
+): CachedViewOnceEntry | undefined {
+  if (!msgId) return undefined;
+  const bareChat = normalizeBareJid(chatId);
+  return (
+    viewOnceMediaCache.get(`${bareChat}:${msgId}`) ||
+    viewOnceMediaCache.get(`${chatId}:${msgId}`) ||
+    viewOnceMediaCache.get(`id:${msgId}`)
+  );
+}
+
+export async function waitForViewOnceInflight(msgId: string): Promise<void> {
+  const pending = viewOnceInflight.get(msgId);
+  if (pending) {
+    await pending.catch(() => {});
+  }
+}
+
+export async function precacheViewOnceMedia(
+  sock: WASocket,
+  msg: WAMessage
+): Promise<void> {
+  const chatId = msg.key?.remoteJid;
+  const msgId = msg.key?.id;
+  if (!chatId || !msgId || !msg.message) return;
+  if (!isViewOnceMediaMessage(msg.message)) return;
+
+  const bareChat = normalizeBareJid(chatId);
+  const idKey = `id:${msgId}`;
+  if (viewOnceMediaCache.has(idKey) || viewOnceInflight.has(msgId)) return;
+
+  const inner = unwrapViewOnce(msg.message);
+  if (!inner || !hasValidMediaPayload(inner)) return;
+
+  const mediaType = detectMediaType(inner);
+  if (mediaType !== 'image' && mediaType !== 'video' && mediaType !== 'audio') return;
+
+  const task = (async () => {
+    try {
+      const buf = await downloadMessageMedia(sock, {
+        key: msg.key,
+        message: inner,
+      });
+      if (!buf || buf.length === 0 || buf.length > MAX_VIEW_ONCE_CACHE_BYTES) return;
+
+      const entry: CachedViewOnceEntry = {
+        type: mediaType,
+        buffer: buf,
+        mimetype:
+          inner.audioMessage?.mimetype ||
+          inner.videoMessage?.mimetype ||
+          inner.ptvMessage?.mimetype ||
+          inner.imageMessage?.mimetype ||
+          undefined,
+        caption:
+          inner.imageMessage?.caption ||
+          inner.videoMessage?.caption ||
+          undefined,
+        ptt: inner.audioMessage ? inner.audioMessage.ptt !== false : undefined,
+        seconds:
+          inner.audioMessage?.seconds ||
+          inner.videoMessage?.seconds ||
+          inner.ptvMessage?.seconds ||
+          undefined,
+      };
+
+      viewOnceMediaCache.set(`${bareChat}:${msgId}`, entry);
+      viewOnceMediaCache.set(idKey, entry);
+
+      while (viewOnceMediaCache.size > MAX_VIEW_ONCE_CACHE_ITEMS * 2) {
+        const oldest = viewOnceMediaCache.keys().next().value;
+        if (!oldest) break;
+        viewOnceMediaCache.delete(oldest);
+      }
+    } catch {
+      // Fallback to live download / reupload on .vv invocation
+    } finally {
+      viewOnceInflight.delete(msgId);
+    }
+  })();
+
+  viewOnceInflight.set(msgId, task);
+  await task;
 }
 
 export async function convertMediaToWebpSticker(inputBuffer: Buffer, isVideo: boolean): Promise<Buffer> {
@@ -134,7 +303,7 @@ export function detectMediaType(message: proto.IMessage | null | undefined): 'im
   if (!message) return 'unknown';
   const type = getContentType(message);
   if (type === 'imageMessage') return 'image';
-  if (type === 'videoMessage') return 'video';
+  if (type === 'videoMessage' || type === 'ptvMessage') return 'video';
   if (type === 'stickerMessage') return 'sticker';
   if (type === 'audioMessage') return 'audio';
   return 'unknown';

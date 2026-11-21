@@ -17,8 +17,10 @@ import {
   detectMediaType,
   downloadMessageMedia,
   extractQuotedMessage,
+  getCachedViewOnceMedia,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
+  waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand } from './types.ts';
@@ -198,58 +200,96 @@ export const mediaCommands: BotCommand[] = [
     name: 'vv',
     aliases: ['viewonce', 'rvo'],
     category: 'media',
-    description: 'View-once media ko normal viewable media mein extract kare',
-    usage: 'vv (reply to view-once message)',
+    description: 'View-once photo, video ya voice note ko normal viewable media mein extract kare',
+    usage: 'vv (reply to view-once photo/video/voice)',
     cooldownSeconds: 2,
     execute: async (ctx) => {
       if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
-        const msg = 'Reply to a View-Once photo or video on WhatsApp with `.vv` to unwrap it.';
+        const msg = 'Reply to a View-Once photo, video, or voice note on WhatsApp with `.vv` to unwrap it.';
         await ctx.reply(msg);
         return msg;
       }
 
       const ctxInfo = extractContextInfo(ctx.msg.message);
+      const stanzaId = ctxInfo?.stanzaId || '';
+
+      // 1. Check pre-cached View-Once media buffer first (works even after View-Once was opened)
+      if (stanzaId) {
+        await waitForViewOnceInflight(stanzaId);
+        const preCached = getCachedViewOnceMedia(ctx.chatId, stanzaId);
+        if (preCached) {
+          if (preCached.type === 'image') {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              image: preCached.buffer,
+              caption: preCached.caption || `View-Once extracted by ${loadConfig().botName}`,
+            });
+          } else if (preCached.type === 'video') {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              video: preCached.buffer,
+              caption: preCached.caption || `View-Once extracted by ${loadConfig().botName}`,
+            });
+          } else {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              audio: preCached.buffer,
+              mimetype: preCached.mimetype || 'audio/ogg; codecs=opus',
+              ptt: Boolean(preCached.ptt ?? true),
+              seconds: preCached.seconds,
+            });
+          }
+          return 'View-Once media unwrapped.';
+        }
+      }
+
       const quoted = extractQuotedMessage(ctx.msg);
       let inner = unwrapViewOnce(quoted) || unwrapViewOnce(ctx.msg.message) || quoted;
+      let sourceKey = stanzaId
+        ? {
+            remoteJid: ctx.chatId,
+            fromMe: false,
+            id: stanzaId,
+            participant: ctxInfo?.participant || undefined,
+          }
+        : ctx.msg.key;
 
-      // If WhatsApp stripped directPath/url from the quoted View-Once after opening, check live message cache
-      if ((!inner || !hasValidMediaPayload(inner)) && ctxInfo?.stanzaId && ctx.getCachedMessage) {
-        const cachedOrig = ctx.getCachedMessage(ctx.chatId, ctxInfo.stanzaId);
+      // 2. Fallback to cached original WAMessage (WhatsApp strips mediaKey from quoted View-Once replies)
+      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId && ctx.getCachedMessage) {
+        const cachedOrig = ctx.getCachedMessage(ctx.chatId, stanzaId);
         if (cachedOrig?.message) {
           const cachedInner =
             unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
           if (cachedInner && hasValidMediaPayload(cachedInner)) {
             inner = cachedInner;
+            sourceKey = cachedOrig.key || sourceKey;
           }
         }
       }
 
       if (!inner) {
-        const msg = `Reply to a View-Once message with \`${ctx.prefix}vv\`.`;
+        const msg = `Reply to a View-Once photo, video, or voice note with \`${ctx.prefix}vv\`.`;
         await ctx.reply(msg);
         return msg;
       }
 
       const type = detectMediaType(inner);
       if (type !== 'image' && type !== 'video' && type !== 'audio') {
-        const msg = 'No View-Once image, video, or audio detected in the quoted message.';
+        const msg = 'No View-Once image, video, or voice note detected in the quoted message.';
         await ctx.reply(msg);
         return msg;
       }
 
       if (!hasValidMediaPayload(inner)) {
         const msg =
-          'This View-Once media has already expired or was opened before the bot cached it. Ask the sender to send it again.';
+          'This View-Once media was opened or sent before the bot started caching. Ask the sender to send it again.';
         await ctx.reply(msg);
         return msg;
       }
 
       try {
-        const fakeInfo: WAMessage = {
-          key: ctx.msg.key,
+        const targetInfo: WAMessage = {
+          key: sourceKey,
           message: inner,
         };
-        const buffer = await downloadMessageMedia(ctx.sock, fakeInfo);
+        const buffer = await downloadMessageMedia(ctx.sock, targetInfo);
 
         if (type === 'image') {
           await ctx.sock.sendMessage(ctx.chatId, {
@@ -262,9 +302,12 @@ export const mediaCommands: BotCommand[] = [
             caption: inner.videoMessage?.caption || `View-Once extracted by ${loadConfig().botName}`,
           });
         } else {
+          const audioMeta = inner.audioMessage;
           await ctx.sock.sendMessage(ctx.chatId, {
             audio: buffer,
-            mimetype: 'audio/mp4',
+            mimetype: audioMeta?.mimetype || 'audio/ogg; codecs=opus',
+            ptt: audioMeta?.ptt !== false,
+            seconds: audioMeta?.seconds || undefined,
           });
         }
         return 'View-Once media unwrapped.';
