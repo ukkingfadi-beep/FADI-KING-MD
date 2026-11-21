@@ -71,6 +71,7 @@ const vipReconnectTimers = new Map<string, NodeJS.Timeout>();
 const messageCache = new Map<string, WAMessage>();
 const messageByIdCache = new Map<string, WAMessage>();
 const persistedSessionsCache = new Set<string>();
+const pendingFreshPairs = new Set<string>();
 let mainHasSavedCredsCache = false;
 let persistedCacheLoaded = false;
 
@@ -383,15 +384,27 @@ function handleSessionOpenActions(params: {
   const { sock, sessionKey, phone, authDir, isFreshPair } = params;
   const cfg = loadConfig();
   const targetJid = phone ? `${phone}@s.whatsapp.net` : sock.user?.id || '';
+  const wasPendingFreshPair = pendingFreshPairs.delete(sessionKey);
+  const effectiveFreshPair = isFreshPair || wasPendingFreshPair;
 
   persistedSessionsCache.add(sessionKey);
   if (sessionKey === 'main') mainHasSavedCredsCache = true;
+
+  if (phone) {
+    vipStore.recordConnectedSession({
+      number: phone,
+      name: sock.user?.name || (sessionKey === 'main' ? cfg.botName : `+${phone}`),
+      sessionId: sessionKey,
+      incrementCount: effectiveFreshPair,
+      status: 'connected',
+    });
+  }
 
   // 1. Send connection confirmation message into bot's own IB/DM
   if (cfg.sendConnectSelfMessage && targetJid) {
     const now = Date.now();
     const prevAt = lastConnectNoticeAt.get(sessionKey) || 0;
-    if (isFreshPair || now - prevAt > 5 * 60_000) {
+    if (effectiveFreshPair || now - prevAt > 5 * 60_000) {
       lastConnectNoticeAt.set(sessionKey, now);
       const t = setTimeout(() => {
         void sock
@@ -414,7 +427,7 @@ function handleSessionOpenActions(params: {
       sock,
       sessionKey,
       authDir,
-      forceCheck: isFreshPair,
+      forceCheck: effectiveFreshPair,
     });
   }, 1100);
   if (typeof joinTimer.unref === 'function') joinTimer.unref();
@@ -575,6 +588,9 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
   botState.qrDataUrl = null;
   botState.pairingCode = null;
   botState.pairingPhone = options?.pairingPhone ? normalizePhone(options.pairingPhone) : null;
+  if (options?.pairingPhone) {
+    pendingFreshPairs.add('main');
+  }
 
   try {
     const [{ state, saveCreds }, version] = await Promise.all([
@@ -660,10 +676,12 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       const { connection, lastDisconnect, qr } = update;
 
       if (qr && options?.pairingPhone && !mainPairingTriggered) {
+        pendingFreshPairs.add('main');
         void triggerMainPairing();
       }
 
       if (qr && !options?.pairingPhone) {
+        pendingFreshPairs.add('main');
         try {
           botState.qrDataUrl = await QRCode.toDataURL(qr, {
             margin: 2,
@@ -712,6 +730,8 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
         }
 
         if (isTerminalDisconnect(statusCode)) {
+          pendingFreshPairs.delete('main');
+          vipStore.markSessionStatus('main', 'logged_out');
           botState.status = 'logged_out';
           botState.qrDataUrl = null;
           botState.pairingCode = null;
@@ -738,6 +758,7 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
           return;
         }
 
+        vipStore.markSessionStatus('main', 'offline');
         botState.status = 'disconnected';
         botState.lastError = reasonText;
 
@@ -827,6 +848,10 @@ export async function disconnectMainBot(clearSession = false): Promise<void> {
     fs.mkdirSync(authDir, { recursive: true });
     mainHasSavedCredsCache = false;
     persistedSessionsCache.delete('main');
+    pendingFreshPairs.delete('main');
+    vipStore.markSessionStatus('main', 'logged_out');
+  } else {
+    vipStore.markSessionStatus('main', 'offline');
   }
   botState.status = 'idle';
   botState.qrDataUrl = null;
@@ -986,6 +1011,8 @@ async function connectSubSession(params: {
       if (isTerminalDisconnect(statusCode)) {
         sessionInfo.status = 'logged_out';
         vipSubSockets.delete(sessionId);
+        pendingFreshPairs.delete(sessionId);
+        vipStore.markSessionStatus(sessionId, 'logged_out');
         logger.security(
           'pairing',
           `Session ${sessionId} unlinked/logged out (code=${String(statusCode ?? 'unknown')}).`
@@ -1017,6 +1044,7 @@ async function connectSubSession(params: {
         return;
       }
 
+      vipStore.markSessionStatus(sessionId, 'offline');
       if (hasSavedAuth(authDir)) {
         sessionInfo.status = 'connecting';
         const delayMs = Math.min(30_000, 1000 * Math.pow(1.6, Math.min(reconnectAttempt, 6))) + getRandomDelayMs(150, 500);
@@ -1103,6 +1131,7 @@ export async function requestVipSubPairingCode(
     await fs.promises.rm(authDir, { recursive: true, force: true }).catch(() => {});
     await fs.promises.mkdir(authDir, { recursive: true });
     persistedSessionsCache.add(sessionId);
+    pendingFreshPairs.add(sessionId);
 
     const { info, pairingCodePromise } = await connectSubSession({
       sessionId,
@@ -1202,6 +1231,13 @@ async function restoreSessionsInBatches(sessionNames: string[], sessionDir: stri
         if (!(await hasSavedAuthAsync(subDir))) return;
         persistedSessionsCache.add(name);
         const cleanPhone = name.replace(/^vip_/, '');
+        vipStore.recordConnectedSession({
+          number: cleanPhone,
+          name: `+${cleanPhone}`,
+          sessionId: name,
+          incrementCount: false,
+          status: 'offline',
+        });
         await connectSubSession({
           sessionId: name,
           cleanPhone,
@@ -1283,6 +1319,22 @@ export function initializeSavedSessionOnBoot(): void {
     if (await hasSavedAuthAsync(mainAuthDir)) {
       mainHasSavedCredsCache = true;
       persistedSessionsCache.add('main');
+      try {
+        const credsRaw = await fs.promises.readFile(path.join(mainAuthDir, 'creds.json'), 'utf-8');
+        const creds = JSON.parse(credsRaw) as { me?: { id?: string; name?: string } };
+        const mainPhone = normalizePhone((creds.me?.id || '').split('@')[0].split(':')[0]);
+        if (mainPhone) {
+          vipStore.recordConnectedSession({
+            number: mainPhone,
+            name: creds.me?.name || cfg.botName,
+            sessionId: 'main',
+            incrementCount: false,
+            status: 'offline',
+          });
+        }
+      } catch {
+        // Ignore creds read failure
+      }
       logger.info('boot', 'Found existing Main WhatsApp MD credentials. Auto-reconnecting...');
       void startMainBot();
     }

@@ -86,13 +86,21 @@ export function PublicPairingBoard({
   useEffect(() => {
     if (!generatedPhone) return;
     let cancelled = false;
+    let notifiedConnected = false;
     const pollStatus = async () => {
       try {
-        const res = await fetch(`/api/bot/pair-status?phone=${encodeURIComponent(generatedPhone)}`);
+        const res = await fetch(
+          `/api/bot/pair-status?phone=${encodeURIComponent(generatedPhone)}`,
+          { cache: 'no-store' }
+        );
         if (!res.ok) return;
         const data = (await res.json()) as { status?: ConnectionStatus };
         if (!cancelled && data.status) {
           setPairStatus(data.status);
+          if (data.status === 'connected' && !notifiedConnected) {
+            notifiedConnected = true;
+            void onRefresh();
+          }
         }
       } catch {
         // Ignore transient status poll
@@ -106,7 +114,7 @@ export function PublicPairingBoard({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [generatedPhone]);
+  }, [generatedPhone, onRefresh]);
 
   async function handleGenerateCode(e: FormEvent) {
     e.preventDefault();

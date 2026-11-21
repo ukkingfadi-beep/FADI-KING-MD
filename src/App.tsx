@@ -98,7 +98,7 @@ export default function App() {
 
   const fetchPublicState = useCallback(async () => {
     try {
-      const res = await fetch('/api/public/state');
+      const res = await fetch('/api/public/state', { cache: 'no-store' });
       if (!res.ok) return;
       const data = (await res.json()) as PublicStateResponse;
       setPublicState(data);
@@ -123,10 +123,10 @@ export default function App() {
     const headers = { Authorization: `Bearer ${adminToken}` };
     try {
       const [statusRes, vipsRes, cmdsRes, groupsRes] = await Promise.all([
-        fetch('/api/bot/status', { headers }),
-        fetch('/api/vips', { headers }),
-        fetch('/api/commands', { headers }),
-        fetch('/api/groups', { headers }),
+        fetch('/api/bot/status', { headers, cache: 'no-store' }),
+        fetch('/api/vips', { headers, cache: 'no-store' }),
+        fetch('/api/commands', { headers, cache: 'no-store' }),
+        fetch('/api/groups', { headers, cache: 'no-store' }),
       ]);
 
       if (statusRes.status === 401) {

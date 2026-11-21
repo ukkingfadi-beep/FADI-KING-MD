@@ -172,12 +172,20 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
                     +{u.number}
                   </div>
                   <div className="text-xs text-[#9E97C2] truncate">
-                    {u.name} · <span className="capitalize">{u.tier}</span>
+                    {u.name} ·{' '}
+                    <span className="capitalize">
+                      {u.tier === 'paired' ? 'Paired Bot' : u.tier}
+                    </span>
                   </div>
                 </div>
-                <span className="text-[11px] font-mono tabular-nums text-[#C4B5FD] shrink-0">
-                  {u.pairingCount}x
-                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  {u.online && (
+                    <span className="text-[11px] font-medium text-emerald-400">Live</span>
+                  )}
+                  <span className="text-[11px] font-mono tabular-nums text-[#C4B5FD]">
+                    {u.pairingCount}x
+                  </span>
+                </div>
               </div>
             ))}
           </div>

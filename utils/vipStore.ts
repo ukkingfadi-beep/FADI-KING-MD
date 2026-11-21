@@ -24,6 +24,16 @@ export interface VipUser {
   active: boolean;
 }
 
+export interface PairedUserEntry {
+  number: string;
+  name: string;
+  sessionId: string;
+  status: 'connected' | 'offline' | 'logged_out';
+  pairingCount: number;
+  firstPairedAt: string;
+  lastPairedAt: string;
+}
+
 export interface GroupConfig {
   groupId: string;
   antilink: boolean;
@@ -67,6 +77,7 @@ const groupsFile = path.join(dbDir, 'groups.json');
 const pairingLogsFile = path.join(dbDir, 'pairing_logs.json');
 
 let vipsCache: VipUser[] | null = null;
+let pairedUsersCache: PairedUserEntry[] | null = null;
 let groupsCache: Record<string, GroupConfig> | null = null;
 let pairingLogsCache: PairingAuditEntry[] | null = null;
 let bannedStickersCache: BannedStickerEntry[] | null = null;
@@ -74,6 +85,7 @@ let protectedPostsCache: Record<string, ProtectedPostEntry> | null = null;
 
 registerDbHydrationHook(() => {
   vipsCache = null;
+  pairedUsersCache = null;
   groupsCache = null;
   pairingLogsCache = null;
   bannedStickersCache = null;
@@ -245,6 +257,226 @@ export const vipStore = {
       vipsCache = vips;
       dbSetSync('vips', vips);
     }
+  },
+
+  listPairedUsers(): PairedUserEntry[] {
+    if (pairedUsersCache) return [...pairedUsersCache];
+    const fromDb = dbGetSync<PairedUserEntry[]>('paired_users') || [];
+    pairedUsersCache = Array.isArray(fromDb) ? fromDb : [];
+    return [...pairedUsersCache];
+  },
+
+  recordConnectedSession(input: {
+    number: string;
+    name?: string;
+    sessionId: string;
+    incrementCount?: boolean;
+    status?: 'connected' | 'offline';
+  }): PairedUserEntry | null {
+    const cleaned = normalizePhone(input.number || '');
+    if (!cleaned || cleaned.length < 7) return null;
+
+    const list = this.listPairedUsers();
+    const nowIso = new Date().toISOString();
+    const cleanName = String(input.name || '').trim();
+    const nextStatus = input.status || 'connected';
+
+    const idx = list.findIndex((u) => u.number === cleaned);
+    if (idx >= 0) {
+      const existing = list[idx];
+      const updated: PairedUserEntry = {
+        ...existing,
+        number: cleaned,
+        name:
+          cleanName && !cleanName.startsWith('+')
+            ? cleanName
+            : existing.name || cleanName || `+${cleaned}`,
+        sessionId: input.sessionId || existing.sessionId,
+        status: nextStatus,
+        pairingCount: Math.max(
+          existing.pairingCount || 0,
+          input.incrementCount ? (existing.pairingCount || 0) + 1 : 1
+        ),
+        lastPairedAt: nextStatus === 'connected' ? nowIso : existing.lastPairedAt || nowIso,
+      };
+      list[idx] = updated;
+      pairedUsersCache = list;
+      dbSetSync('paired_users', list);
+      return updated;
+    }
+
+    const created: PairedUserEntry = {
+      number: cleaned,
+      name: cleanName || `+${cleaned}`,
+      sessionId: input.sessionId,
+      status: nextStatus,
+      pairingCount: 1,
+      firstPairedAt: nowIso,
+      lastPairedAt: nowIso,
+    };
+    list.push(created);
+    pairedUsersCache = list;
+    dbSetSync('paired_users', list);
+    return created;
+  },
+
+  markSessionStatus(numberOrSessionId: string, status: 'connected' | 'offline' | 'logged_out'): void {
+    const raw = String(numberOrSessionId || '').trim();
+    if (!raw) return;
+    const cleaned = normalizePhone(raw);
+    const list = this.listPairedUsers();
+    let changed = false;
+
+    const nextList = list.map((u) => {
+      const matchesSession = u.sessionId === raw;
+      const matchesPhone = Boolean(cleaned) && u.number === cleaned && raw !== 'main';
+      if (!matchesSession && !matchesPhone) return u;
+      if (u.status === status) return u;
+      changed = true;
+      return {
+        ...u,
+        status,
+        lastPairedAt: status === 'connected' ? new Date().toISOString() : u.lastPairedAt,
+      };
+    });
+
+    if (changed) {
+      pairedUsersCache = nextList;
+      dbSetSync('paired_users', nextList);
+    }
+  },
+
+  getCombinedActiveUsers(liveSnapshot?: {
+    status?: string;
+    connectedUser?: { phone?: string; name?: string } | null;
+    subSessions?: Array<{
+      phone?: string;
+      status?: string;
+      connectedUser?: { phone?: string; name?: string };
+      createdAt?: string;
+    }>;
+  }): {
+    activePaidUsersCount: number;
+    activeVipsCount: number;
+    totalPairings: number;
+    users: Array<{
+      number: string;
+      name: string;
+      tier: VipTier | 'paired';
+      online: boolean;
+      pairingCount: number;
+      lastPairedAt?: string;
+    }>;
+  } {
+    const vips = this.listVips().filter((v) => v.active);
+    const pairedUsers = this.listPairedUsers().filter((u) => u.status !== 'logged_out');
+
+    const merged = new Map<
+      string,
+      {
+        number: string;
+        name: string;
+        tier: VipTier | 'paired';
+        online: boolean;
+        pairingCount: number;
+        lastPairedAt?: string;
+      }
+    >();
+
+    for (const vip of vips) {
+      const clean = normalizePhone(vip.number);
+      if (!clean) continue;
+      merged.set(clean, {
+        number: clean,
+        name: vip.name || `VIP ${clean.slice(-4)}`,
+        tier: vip.tier,
+        online: false,
+        pairingCount: vip.pairingCount || 0,
+        lastPairedAt: vip.lastPairedAt,
+      });
+    }
+
+    for (const paired of pairedUsers) {
+      const clean = normalizePhone(paired.number);
+      if (!clean) continue;
+      const existing = merged.get(clean);
+      if (existing) {
+        merged.set(clean, {
+          ...existing,
+          name:
+            existing.name && !existing.name.startsWith('+')
+              ? existing.name
+              : paired.name || existing.name,
+          online: existing.online || paired.status === 'connected',
+          pairingCount: Math.max(existing.pairingCount, paired.pairingCount || 1),
+          lastPairedAt: paired.lastPairedAt || existing.lastPairedAt,
+        });
+      } else {
+        merged.set(clean, {
+          number: clean,
+          name: paired.name || `+${clean}`,
+          tier: 'paired',
+          online: paired.status === 'connected',
+          pairingCount: paired.pairingCount || 1,
+          lastPairedAt: paired.lastPairedAt,
+        });
+      }
+    }
+
+    if (liveSnapshot?.status === 'connected' && liveSnapshot.connectedUser?.phone) {
+      const clean = normalizePhone(liveSnapshot.connectedUser.phone);
+      if (clean) {
+        const existing = merged.get(clean);
+        merged.set(clean, {
+          number: clean,
+          name:
+            (existing?.name && !existing.name.startsWith('+') ? existing.name : '') ||
+            liveSnapshot.connectedUser.name ||
+            existing?.name ||
+            `+${clean}`,
+          tier: existing?.tier || 'paired',
+          online: true,
+          pairingCount: Math.max(existing?.pairingCount || 0, 1),
+          lastPairedAt: existing?.lastPairedAt || new Date().toISOString(),
+        });
+      }
+    }
+
+    for (const sub of liveSnapshot?.subSessions || []) {
+      if (sub.status === 'logged_out' || sub.status === 'disconnected') continue;
+      const clean = normalizePhone(sub.connectedUser?.phone || sub.phone || '');
+      if (!clean) continue;
+      if (sub.status !== 'connected' && !merged.has(clean)) continue;
+      const existing = merged.get(clean);
+      merged.set(clean, {
+        number: clean,
+        name:
+          (existing?.name && !existing.name.startsWith('+') ? existing.name : '') ||
+          sub.connectedUser?.name ||
+          existing?.name ||
+          `+${clean}`,
+        tier: existing?.tier || 'paired',
+        online: existing?.online || sub.status === 'connected',
+        pairingCount: Math.max(existing?.pairingCount || 0, 1),
+        lastPairedAt: existing?.lastPairedAt || sub.createdAt,
+      });
+    }
+
+    const users = Array.from(merged.values()).sort((a, b) => {
+      if (a.tier === 'owner' && b.tier !== 'owner') return -1;
+      if (b.tier === 'owner' && a.tier !== 'owner') return 1;
+      if (a.online !== b.online) return a.online ? -1 : 1;
+      return (b.lastPairedAt || '').localeCompare(a.lastPairedAt || '');
+    });
+
+    const totalPairings = users.reduce((sum, u) => sum + Math.max(u.pairingCount, 0), 0);
+
+    return {
+      activePaidUsersCount: users.length,
+      activeVipsCount: vips.length,
+      totalPairings,
+      users,
+    };
   },
 
   getGroupConfig(groupId: string): GroupConfig {

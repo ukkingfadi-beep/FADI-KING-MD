@@ -104,9 +104,10 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/public/state', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const cfg = loadConfig();
     const snap = getBotSnapshot();
-    const activePaidUsersCount = vipStore.listVips().filter((v) => v.active).length;
+    const combined = vipStore.getCombinedActiveUsers(snap);
 
     res.json({
       bot: {
@@ -116,7 +117,7 @@ async function startServer(): Promise<void> {
         vipOnlyPairing: cfg.vipOnlyPairing,
         prefix: cfg.prefix,
         botName: cfg.botName,
-        activePaidUsersCount,
+        activePaidUsersCount: combined.activePaidUsersCount,
       },
       portalBanner: liveStore.getPortalBanner(),
       liveScreen: liveStore.getLiveScreen(),
@@ -125,6 +126,7 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/bot/pair-status', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const cleanPhone = normalizePhone(String(req.query?.phone || ''));
     if (!isValidPhone(cleanPhone)) {
       return res.json({ status: 'idle' });
@@ -366,10 +368,10 @@ async function startServer(): Promise<void> {
   // ============================================================================
 
   app.get('/api/bot/status', requireAdmin, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const cfg = loadConfig();
     const snapshot = getBotSnapshot();
-    const vips = vipStore.listVips();
-    const activePaidUsers = vips.filter((v) => v.active);
+    const combined = vipStore.getCombinedActiveUsers(snapshot);
     const botOnline =
       snapshot.status === 'connected' ||
       snapshot.subSessions.some((s) => s.status === 'connected');
@@ -423,16 +425,10 @@ async function startServer(): Promise<void> {
       stats: {
         serverOnline: true,
         botOnline,
-        activeVips: activePaidUsers.length,
-        activePaidUsersCount: activePaidUsers.length,
-        paidUsers: activePaidUsers.map((v) => ({
-          number: v.number,
-          name: v.name,
-          tier: v.tier,
-          pairingCount: v.pairingCount,
-          lastPairedAt: v.lastPairedAt,
-        })),
-        totalPairings: vips.reduce((sum, v) => sum + v.pairingCount, 0),
+        activeVips: combined.activeVipsCount,
+        activePaidUsersCount: combined.activePaidUsersCount,
+        paidUsers: combined.users,
+        totalPairings: combined.totalPairings,
         commandCount: getAllCommands().length,
         activeBlocks: pairingRateLimiter.getActiveBlocks().length,
       },

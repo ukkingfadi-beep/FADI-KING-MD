@@ -157,7 +157,8 @@ export interface BotStatusResponse {
     paidUsers: Array<{
       number: string;
       name: string;
-      tier: VipTier;
+      tier: VipTier | 'paired';
+      online?: boolean;
       pairingCount: number;
       lastPairedAt?: string;
     }>;
