@@ -52,6 +52,10 @@ export interface BotConfig {
   singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
+  menuImageUrl: string;
+  menuChannelJid: string;
+  menuChannelName: string;
+  menuChannelUrl: string;
   sessionDir: string;
   databaseDir: string;
 }
@@ -108,6 +112,11 @@ const defaultConfig: BotConfig = {
   singleTick: process.env.SINGLE_TICK === 'true',
   stickerPack: process.env.STICKER_PACK || 'FADI KING MD',
   stickerAuthor: process.env.STICKER_AUTHOR || 'VIP BOT',
+  menuImageUrl:
+    process.env.MENU_IMAGE_URL || '/assets/aistudio/IMG-20261114-WA0040_492a0008_492a0008.jpg',
+  menuChannelJid: process.env.MENU_CHANNEL_JID || '',
+  menuChannelName: process.env.MENU_CHANNEL_NAME || 'FADI KING MD OFFICIAL',
+  menuChannelUrl: process.env.MENU_CHANNEL_URL || '',
   sessionDir: process.env.SESSION_DIR
     ? path.resolve(process.cwd(), process.env.SESSION_DIR)
     : path.join(databaseDir, 'sessions'),
@@ -254,6 +263,22 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof partial.singleTick === 'boolean'
         ? partial.singleTick
         : current.singleTick,
+    menuImageUrl:
+      typeof partial.menuImageUrl === 'string'
+        ? partial.menuImageUrl.trim() || defaultConfig.menuImageUrl
+        : current.menuImageUrl,
+    menuChannelJid:
+      typeof partial.menuChannelJid === 'string'
+        ? partial.menuChannelJid.trim()
+        : current.menuChannelJid,
+    menuChannelName:
+      typeof partial.menuChannelName === 'string'
+        ? partial.menuChannelName.trim() || defaultConfig.menuChannelName
+        : current.menuChannelName,
+    menuChannelUrl:
+      typeof partial.menuChannelUrl === 'string'
+        ? partial.menuChannelUrl.trim()
+        : current.menuChannelUrl,
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };
@@ -300,6 +325,10 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     singleTick: next.singleTick,
     stickerPack: next.stickerPack,
     stickerAuthor: next.stickerAuthor,
+    menuImageUrl: next.menuImageUrl,
+    menuChannelJid: next.menuChannelJid,
+    menuChannelName: next.menuChannelName,
+    menuChannelUrl: next.menuChannelUrl,
   };
   dbSetSync('settings', persistable);
   void fs.promises

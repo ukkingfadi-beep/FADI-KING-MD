@@ -1,9 +1,12 @@
-import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
   BellRing,
   Image as ImageIcon,
   MonitorPlay,
+  RotateCcw,
+  Save,
   Send,
+  Sparkles,
   Trash2,
   Upload,
   Video,
@@ -11,15 +14,19 @@ import {
 import type {
   AdminAlert,
   AlertLevel,
+  BotConfigView,
   LiveMediaType,
   LiveScreenState,
   PortalBannerState,
 } from '../types/bot';
 
+const DEFAULT_MENU_DP_URL = '/assets/aistudio/IMG-20261114-WA0040_492a0008_492a0008.jpg';
+
 interface LiveScreenAdminProps {
   portalBanner: PortalBannerState | null;
   liveScreen: LiveScreenState | null;
   alerts: AdminAlert[];
+  config: BotConfigView | null;
   adminToken: string;
   onRefresh: () => Promise<void>;
 }
@@ -28,6 +35,7 @@ export function LiveScreenAdmin({
   portalBanner,
   liveScreen,
   alerts,
+  config,
   adminToken,
   onRefresh,
 }: LiveScreenAdminProps) {
@@ -54,24 +62,87 @@ export function LiveScreenAdmin({
   const [sendingAlert, setSendingAlert] = useState(false);
   const [alertFeedback, setAlertFeedback] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (portalBanner) {
-      setBannerEnabled(portalBanner.enabled);
-      setBannerType(portalBanner.mediaType);
-      setBannerUrl(portalBanner.mediaUrl);
-      setBannerCaption(portalBanner.caption || '');
-    }
-  }, [portalBanner]);
+  const [menuImageUrl, setMenuImageUrl] = useState(DEFAULT_MENU_DP_URL);
+  const [menuChannelUrl, setMenuChannelUrl] = useState('');
+  const [menuChannelJid, setMenuChannelJid] = useState('');
+  const [menuChannelName, setMenuChannelName] = useState('FADI KING MD OFFICIAL');
+  const [uploadingMenuDp, setUploadingMenuDp] = useState(false);
+  const [savingMenuCfg, setSavingMenuCfg] = useState(false);
+  const [menuFeedback, setMenuFeedback] = useState<string | null>(null);
+
+  const bannerDirtyRef = useRef(false);
+  const screenDirtyRef = useRef(false);
+  const menuDirtyRef = useRef(false);
+
+  const lastBannerSigRef = useRef<string | null>(null);
+  const lastScreenSigRef = useRef<string | null>(null);
+  const lastMenuSigRef = useRef<string | null>(null);
+
+  const setBannerDirty = (v: boolean) => {
+    bannerDirtyRef.current = v;
+  };
+  const setScreenDirty = (v: boolean) => {
+    screenDirtyRef.current = v;
+  };
+  const setMenuDirty = (v: boolean) => {
+    menuDirtyRef.current = v;
+  };
 
   useEffect(() => {
-    if (liveScreen) {
-      setActive(liveScreen.active);
-      setTitle(liveScreen.title);
-      setMessage(liveScreen.message);
-      setMediaType(liveScreen.mediaType);
-      setMediaUrl(liveScreen.mediaUrl);
+    if (!portalBanner || bannerDirtyRef.current || uploadingBanner) return;
+    const snap = {
+      enabled: Boolean(portalBanner.enabled),
+      mediaType: portalBanner.mediaType ?? ('none' as LiveMediaType),
+      mediaUrl: portalBanner.mediaUrl ?? '',
+      caption: portalBanner.caption ?? '',
+    };
+    const sig = JSON.stringify(snap);
+    if (sig !== lastBannerSigRef.current) {
+      lastBannerSigRef.current = sig;
+      setBannerEnabled(snap.enabled);
+      setBannerType(snap.mediaType);
+      setBannerUrl(snap.mediaUrl);
+      setBannerCaption(snap.caption);
     }
-  }, [liveScreen]);
+  }, [portalBanner, uploadingBanner]);
+
+  useEffect(() => {
+    if (!liveScreen || screenDirtyRef.current || uploading) return;
+    const snap = {
+      active: Boolean(liveScreen.active),
+      title: liveScreen.title ?? '',
+      message: liveScreen.message ?? '',
+      mediaType: liveScreen.mediaType ?? ('none' as LiveMediaType),
+      mediaUrl: liveScreen.mediaUrl ?? '',
+    };
+    const sig = JSON.stringify(snap);
+    if (sig !== lastScreenSigRef.current) {
+      lastScreenSigRef.current = sig;
+      setActive(snap.active);
+      setTitle(snap.title);
+      setMessage(snap.message);
+      setMediaType(snap.mediaType);
+      setMediaUrl(snap.mediaUrl);
+    }
+  }, [liveScreen, uploading]);
+
+  useEffect(() => {
+    if (!config || menuDirtyRef.current || uploadingMenuDp) return;
+    const snap = {
+      menuImageUrl: config.menuImageUrl ?? DEFAULT_MENU_DP_URL,
+      menuChannelUrl: config.menuChannelUrl ?? '',
+      menuChannelJid: config.menuChannelJid ?? '',
+      menuChannelName: config.menuChannelName ?? 'FADI KING MD OFFICIAL',
+    };
+    const sig = JSON.stringify(snap);
+    if (sig !== lastMenuSigRef.current) {
+      lastMenuSigRef.current = sig;
+      setMenuImageUrl(snap.menuImageUrl);
+      setMenuChannelUrl(snap.menuChannelUrl);
+      setMenuChannelJid(snap.menuChannelJid);
+      setMenuChannelName(snap.menuChannelName);
+    }
+  }, [config, uploadingMenuDp]);
 
   async function handleSaveBanner(e: FormEvent) {
     e.preventDefault();
@@ -93,6 +164,15 @@ export function LiveScreenAdmin({
       });
       const data = await res.json();
       if (data.ok) {
+        if (data.portalBanner) {
+          lastBannerSigRef.current = JSON.stringify({
+            enabled: Boolean(data.portalBanner.enabled),
+            mediaType: data.portalBanner.mediaType ?? 'none',
+            mediaUrl: data.portalBanner.mediaUrl ?? '',
+            caption: data.portalBanner.caption ?? '',
+          });
+        }
+        setBannerDirty(false);
         setBannerFeedback('Top Portal Header Banner saved to persistent database.');
         await onRefresh();
       } else {
@@ -126,6 +206,7 @@ export function LiveScreenAdmin({
       });
       const data = await res.json();
       if (res.ok && data.ok) {
+        setBannerDirty(true);
         setBannerUrl(data.url);
         setBannerType(file.type.startsWith('video/') ? 'video' : 'image');
         setBannerEnabled(true);
@@ -155,6 +236,16 @@ export function LiveScreenAdmin({
       });
       const data = await res.json();
       if (data.ok) {
+        if (data.liveScreen) {
+          lastScreenSigRef.current = JSON.stringify({
+            active: Boolean(data.liveScreen.active),
+            title: data.liveScreen.title ?? '',
+            message: data.liveScreen.message ?? '',
+            mediaType: data.liveScreen.mediaType ?? 'none',
+            mediaUrl: data.liveScreen.mediaUrl ?? '',
+          });
+        }
+        setScreenDirty(false);
         setScreenFeedback('Public Live Screen updated immediately.');
         await onRefresh();
       } else {
@@ -188,6 +279,7 @@ export function LiveScreenAdmin({
       });
       const data = await res.json();
       if (res.ok && data.ok) {
+        setScreenDirty(true);
         setMediaUrl(data.url);
         setMediaType(file.type.startsWith('video/') ? 'video' : 'image');
         setScreenFeedback(`Uploaded ${file.name}. Click "Publish Live Screen" to push live.`);
@@ -249,8 +341,235 @@ export function LiveScreenAdmin({
     await onRefresh();
   }
 
+  async function handleMenuDpUpload(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setMenuFeedback('Please select a valid image file (JPG, PNG, or WebP) for .menu DP.');
+      return;
+    }
+    setUploadingMenuDp(true);
+    setMenuFeedback(null);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('Failed to read image file'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await fetch('/api/admin/upload-media', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ dataUrl, mimeType: file.type }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        setMenuDirty(true);
+        setMenuImageUrl(data.url);
+        setMenuFeedback(`Uploaded ${file.name}. Click "Save .menu DP & Channel" to apply live.`);
+      } else {
+        setMenuFeedback(data.error || 'Failed to upload .menu DP.');
+      }
+    } catch (err) {
+      setMenuFeedback((err as Error).message);
+    } finally {
+      setUploadingMenuDp(false);
+    }
+  }
+
+  async function handleSaveMenuConfig(e: FormEvent) {
+    e.preventDefault();
+    setSavingMenuCfg(true);
+    setMenuFeedback(null);
+    try {
+      const res = await fetch('/api/config', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          menuImageUrl: menuImageUrl.trim() || DEFAULT_MENU_DP_URL,
+          menuChannelUrl: menuChannelUrl.trim(),
+          menuChannelJid: menuChannelJid.trim(),
+          menuChannelName: menuChannelName.trim() || 'FADI KING MD OFFICIAL',
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        if (data.config) {
+          const snap = {
+            menuImageUrl: data.config.menuImageUrl ?? DEFAULT_MENU_DP_URL,
+            menuChannelUrl: data.config.menuChannelUrl ?? '',
+            menuChannelJid: data.config.menuChannelJid ?? '',
+            menuChannelName: data.config.menuChannelName ?? 'FADI KING MD OFFICIAL',
+          };
+          lastMenuSigRef.current = JSON.stringify(snap);
+          setMenuImageUrl(snap.menuImageUrl);
+          setMenuChannelUrl(snap.menuChannelUrl);
+          setMenuChannelJid(snap.menuChannelJid);
+          setMenuChannelName(snap.menuChannelName);
+        }
+        setMenuDirty(false);
+        setMenuFeedback('.menu DP photo and WhatsApp Channel saved to persistent database.');
+        await onRefresh();
+      } else {
+        setMenuFeedback(data.error || 'Failed to save .menu DP & Channel settings.');
+      }
+    } finally {
+      setSavingMenuCfg(false);
+    }
+  }
+
   return (
     <div className="space-y-8">
+      {/* .menu Cover DP & WhatsApp Channel Controller */}
+      <section className="glass-surface rounded-2xl p-6 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">
+          <div className="flex items-center gap-2.5">
+            <Sparkles className="w-4 h-4 text-[#A78BFA]" />
+            <div>
+              <h2 className="text-lg font-semibold text-white">
+                WhatsApp .menu DP Photo &amp; View Channel Footer
+              </h2>
+              <p className="text-xs text-[#9E97C2]">
+                Customize the profile image and WhatsApp Channel shown whenever any user types .menu.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white cursor-pointer">
+              <Upload className="w-3.5 h-3.5 text-[#A78BFA]" />
+              {uploadingMenuDp ? 'Uploading...' : 'Change .menu DP'}
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={handleMenuDpUpload}
+                disabled={uploadingMenuDp}
+                className="hidden"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setMenuDirty(true);
+                setMenuImageUrl(DEFAULT_MENU_DP_URL);
+                setMenuFeedback('Default FADI KING OWNER 302 DP selected. Click Save to apply.');
+              }}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-[#C4BFE0] hover:text-white cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Reset Default DP
+            </button>
+          </div>
+        </div>
+
+        <form onSubmit={handleSaveMenuConfig} className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <div className="lg:col-span-3">
+            <div className="rounded-2xl overflow-hidden border border-white/[0.12] bg-[#0A0714] aspect-square max-w-[200px] mx-auto lg:mx-0">
+              <img
+                src={menuImageUrl || DEFAULT_MENU_DP_URL}
+                alt="WhatsApp .menu Cover DP"
+                className="w-full h-full object-cover"
+              />
+            </div>
+          </div>
+
+          <div className="lg:col-span-9 space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                .menu Cover DP URL
+              </label>
+              <input
+                type="text"
+                value={menuImageUrl}
+                onChange={(e) => {
+                  setMenuDirty(true);
+                  setMenuImageUrl(e.target.value);
+                }}
+                placeholder={DEFAULT_MENU_DP_URL}
+                className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs font-mono text-white focus:outline-none focus:border-[#8B5CF6]"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                  Channel Invite URL
+                </label>
+                <input
+                  type="text"
+                  value={menuChannelUrl}
+                  onChange={(e) => {
+                    setMenuDirty(true);
+                    setMenuChannelUrl(e.target.value);
+                  }}
+                  placeholder="https://whatsapp.com/channel/..."
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs font-mono text-white placeholder:text-[#5F5882] focus:outline-none focus:border-[#8B5CF6]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                  Channel JID (optional @newsletter)
+                </label>
+                <input
+                  type="text"
+                  value={menuChannelJid}
+                  onChange={(e) => {
+                    setMenuDirty(true);
+                    setMenuChannelJid(e.target.value);
+                  }}
+                  placeholder="120363...@newsletter"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs font-mono text-white placeholder:text-[#5F5882] focus:outline-none focus:border-[#8B5CF6]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                  Channel Display Name
+                </label>
+                <input
+                  type="text"
+                  value={menuChannelName}
+                  onChange={(e) => {
+                    setMenuDirty(true);
+                    setMenuChannelName(e.target.value);
+                  }}
+                  placeholder="FADI KING MD OFFICIAL"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-sm text-white placeholder:text-[#5F5882] focus:outline-none focus:border-[#8B5CF6]"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <span className="text-[11px] text-[#8B84AD]">
+                Channel URL auto-resolves the View Channel button when the bot is connected, or uses Auto-Follow Channel if blank.
+              </span>
+              <button
+                type="submit"
+                disabled={savingMenuCfg}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#7C3AED] hover:from-[#9D74F7] hover:to-[#8B5CF6] text-sm font-semibold text-white transition-all whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                <Save className="w-4 h-4" />
+                {savingMenuCfg ? 'Saving...' : 'Save .menu DP & Channel'}
+              </button>
+            </div>
+
+            {menuFeedback && (
+              <div className="text-xs text-[#E2DCF8] bg-white/[0.05] border border-white/[0.08] rounded-xl px-3.5 py-2.5">
+                {menuFeedback}
+              </div>
+            )}
+          </div>
+        </form>
+      </section>
+
       {/* Dynamic Top Header Media Banner Controller */}
       <section className="glass-surface rounded-2xl p-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">
@@ -268,7 +587,10 @@ export function LiveScreenAdmin({
             <input
               type="checkbox"
               checked={bannerEnabled}
-              onChange={(e) => setBannerEnabled(e.target.checked)}
+              onChange={(e) => {
+                setBannerDirty(true);
+                setBannerEnabled(e.target.checked);
+              }}
               className="w-4 h-4 accent-[#8B5CF6]"
             />
             Show Header Banner
@@ -287,7 +609,10 @@ export function LiveScreenAdmin({
               <button
                 key={id}
                 type="button"
-                onClick={() => setBannerType(id)}
+                onClick={() => {
+                  setBannerDirty(true);
+                  setBannerType(id);
+                }}
                 className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium transition-colors cursor-pointer ${
                   bannerType === id
                     ? 'bg-[#8B5CF6] text-white'
@@ -320,7 +645,10 @@ export function LiveScreenAdmin({
               <input
                 type="text"
                 value={bannerUrl}
-                onChange={(e) => setBannerUrl(e.target.value)}
+                onChange={(e) => {
+                  setBannerDirty(true);
+                  setBannerUrl(e.target.value);
+                }}
                 placeholder="/api/public/media/... or https://..."
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs font-mono text-white focus:outline-none focus:border-[#8B5CF6]"
               />
@@ -333,7 +661,10 @@ export function LiveScreenAdmin({
               <input
                 type="text"
                 value={bannerCaption}
-                onChange={(e) => setBannerCaption(e.target.value)}
+                onChange={(e) => {
+                  setBannerDirty(true);
+                  setBannerCaption(e.target.value);
+                }}
                 placeholder="Welcome to FADI KING MD..."
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-sm text-white focus:outline-none focus:border-[#8B5CF6]"
               />
@@ -377,7 +708,10 @@ export function LiveScreenAdmin({
               <input
                 type="checkbox"
                 checked={active}
-                onChange={(e) => setActive(e.target.checked)}
+                onChange={(e) => {
+                  setScreenDirty(true);
+                  setActive(e.target.checked);
+                }}
                 className="w-4 h-4 accent-[#8B5CF6]"
               />
               Show Live Screen Publicly
@@ -392,7 +726,10 @@ export function LiveScreenAdmin({
               <input
                 type="text"
                 value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                onChange={(e) => {
+                  setScreenDirty(true);
+                  setTitle(e.target.value);
+                }}
                 placeholder="FADI KING MD Live Broadcast"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-sm text-white focus:outline-none focus:border-[#8B5CF6]"
               />
@@ -405,7 +742,10 @@ export function LiveScreenAdmin({
               <textarea
                 rows={3}
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={(e) => {
+                  setScreenDirty(true);
+                  setMessage(e.target.value);
+                }}
                 placeholder="Write live instructions or announcement for visitors..."
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-sm text-white focus:outline-none focus:border-[#8B5CF6]"
               />
@@ -426,7 +766,10 @@ export function LiveScreenAdmin({
                   <button
                     key={id}
                     type="button"
-                    onClick={() => setMediaType(id)}
+                    onClick={() => {
+                      setScreenDirty(true);
+                      setMediaType(id);
+                    }}
                     className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium transition-colors cursor-pointer ${
                       mediaType === id
                         ? 'bg-[#8B5CF6] text-white'
@@ -460,7 +803,10 @@ export function LiveScreenAdmin({
                 <input
                   type="text"
                   value={mediaUrl}
-                  onChange={(e) => setMediaUrl(e.target.value)}
+                  onChange={(e) => {
+                    setScreenDirty(true);
+                    setMediaUrl(e.target.value);
+                  }}
                   placeholder="/api/public/media/... or https://..."
                   className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs font-mono text-white focus:outline-none focus:border-[#8B5CF6]"
                 />

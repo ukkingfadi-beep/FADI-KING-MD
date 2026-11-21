@@ -428,6 +428,7 @@ export default function App() {
                 portalBanner={publicState?.portalBanner || null}
                 liveScreen={publicState?.liveScreen || null}
                 alerts={alerts}
+                config={adminStatus?.config || null}
                 adminToken={adminToken}
                 onRefresh={refreshAll}
               />

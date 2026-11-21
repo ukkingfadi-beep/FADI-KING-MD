@@ -94,6 +94,10 @@ export interface BotConfigView {
   singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
+  menuImageUrl: string;
+  menuChannelJid: string;
+  menuChannelName: string;
+  menuChannelUrl: string;
 }
 
 export interface BlockedCallerEntry {

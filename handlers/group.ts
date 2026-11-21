@@ -92,26 +92,18 @@ export async function handleGroupParticipantsUpdate(
       targetDm = normalizeBareJid(targetDm) || rawJid;
 
       const num = jidUserPart(targetDm);
-      const notifyName =
-        (pObj as { notify?: string; name?: string }).notify ||
-        (pObj as { notify?: string; name?: string }).name ||
-        lookupKnownUserName(targetDm) ||
-        lookupKnownUserName(rawJid);
-      const displayName = (notifyName && notifyName.trim()) || (num ? `+${num}` : 'Friend');
+      const mentionUser = jidUserPart(rawJid) || num;
 
       if (update.action === 'add' && groupCfg.welcome) {
-        // Short, nice welcome posted inside the group (never to user's private IB)
-        const greetingTarget =
-          notifyName && notifyName.trim() ? `*${notifyName.trim()}* (@${num})` : `@${num}`;
         await sock
           .sendMessage(groupId, {
-            text: `Hello ${greetingTarget}! Welcome — glad to have you here. ✨`,
+            text: `*_${mentionUser ? `@${mentionUser}` : 'Welcome'} joined the group, welcome!_* 🎉`,
             mentions: [rawJid],
           })
           .catch(() => {});
       } else if (update.action === 'remove' && groupCfg.goodbye) {
         await sock.sendMessage(groupId, {
-          text: `*Goodbye @${num}*\nWishing you all the best ahead.`,
+          text: `*Goodbye @${mentionUser || num}*\nWishing you all the best ahead.`,
           mentions: [rawJid],
         });
       }

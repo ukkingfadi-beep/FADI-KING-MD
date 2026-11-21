@@ -537,6 +537,10 @@ async function startServer(): Promise<void> {
       singleTick: typeof body.singleTick === 'boolean' ? body.singleTick : undefined,
       stickerPack: typeof body.stickerPack === 'string' ? body.stickerPack : undefined,
       stickerAuthor: typeof body.stickerAuthor === 'string' ? body.stickerAuthor : undefined,
+      menuImageUrl: typeof body.menuImageUrl === 'string' ? body.menuImageUrl : undefined,
+      menuChannelJid: typeof body.menuChannelJid === 'string' ? body.menuChannelJid : undefined,
+      menuChannelName: typeof body.menuChannelName === 'string' ? body.menuChannelName : undefined,
+      menuChannelUrl: typeof body.menuChannelUrl === 'string' ? body.menuChannelUrl : undefined,
     });
     if (
       updated.autoJoinGroupInvite !== prevCfg.autoJoinGroupInvite ||
