@@ -415,7 +415,11 @@ export function LiveScreenAdmin({
           setMenuChannelName(snap.menuChannelName);
         }
         setMenuDirty(false);
-        setMenuFeedback('.menu DP photo and WhatsApp Channel saved to persistent database.');
+        setMenuFeedback(
+          data.config?.menuChannelJid
+            ? `.menu DP & Channel saved (View Channel JID: ${data.config.menuChannelJid}).`
+            : '.menu DP photo & Channel URL saved to persistent database.'
+        );
         await onRefresh();
       } else {
         setMenuFeedback(data.error || 'Failed to save .menu DP & Channel settings.');

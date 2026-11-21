@@ -498,6 +498,59 @@ export function getBotSnapshot() {
   };
 }
 
+export async function resolveNewsletterMetadataFromActiveSockets(
+  channelUrlOrJid: string
+): Promise<{ jid: string; name?: string } | null> {
+  const raw = String(channelUrlOrJid || '').trim();
+  if (!raw) return null;
+
+  const firstEntry = raw.split(/[\n,]+/).map((s) => s.trim()).find(Boolean) || '';
+  if (!firstEntry) return null;
+  if (firstEntry.includes('@newsletter')) {
+    return { jid: firstEntry };
+  }
+
+  const inviteMatch = firstEntry.match(/whatsapp\.com\/channel\/(?:invite\/)?([A-Za-z0-9_-]+)/i);
+  if (!inviteMatch) return null;
+  const code = inviteMatch[1];
+
+  const sockets: WASocket[] = [];
+  if (mainSock && botState.status === 'connected') {
+    sockets.push(mainSock);
+  }
+  for (const entry of vipSubSockets.values()) {
+    if (entry.sock && entry.info.status === 'connected') {
+      sockets.push(entry.sock);
+    }
+  }
+
+  for (const sock of sockets) {
+    if (typeof sock.newsletterMetadata !== 'function') continue;
+    try {
+      const meta = (await Promise.race([
+        sock.newsletterMetadata('invite', code),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+      ])) as {
+        id?: string;
+        jid?: string;
+        name?: string;
+        subject?: string;
+        thread_metadata?: { name?: { text?: string } };
+      } | null;
+      const jid = String(meta?.id || meta?.jid || '').trim();
+      const name = String(
+        meta?.thread_metadata?.name?.text || meta?.name || meta?.subject || ''
+      ).trim();
+      if (jid && jid.includes('@newsletter')) {
+        return { jid, name: name || undefined };
+      }
+    } catch {
+      // Try next active socket
+    }
+  }
+  return null;
+}
+
 export async function startMainBot(options?: { pairingPhone?: string }): Promise<void> {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);

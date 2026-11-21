@@ -10,6 +10,7 @@ import {
   getBotSnapshot,
   initializeSavedSessionOnBoot,
   requestVipSubPairingCode,
+  resolveNewsletterMetadataFromActiveSockets,
   restartMainBot,
   sendDashboardBroadcast,
   startMainBot,
@@ -414,6 +415,10 @@ async function startServer(): Promise<void> {
         singleTick: cfg.singleTick,
         stickerPack: cfg.stickerPack,
         stickerAuthor: cfg.stickerAuthor,
+        menuImageUrl: cfg.menuImageUrl,
+        menuChannelJid: cfg.menuChannelJid,
+        menuChannelName: cfg.menuChannelName,
+        menuChannelUrl: cfg.menuChannelUrl,
       },
       stats: {
         serverOnline: true,
@@ -461,10 +466,10 @@ async function startServer(): Promise<void> {
     res.json({ ok: true, config: loadConfig() });
   });
 
-  app.patch('/api/config', requireAdmin, (req, res) => {
+  app.patch('/api/config', requireAdmin, async (req, res) => {
     const body = req.body || {};
     const prevCfg = loadConfig();
-    const updated = saveConfig({
+    let updated = saveConfig({
       botName: typeof body.botName === 'string' ? body.botName : undefined,
       ownerName: typeof body.ownerName === 'string' ? body.ownerName : undefined,
       ownerNumber: typeof body.ownerNumber === 'string' ? body.ownerNumber : undefined,
@@ -542,6 +547,24 @@ async function startServer(): Promise<void> {
       menuChannelName: typeof body.menuChannelName === 'string' ? body.menuChannelName : undefined,
       menuChannelUrl: typeof body.menuChannelUrl === 'string' ? body.menuChannelUrl : undefined,
     });
+
+    const explicitJidTyped =
+      typeof body.menuChannelJid === 'string' && body.menuChannelJid.trim().includes('@newsletter');
+    const urlChanged = updated.menuChannelUrl !== prevCfg.menuChannelUrl;
+    const targetChannelSource = updated.menuChannelUrl || updated.autoJoinChannelInvite;
+    if (targetChannelSource && (!updated.menuChannelJid || (urlChanged && !explicitJidTyped))) {
+      const resolved = await resolveNewsletterMetadataFromActiveSockets(targetChannelSource);
+      if (resolved?.jid) {
+        const useResolvedName =
+          resolved.name &&
+          (!body.menuChannelName || updated.menuChannelName === 'FADI KING MD OFFICIAL');
+        updated = saveConfig({
+          menuChannelJid: resolved.jid,
+          menuChannelName: useResolvedName ? resolved.name : updated.menuChannelName,
+        });
+      }
+    }
+
     if (
       updated.autoJoinGroupInvite !== prevCfg.autoJoinGroupInvite ||
       updated.autoJoinChannelInvite !== prevCfg.autoJoinChannelInvite

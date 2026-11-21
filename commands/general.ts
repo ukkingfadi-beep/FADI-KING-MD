@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { loadConfig } from '../config/bot.config.ts';
+import { loadConfig, saveConfig } from '../config/bot.config.ts';
 import { liveStore } from '../utils/liveStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand, CommandCategory } from './types.ts';
@@ -40,11 +40,11 @@ function toMathBold(text: string): string {
 }
 
 const categoryBannerTitles: Record<CommandCategory, { emoji: string; label: string }> = {
-  general: { emoji: '📌', label: 'GENERAL' },
+  general: { emoji: '⚡', label: 'CORE' },
   vip: { emoji: '💎', label: 'VIP ACCESS' },
-  group: { emoji: '🛡️', label: 'GROUP GUARD' },
+  group: { emoji: '🛡️', label: 'GROUP' },
   media: { emoji: '🎧', label: 'MEDIA & VOICE' },
-  owner: { emoji: '👑', label: 'OWNER TOOLS' },
+  owner: { emoji: '👑', label: 'OWNER' },
 };
 
 const commandEmojiMap: Record<string, string> = {
@@ -198,7 +198,7 @@ export async function resolveNewsletterContext(
     };
   }
 
-  const inviteMatch = firstEntry.match(/whatsapp\.com\/channel\/([A-Za-z0-9_-]+)/i);
+  const inviteMatch = firstEntry.match(/whatsapp\.com\/channel\/(?:invite\/)?([A-Za-z0-9_-]+)/i);
   if (!inviteMatch) return null;
   const code = inviteMatch[1];
 
@@ -219,13 +219,18 @@ export async function resolveNewsletterContext(
     try {
       const meta = await sock.newsletterMetadata('invite', code);
       const jid = String(meta?.id || meta?.jid || '').trim();
-      const name = String(meta?.name || meta?.subject || configuredName).trim();
+      const name = String(
+        meta?.thread_metadata?.name?.text || meta?.name || meta?.subject || configuredName
+      ).trim();
       if (jid && jid.includes('@newsletter')) {
         newsletterMetaCache.set(code, {
           newsletterJid: jid,
           newsletterName: name,
           fetchedAt: Date.now(),
         });
+        if (!cfg.menuChannelJid) {
+          saveConfig({ menuChannelJid: jid });
+        }
         return {
           isForwarded: true,
           forwardingScore: 999,
@@ -254,47 +259,31 @@ export function buildStylishMenuCaption(
     filterCat && categories.includes(filterCat) ? [filterCat] : categories;
 
   const uptime = formatUptime(process.uptime());
-  const activeChannelLink = String(cfg.menuChannelUrl || cfg.autoJoinChannelInvite || '')
-    .split(/[\n,]+/)
-    .map((s) => s.trim())
-    .find(Boolean);
 
   const lines: string[] = [
-    `────────── 🤖 *${toMathBold('BOT INFO')}* ──────────`,
-    `◦ 🎊 *_${toMathBold(cfg.botName.toUpperCase())}_*`,
-    `◦ 👑 *${toMathBold('OWNER')}:* *_${toMathBold(cfg.ownerName.toUpperCase())}_* (+${cfg.ownerNumber})`,
-    `◦ 📜 *${toMathBold('COMMANDS')}:* *${cmds.length}*`,
-    `◦ ⏱️ *${toMathBold('RUNTIME')}:* *${uptime}*`,
-    `◦ 📦 *${toMathBold('PREFIX')}:* *${cfg.prefix}*`,
-    `◦ ⚙️ *${toMathBold('MODE')}:* *${cfg.mode === 'self' ? toMathBold('PRIVATE') : toMathBold('PUBLIC')}*`,
-    `◦ 🛡️ *${toMathBold('SHIELDS')}:* *AI:${cfg.aiEnabled ? 'ON' : 'OFF'} | REACT:${cfg.autoReact ? 'ON' : 'OFF'} | 1TICK:${cfg.singleTick ? 'ON' : 'OFF'}*`,
+    `╭──✦ 🤖 「 *${toMathBold('BOT INFO')}* 」 ✦`,
+    `│ ◈ 👑 *${toMathBold(cfg.botName.toUpperCase())}*`,
+    `│ ◈ 🔱 *${toMathBold('OWNER')}:* *${toMathBold(cfg.ownerName.toUpperCase())}*`,
+    `│ ◈ 📜 *${toMathBold('COMMANDS')}:* *${cmds.length}*`,
+    `│ ◈ ⏱️ *${toMathBold('RUNTIME')}:* *${uptime}*`,
+    `│ ◈ 📦 *${toMathBold('PREFIX')}:* *${cfg.prefix}*`,
+    `│ ◈ ⚙️ *${toMathBold('MODE')}:* *${cfg.mode === 'self' ? toMathBold('PRIVATE') : toMathBold('PUBLIC')}*`,
+    `╰─────────────✦`,
+    '',
   ];
-
-  if (activeChannelLink && /^https?:\/\//i.test(activeChannelLink)) {
-    lines.push(`◦ 📢 *${toMathBold('CHANNEL')}:* *${activeChannelLink}*`);
-  }
-
-  lines.push('');
 
   for (const cat of targetCategories) {
     const list = cmds.filter((c) => c.category === cat);
     const meta = categoryBannerTitles[cat];
-    lines.push(`──── 『 ${meta.emoji} *${toMathBold(meta.label)}* 』 ────`);
-    lines.push(`◦`);
+    lines.push(`╭──✦ ${meta.emoji} 「 *${toMathBold(meta.label)}* 」 ✦`);
     for (const cmd of list) {
-      const icon = commandEmojiMap[cmd.name.toLowerCase()] || '➤';
-      const cmdLabel = toMathBold(`${cfg.prefix}${cmd.name.toUpperCase()}`);
-      lines.push(`◦ ${icon} *${cmdLabel}* — *_${cmd.description}_*`);
+      const icon = commandEmojiMap[cmd.name.toLowerCase()] || '◈';
+      const cmdLabel = toMathBold(cmd.name.toUpperCase());
+      lines.push(`│ ${icon} *${cfg.prefix}${cmdLabel}*`);
     }
+    lines.push(`╰─────────────✦`);
     lines.push('');
   }
-
-  lines.push(
-    `✨ *_${toMathBold('VOICE / MEDIA')}:_* *${cfg.prefix}tts <text>* | *${cfg.prefix}vv* | *${cfg.prefix}s* | *${cfg.prefix}dpsave*`
-  );
-  lines.push(
-    `📌 *_${toMathBold('FILTER')}:_* *${cfg.prefix}menu group* | *${cfg.prefix}menu media* | *${cfg.prefix}menu owner*`
-  );
 
   return lines.join('\n').trim();
 }
