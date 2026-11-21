@@ -44,6 +44,9 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
     antiScamBlockAllStickers: false,
     antiStatusMentionGlobal: false,
     autoForwardIbToOpenGcs: false,
+    autoReact: false,
+    aiEnabled: false,
+    singleTick: false,
     stickerPack: 'FADI KING MD',
     stickerAuthor: 'VIP BOT',
   });
@@ -277,7 +280,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-sm text-white focus:outline-none focus:border-[#8B5CF6]"
               >
                 <option value="public">Public (Everyone)</option>
-                <option value="self">Self / VIP Only</option>
+                <option value="self">Private (Owner Only · Pairing Open)</option>
               </select>
             </div>
 
@@ -632,6 +635,36 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                   className="w-4 h-4 accent-[#8B5CF6]"
                 />
                 Auto IB → Open GCs (Anti-Delete Protected Broadcast)
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.autoReact}
+                  onChange={(e) => setForm({ ...form, autoReact: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Auto-React Incoming Messages
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.aiEnabled}
+                  onChange={(e) => setForm({ ...form, aiEnabled: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                AI Assistant Auto-Replies (.ai on/off)
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.singleTick}
+                  onChange={(e) => setForm({ ...form, singleTick: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Single Tick Shield (Suppress Blue Ticks & Presence — WA Ban Risk)
               </label>
             </div>
 

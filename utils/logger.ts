@@ -11,10 +11,16 @@ export interface LogEntry {
 const MAX_LOGS = 200;
 const logBuffer: LogEntry[] = [];
 
+export function formatLogDateTime(input: string | Date = new Date()): string {
+  const iso = input instanceof Date ? input.toISOString() : String(input);
+  return iso.slice(0, 19).replace('T', ' ');
+}
+
 function pushLog(level: LogLevel, module: string, message: string): LogEntry {
+  const nowIso = new Date().toISOString();
   const entry: LogEntry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso,
     level,
     module,
     message,
@@ -24,8 +30,8 @@ function pushLog(level: LogLevel, module: string, message: string): LogEntry {
     logBuffer.length = MAX_LOGS;
   }
 
-  const time = entry.timestamp.slice(11, 19);
-  const tag = `[${time}] [${level.toUpperCase()}] [${module}]`;
+  const dateTime = formatLogDateTime(entry.timestamp);
+  const tag = `[${dateTime}] [${level.toUpperCase()}] [${module}]`;
   if (level === 'error') {
     console.error(`${tag} ${message}`);
   } else {

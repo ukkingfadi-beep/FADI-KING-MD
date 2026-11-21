@@ -25,6 +25,7 @@ import {
   isLidUser,
   jidUserPart,
   normalizeBareJid,
+  rememberUserName,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
@@ -347,6 +348,18 @@ export async function syncAutoJoinsAcrossConnectedSessions(): Promise<void> {
   }
 }
 
+export async function applySingleTickPresenceAcrossSockets(singleTick: boolean): Promise<void> {
+  const presence = singleTick ? 'unavailable' : 'available';
+  if (mainSock && botState.status === 'connected') {
+    await mainSock.sendPresenceUpdate(presence).catch(() => {});
+  }
+  for (const entry of vipSubSockets.values()) {
+    if (entry.info.status === 'connected') {
+      await entry.sock.sendPresenceUpdate(presence).catch(() => {});
+    }
+  }
+}
+
 function handleSessionOpenActions(params: {
   sock: WASocket;
   sessionKey: string;
@@ -524,7 +537,7 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       },
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: !cfg.singleTick,
       connectTimeoutMs: 25_000,
       defaultQueryTimeoutMs: 25_000,
       keepAliveIntervalMs: 18_000,
@@ -697,6 +710,18 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       }
     });
 
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) {
+        rememberUserName(c.id, c.notify || c.name || c.verifiedName);
+      }
+    });
+
+    sock.ev.on('contacts.update', (contacts) => {
+      for (const c of contacts) {
+        rememberUserName(c.id, c.notify || c.name || c.verifiedName);
+      }
+    });
+
     sock.ev.on('call', (calls) => {
       void handleIncomingCalls(sock, calls);
     });
@@ -787,7 +812,7 @@ async function connectSubSession(params: {
     },
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: !loadConfig().singleTick,
     connectTimeoutMs: 25_000,
     defaultQueryTimeoutMs: 25_000,
     keepAliveIntervalMs: 18_000,
@@ -963,6 +988,12 @@ async function connectSubSession(params: {
   sock.ev.on('groups.update', (updates) => {
     for (const g of updates) {
       if (g.id) invalidateGroupMetadataCache(g.id);
+    }
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) {
+      rememberUserName(c.id, c.notify || c.name || c.verifiedName);
     }
   });
 

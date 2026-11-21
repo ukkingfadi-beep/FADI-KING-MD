@@ -47,8 +47,9 @@ export const generalCommands: BotCommand[] = [
         `╔══════════════════════════╗`,
         `   *${cfg.botName}*  (${cmds.length} Commands)`,
         `╚══════════════════════════╝`,
-        `• *Prefix:* \`${cfg.prefix}\`   • *Mode:* *${cfg.mode.toUpperCase()}*`,
+        `• *Prefix:* \`${cfg.prefix}\`   • *Mode:* *${cfg.mode === 'self' ? 'PRIVATE' : 'PUBLIC'}*`,
         `• *Role:* *${roleLabel}*   • *Anti-Scam:* *${cfg.antiScamGlobal ? 'ON' : 'OFF'}*`,
+        `• *AI:* *${cfg.aiEnabled ? 'ON' : 'OFF'}*   • *Auto-React:* *${cfg.autoReact ? 'ON' : 'OFF'}*   • *SingleTick:* *${cfg.singleTick ? 'ON' : 'OFF'}*`,
         '',
       ];
 

@@ -8,6 +8,7 @@ import { downloadMediaMessage, getContentType, proto, type WAMessage, type WASoc
 import pino from 'pino';
 
 import { extractContextInfo, unwrapMessage } from './jidHelper.ts';
+import { isGeminiConfigured, synthesizePakistaniFemaleTts } from './geminiService.ts';
 
 const execFileAsync = promisify(execFile);
 const silentLogger = pino({ level: 'silent' });
@@ -196,7 +197,10 @@ function computePcmWaveformAndSeconds(pcmBuffer: Buffer, sampleRate = 8000): {
   return { seconds, waveform };
 }
 
-export async function convertAudioPartsToWhatsAppVoice(audioParts: Buffer[]): Promise<{
+export async function convertAudioPartsToWhatsAppVoice(
+  audioParts: Buffer[],
+  inputExt: 'mp3' | 'wav' = 'mp3'
+): Promise<{
   buffer: Buffer;
   seconds: number;
   waveform: Uint8Array;
@@ -211,7 +215,7 @@ export async function convertAudioPartsToWhatsAppVoice(audioParts: Buffer[]): Pr
 
   try {
     for (let i = 0; i < audioParts.length; i += 1) {
-      const p = path.join(tmpDir, `${id}_part${i}.mp3`);
+      const p = path.join(tmpDir, `${id}_part${i}.${inputExt}`);
       await fs.promises.writeFile(p, audioParts[i]);
       partPaths.push(p);
     }
@@ -290,14 +294,40 @@ export async function synthesizeTtsVoiceNote(
     throw new Error('Provide text or reply to a message for `.tts`.');
   }
 
-  const detectedLang = langHint || (/[\u0600-\u06FF]/.test(clean) ? 'ur' : 'en');
+  const detectedLang = langHint || (/[\u0600-\u06FF]/.test(clean) ? 'ur' : 'ur-PK');
+
+  // Prefer natural Pakistani female voice via Gemini 3.8 Flash TTS when API key is configured
+  if (isGeminiConfigured()) {
+    const wavBuffer = await synthesizePakistaniFemaleTts(clean);
+    const hasFfmpeg = await isFfmpegAvailable();
+    if (hasFfmpeg) {
+      const voice = await convertAudioPartsToWhatsAppVoice([wavBuffer], 'wav');
+      return {
+        buffer: voice.buffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+        lang: detectedLang,
+        seconds: voice.seconds,
+        waveform: voice.waveform,
+      };
+    }
+    return {
+      buffer: wavBuffer,
+      mimetype: 'audio/wav',
+      ptt: false,
+      lang: detectedLang,
+    };
+  }
+
+  // Real HTTP TTS fallback when GEMINI_API_KEY is not present
+  const fallbackLang = langHint || (/[\u0600-\u06FF]/.test(clean) ? 'ur' : 'en');
   const chunks = splitTtsChunks(clean, 180);
   const audioParts: Buffer[] = [];
 
   for (const chunk of chunks) {
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
       chunk
-    )}&tl=${encodeURIComponent(detectedLang)}&client=tw-ob`;
+    )}&tl=${encodeURIComponent(fallbackLang)}&client=tw-ob`;
 
     const res = await fetch(url, {
       headers: {
@@ -322,12 +352,12 @@ export async function synthesizeTtsVoiceNote(
   const hasFfmpeg = await isFfmpegAvailable();
   if (hasFfmpeg) {
     try {
-      const voice = await convertAudioPartsToWhatsAppVoice(audioParts);
+      const voice = await convertAudioPartsToWhatsAppVoice(audioParts, 'mp3');
       return {
         buffer: voice.buffer,
         mimetype: 'audio/ogg; codecs=opus',
         ptt: true,
-        lang: detectedLang,
+        lang: fallbackLang,
         seconds: voice.seconds,
         waveform: voice.waveform,
       };
@@ -336,11 +366,10 @@ export async function synthesizeTtsVoiceNote(
     }
   }
 
-  // Fallback as standard audio (ptt: false) because WhatsApp cannot open MP3 with ptt: true
   return {
     buffer: audioParts[0],
     mimetype: 'audio/mpeg',
     ptt: false,
-    lang: detectedLang,
+    lang: fallbackLang,
   };
 }

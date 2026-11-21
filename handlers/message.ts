@@ -2,7 +2,16 @@ import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import { findCommand } from '../commands/index.ts';
 import type { CommandContext } from '../commands/types.ts';
-import { extractBodyText, jidUserPart, resolveSenderInfo } from '../utils/jidHelper.ts';
+import { generateAiChatReply } from '../utils/geminiService.ts';
+import {
+  extractBodyText,
+  extractContextInfo,
+  getBotJids,
+  jidUserPart,
+  normalizeBareJid,
+  rememberUserName,
+  resolveSenderInfo,
+} from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { commandRateLimiter, getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { vipStore } from '../utils/vipStore.ts';
@@ -13,6 +22,8 @@ import {
   enforceAntiStatusMention,
   handleAntidelete,
 } from './group.ts';
+
+const AUTO_REACT_EMOJIS = ['❤️', '🔥', '👍', '😂', '😮', '✨', '💯', '🤩', '👏', '🥳'];
 
 const processedMsgIds = new Set<string>();
 
@@ -34,8 +45,9 @@ export async function handleIncomingMessage(
 ): Promise<void> {
   try {
     if (!msg.message || !msg.key?.remoteJid) return;
+    const cfg = loadConfig();
     if (msg.key.remoteJid === 'status@broadcast') {
-      if (loadConfig().autoStatusSeen && !msg.key.fromMe && msg.key.id) {
+      if (!cfg.singleTick && cfg.autoStatusSeen && !msg.key.fromMe && msg.key.id) {
         void sock.readMessages([msg.key]).catch(() => {});
       }
       return;
@@ -49,24 +61,29 @@ export async function handleIncomingMessage(
 
     if (!markProcessed(msg.key.id)) return;
 
-    const cfg = loadConfig();
     const chatId = msg.key.remoteJid;
     const isGroup = chatId.endsWith('@g.us');
 
-    if (cfg.autoReadMessages && msg.key.id && !msg.key.fromMe) {
-      void sock.readMessages([msg.key]).catch(() => {});
-    }
+    if (cfg.singleTick) {
+      void sock.sendPresenceUpdate('unavailable').catch(() => {});
+    } else {
+      if (cfg.autoReadMessages && msg.key.id && !msg.key.fromMe) {
+        void sock.readMessages([msg.key]).catch(() => {});
+      }
 
-    if (!msg.key.fromMe && (cfg.autoRecording || cfg.autoTyping)) {
-      const mode = cfg.autoRecording ? 'recording' : 'composing';
-      void sock.sendPresenceUpdate(mode, chatId).catch(() => {});
-      const presenceTimer = setTimeout(() => {
-        void sock.sendPresenceUpdate('paused', chatId).catch(() => {});
-      }, 3200);
-      if (typeof presenceTimer.unref === 'function') presenceTimer.unref();
+      if (!msg.key.fromMe && (cfg.autoRecording || cfg.autoTyping)) {
+        const mode = cfg.autoRecording ? 'recording' : 'composing';
+        void sock.sendPresenceUpdate(mode, chatId).catch(() => {});
+        const presenceTimer = setTimeout(() => {
+          void sock.sendPresenceUpdate('paused', chatId).catch(() => {});
+        }, 3200);
+        if (typeof presenceTimer.unref === 'function') presenceTimer.unref();
+      }
     }
 
     const { senderJid, senderCandidates, senderNumber } = await resolveSenderInfo(sock, msg);
+    rememberUserName(senderJid, msg.pushName);
+    rememberUserName(senderNumber, msg.pushName);
     const isOwner = Boolean(msg.key.fromMe) || vipStore.isOwner(senderNumber);
     const isVip = isOwner || vipStore.isVip(senderNumber);
 
@@ -93,6 +110,25 @@ export async function handleIncomingMessage(
         isOwner
       );
       if (scamBlocked) return;
+    }
+
+    // Auto-React on incoming messages when enabled (disabled in Single Tick Shield & non-owner Private mode)
+    if (
+      cfg.autoReact &&
+      !cfg.singleTick &&
+      !msg.key.fromMe &&
+      msg.key.id &&
+      (cfg.mode !== 'self' || isOwner)
+    ) {
+      const emoji = AUTO_REACT_EMOJIS[Math.floor(Math.random() * AUTO_REACT_EMOJIS.length)];
+      void sock
+        .sendMessage(chatId, {
+          react: {
+            text: emoji,
+            key: msg.key,
+          },
+        })
+        .catch(() => {});
     }
 
     if (!body) return;
@@ -126,13 +162,39 @@ export async function handleIncomingMessage(
               { quoted: msg }
             )
             .catch(() => {});
+          return;
+        }
+      }
+
+      // AI Auto-Reply when enabled (respects Private Mode: Owner-only in 'self' mode)
+      if (cfg.aiEnabled && !msg.key.fromMe && (cfg.mode !== 'self' || isOwner)) {
+        let shouldReplyWithAi = !isGroup;
+        if (isGroup) {
+          const ctxInfo = extractContextInfo(msg.message);
+          const botJids = await getBotJids(sock);
+          const mentionedBot = (ctxInfo?.mentionedJid || []).some((j) =>
+            botJids.includes(normalizeBareJid(j))
+          );
+          const repliedToBot = Boolean(
+            ctxInfo?.participant && botJids.includes(normalizeBareJid(ctxInfo.participant))
+          );
+          shouldReplyWithAi = mentionedBot || repliedToBot;
+        }
+
+        if (shouldReplyWithAi) {
+          try {
+            const replyText = await generateAiChatReply(body, msg.pushName || 'Friend');
+            await sock.sendMessage(chatId, { text: replyText }, { quoted: msg });
+          } catch (aiErr) {
+            logger.error('ai', `AI auto-reply failed: ${(aiErr as Error).message}`);
+          }
         }
       }
       return;
     }
 
-    // Mode guard: self mode allows only Owner or VIPs
-    if (cfg.mode === 'self' && !isOwner && !isVip) return;
+    // Private Mode guard: strictly Owner ONLY (non-owners blocked from all bot commands)
+    if (cfg.mode === 'self' && !isOwner) return;
 
     const withoutPrefix = body.slice(matchedPrefix.length).trim();
     if (!withoutPrefix) return;
@@ -240,15 +302,17 @@ export async function handleIncomingMessage(
     logger.cmd('messageHandler', `${matchedPrefix}${command.name} from +${senderNumber}`);
     try {
       if (cfg.humanDelayEnabled && cfg.humanDelayMaxMs > 0) {
-        const presenceMode = command.name === 'tts' ? 'recording' : 'composing';
-        void sock.sendPresenceUpdate(presenceMode, chatId).catch(() => {});
+        if (!cfg.singleTick) {
+          const presenceMode = command.name === 'tts' ? 'recording' : 'composing';
+          void sock.sendPresenceUpdate(presenceMode, chatId).catch(() => {});
+        }
         const paceMs = getRandomDelayMs(cfg.humanDelayMinMs, cfg.humanDelayMaxMs);
         if (paceMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, paceMs));
         }
       }
       await command.execute(ctx);
-      if (cfg.humanDelayEnabled) {
+      if (cfg.humanDelayEnabled && !cfg.singleTick) {
         void sock.sendPresenceUpdate('paused', chatId).catch(() => {});
       }
     } catch (cmdErr) {

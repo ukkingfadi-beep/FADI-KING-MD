@@ -277,15 +277,40 @@ export default function App() {
       <WaveBackdrop />
 
       {/* Top Navigation Bar */}
-      <header className="sticky top-0 z-30 border-b border-white/[0.07] bg-[#07050F]/80 backdrop-blur-xl">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
-          {/* Zone 1: Single-line Brand Wordmark */}
+      <header className="sticky top-0 z-30 border-b border-white/[0.09] bg-[#0A0716]/85 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.45)]">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-6">
+          {/* Zone 1: FK Crest + Single-line Brand Wordmark */}
           <button
             type="button"
             onClick={() => setIsAdminView(false)}
-            className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-2.5 text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 cursor-pointer"
           >
-            FADI KING MD
+            <span className="w-8 h-8 rounded-full bg-gradient-to-br from-[#7C3AED]/45 to-[#3B0764]/75 border border-[#C4B5FD]/45 shadow-[0_0_14px_rgba(139,92,246,0.4)] flex items-center justify-center shrink-0">
+              <svg
+                viewBox="0 0 24 24"
+                className="w-4 h-4 text-[#EDE9FE]"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12 2.5L20 7v10l-8 4.5L4 17V7l8-4.5z"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                />
+                <text
+                  x="12"
+                  y="15"
+                  textAnchor="middle"
+                  fill="currentColor"
+                  fontSize="8"
+                  fontWeight="700"
+                  fontFamily="sans-serif"
+                >
+                  FK
+                </text>
+              </svg>
+            </span>
+            <span>FADI KING MD</span>
           </button>
 
           {/* Zone 2: Navigation Links (Public vs Admin) */}
@@ -296,16 +321,8 @@ export default function App() {
                 onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
                 className="text-sm font-medium text-white border-b-2 border-[#8B5CF6] py-1 whitespace-nowrap shrink-0"
               >
-                VIP Pairing
+                Pairing
               </a>
-              {publicState?.liveScreen.active && (
-                <a
-                  href="#live-screen"
-                  className="text-sm font-medium text-[#A9A2C8] hover:text-white border-b-2 border-transparent py-1 transition-colors whitespace-nowrap shrink-0"
-                >
-                  Live Screen
-                </a>
-              )}
             </nav>
           ) : (
             <nav className="hidden md:flex items-center gap-5">
@@ -327,12 +344,12 @@ export default function App() {
           )}
 
           {/* Zone 3: Primary Action(s) */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
             <button
               type="button"
               onClick={openAlertsDrawer}
               aria-label="Open Alert Notifications"
-              className="relative inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="relative inline-flex items-center gap-1.5 px-3 py-2 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.1] text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Bell className="w-4 h-4 text-[#C4B5FD]" />
               {unreadAlerts > 0 && (
@@ -346,27 +363,27 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleOpenAdminTrigger}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#7C3AED] hover:from-[#9D74F7] hover:to-[#8B5CF6] text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-gradient-to-b from-[#6D28D9]/55 to-[#3B0764]/70 hover:from-[#7C3AED]/70 hover:to-[#4C1D95]/80 border border-[#C4B5FD]/40 shadow-[0_0_16px_rgba(139,92,246,0.28)] text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 cursor-pointer"
               >
-                <Lock className="w-3.5 h-3.5" />
-                Admin Panel
+                <Lock className="w-3.5 h-3.5 text-[#DDD6FE]" />
+                <span>Admin Panel</span>
               </button>
             ) : (
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setIsAdminView(false)}
-                  className="px-3.5 py-2 rounded-xl bg-white/[0.07] hover:bg-white/[0.12] text-xs font-medium text-white whitespace-nowrap shrink-0 cursor-pointer"
+                  className="px-3.5 py-2 rounded-full bg-white/[0.07] hover:bg-white/[0.12] border border-white/10 text-xs font-medium text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   Public Pairing
                 </button>
                 <button
                   type="button"
                   onClick={handleAdminLogout}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-xs font-semibold text-rose-200 whitespace-nowrap shrink-0 cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/25 text-xs font-semibold text-rose-200 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <LogOut className="w-3.5 h-3.5" />
-                  Lock
+                  <span>Lock</span>
                 </button>
               </div>
             )}
@@ -402,14 +419,13 @@ export default function App() {
         {!isAdminView || !adminToken ? (
           <PublicPairingBoard
             publicState={publicState}
-            unreadAlerts={unreadAlerts}
-            onOpenAlerts={openAlertsDrawer}
             onRefresh={refreshAll}
           />
         ) : (
           <div className="space-y-6">
             {adminTab === 'live' && (
               <LiveScreenAdmin
+                portalBanner={publicState?.portalBanner || null}
                 liveScreen={publicState?.liveScreen || null}
                 alerts={alerts}
                 adminToken={adminToken}

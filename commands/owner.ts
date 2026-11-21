@@ -1,6 +1,8 @@
 import { loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
+import { applySingleTickPresenceAcrossSockets } from '../handlers/connection.ts';
 import { dispatchOpenGcProtectedPost } from '../handlers/group.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
+import { generateAiChatReply } from '../utils/geminiService.ts';
 import {
   extractBodyText,
   extractRawTargetCandidates,
@@ -61,19 +63,33 @@ async function resolveDmOrMentionTarget(ctx: CommandContext): Promise<{
 export const ownerCommands: BotCommand[] = [
   {
     name: 'mode',
+    aliases: ['private', 'self'],
     category: 'owner',
-    description: 'Bot ko public ya sirf owner/VIP self mode mein set kare',
-    usage: 'mode <public|self>',
+    description: 'Bot ko public ya sirf Owner Private mode mein set kare',
+    usage: 'mode <public|private|self>',
     ownerOnly: true,
     execute: async (ctx) => {
-      const target = ctx.args[0]?.toLowerCase();
-      if (target !== 'public' && target !== 'self') {
-        const msg = `Current mode: *${loadConfig().mode.toUpperCase()}*\nUsage: \`${ctx.prefix}mode public\` or \`${ctx.prefix}mode self\``;
+      const raw = ctx.args[0]?.toLowerCase();
+      const target =
+        ctx.commandName === 'private' || ctx.commandName === 'self'
+          ? 'self'
+          : raw === 'private' || raw === 'self'
+            ? 'self'
+            : raw === 'public'
+              ? 'public'
+              : null;
+
+      if (!target) {
+        const cur = loadConfig().mode;
+        const msg = `Current mode: *${cur === 'self' ? 'PRIVATE (Owner Only)' : 'PUBLIC'}*\nUsage: \`${ctx.prefix}mode public\` or \`${ctx.prefix}mode private\``;
         await ctx.reply(msg);
         return msg;
       }
       saveConfig({ mode: target });
-      const msg = `Bot mode updated to *${target.toUpperCase()}*.`;
+      const msg =
+        target === 'self'
+          ? 'Bot mode updated to *PRIVATE (Owner Only)* — non-owners are blocked from commands while Web Pairing remains open.'
+          : 'Bot mode updated to *PUBLIC*.';
       await ctx.reply(msg);
       return msg;
     },
@@ -467,6 +483,87 @@ export const ownerCommands: BotCommand[] = [
         arg === 'on'
           ? 'Auto IB -> Open-GC Forward turned *ON*! Any link or text you send in your bot IB will automatically go to all Open GCs with Anti-Delete Lock.'
           : 'Auto IB -> Open-GC Forward turned *OFF*.';
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'autoreact',
+    aliases: ['reactauto'],
+    category: 'owner',
+    description: 'Har incoming message par automatic emoji reaction on/off kare',
+    usage: 'autoreact <on|off>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const arg = ctx.args[0]?.toLowerCase();
+      const cfg = loadConfig();
+      if (arg !== 'on' && arg !== 'off') {
+        const msg = `Auto-React is currently *${cfg.autoReact ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}autoreact on\` or \`${ctx.prefix}autoreact off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      saveConfig({ autoReact: arg === 'on' });
+      const msg = `Auto-React turned *${arg.toUpperCase()}*${cfg.singleTick && arg === 'on' ? ' (Note: paused while Single Tick Shield is ON)' : ''}.`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'ai',
+    aliases: ['gpt', 'assistant'],
+    category: 'owner',
+    description: 'Global AI Assistant auto-replies on/off kare ya direct AI sawal puche',
+    usage: 'ai <on|off|your question>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const arg = ctx.args[0]?.toLowerCase();
+      const cfg = loadConfig();
+      if (arg === 'on' || arg === 'off') {
+        saveConfig({ aiEnabled: arg === 'on' });
+        const msg = `Global AI Assistant auto-replies turned *${arg.toUpperCase()}* (persisted in database).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+      if (!ctx.text.trim()) {
+        const msg = `AI Assistant is currently *${cfg.aiEnabled ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ai on\`, \`${ctx.prefix}ai off\`, or \`${ctx.prefix}ai <question>\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      try {
+        const answer = await generateAiChatReply(ctx.text.trim(), ctx.pushName);
+        await ctx.reply(answer);
+        return answer;
+      } catch (err) {
+        const msg = `AI Error: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'singletick',
+    aliases: ['stickshield', 'ghosttick'],
+    category: 'owner',
+    description: 'Single Tick Shield on/off kare (read receipts aur online presence suppress kare)',
+    usage: 'singletick <on|off>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const arg = ctx.args[0]?.toLowerCase();
+      const cfg = loadConfig();
+      if (arg !== 'on' && arg !== 'off') {
+        const msg = `Single Tick Shield is currently *${cfg.singleTick ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}singletick on\` or \`${ctx.prefix}singletick off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      const enabled = arg === 'on';
+      saveConfig({
+        singleTick: enabled,
+        ...(enabled ? { autoReadMessages: false } : {}),
+      });
+      await applySingleTickPresenceAcrossSockets(enabled);
+      const msg = enabled
+        ? 'Single Tick Shield turned *ON* (read receipts, blue ticks, typing presence & auto-react suppressed).\n_Note: WhatsApp servers still control delivery acknowledgements and suppressing receipts carries ban risk._'
+        : 'Single Tick Shield turned *OFF*. Normal presence and read behavior restored.';
       await ctx.reply(msg);
       return msg;
     },

@@ -47,6 +47,9 @@ export interface BotConfig {
   antiScamBlockAllStickers: boolean;
   antiStatusMentionGlobal: boolean;
   autoForwardIbToOpenGcs: boolean;
+  autoReact: boolean;
+  aiEnabled: boolean;
+  singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
   sessionDir: string;
@@ -100,6 +103,9 @@ const defaultConfig: BotConfig = {
   antiScamBlockAllStickers: process.env.ANTI_SCAM_BLOCK_ALL_STICKERS === 'true',
   antiStatusMentionGlobal: process.env.ANTI_STATUS_MENTION_GLOBAL === 'true',
   autoForwardIbToOpenGcs: process.env.AUTO_FORWARD_IB_TO_OPEN_GCS === 'true',
+  autoReact: process.env.AUTO_REACT === 'true',
+  aiEnabled: process.env.AI_ENABLED === 'true',
+  singleTick: process.env.SINGLE_TICK === 'true',
   stickerPack: process.env.STICKER_PACK || 'FADI KING MD',
   stickerAuthor: process.env.STICKER_AUTHOR || 'VIP BOT',
   sessionDir: process.env.SESSION_DIR
@@ -236,9 +242,24 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof partial.autoForwardIbToOpenGcs === 'boolean'
         ? partial.autoForwardIbToOpenGcs
         : current.autoForwardIbToOpenGcs,
+    autoReact:
+      typeof partial.autoReact === 'boolean'
+        ? partial.autoReact
+        : current.autoReact,
+    aiEnabled:
+      typeof partial.aiEnabled === 'boolean'
+        ? partial.aiEnabled
+        : current.aiEnabled,
+    singleTick:
+      typeof partial.singleTick === 'boolean'
+        ? partial.singleTick
+        : current.singleTick,
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };
+  if (next.singleTick) {
+    next.autoReadMessages = false;
+  }
   cachedConfig = next;
   const persistable = {
     botName: next.botName,
@@ -274,6 +295,9 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     antiScamBlockAllStickers: next.antiScamBlockAllStickers,
     antiStatusMentionGlobal: next.antiStatusMentionGlobal,
     autoForwardIbToOpenGcs: next.autoForwardIbToOpenGcs,
+    autoReact: next.autoReact,
+    aiEnabled: next.aiEnabled,
+    singleTick: next.singleTick,
     stickerPack: next.stickerPack,
     stickerAuthor: next.stickerAuthor,
   };

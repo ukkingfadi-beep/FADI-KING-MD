@@ -14,6 +14,24 @@ import { isValidPhone, normalizePhone } from '../config/bot.config.ts';
 
 const groupMetaCache = new Map<string, { meta: GroupMetadata; expiresAt: number }>();
 const GROUP_META_TTL_MS = 60_000;
+const knownUserNames = new Map<string, string>();
+
+export function rememberUserName(jidOrPhone: string | undefined | null, name: string | undefined | null): void {
+  const cleanName = (name || '').trim();
+  const key = jidUserPart(jidOrPhone);
+  if (!key || !cleanName || cleanName === 'WhatsApp User') return;
+  knownUserNames.set(key, cleanName);
+  if (knownUserNames.size > 4000) {
+    const oldest = knownUserNames.keys().next().value;
+    if (oldest) knownUserNames.delete(oldest);
+  }
+}
+
+export function lookupKnownUserName(jidOrPhone: string | undefined | null): string | null {
+  const key = jidUserPart(jidOrPhone);
+  if (!key) return null;
+  return knownUserNames.get(key) || null;
+}
 
 export async function getCachedGroupMetadata(
   sock: WASocket,
@@ -369,8 +387,13 @@ export function extractRawTargetCandidates(
     return [normalizeBareJid(ctxInfo.participant)];
   }
 
-  if (args[0]) {
-    const num = normalizePhone(args[0]);
+  const rawArg = (args[0] || '').trim();
+  if (rawArg) {
+    if (/^[0-9]{5,30}@(s\.whatsapp\.net|lid)$/i.test(rawArg)) {
+      return [normalizeBareJid(rawArg)];
+    }
+    const stripped = rawArg.replace(/^@/, '');
+    const num = normalizePhone(stripped);
     if (isValidPhone(num)) {
       return [`${num}@s.whatsapp.net`];
     }

@@ -8,15 +8,18 @@ import {
   getBotJids,
   getCachedGroupMetadata,
   invalidateGroupMetadataCache,
+  isLidUser,
   isParticipantAdmin,
   jidUserPart,
+  lookupKnownUserName,
+  normalizeBareJid,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { vipStore } from '../utils/vipStore.ts';
 
 const LINK_REGEX =
-  /(https?:\/\/[^\s]+|www\.[^\s]+|chat\.whatsapp\.com\/[A-Za-z0-9]+|whatsapp\.com\/channel\/[A-Za-z0-9]+|wa\.me\/[0-9]+|t\.me\/[A-Za-z0-9_]+|youtu\.be\/[^\s]+|discord\.gg\/[A-Za-z0-9]+|bit\.ly\/[^\s]+|\b[a-z0-9-]+\.(?:com|net|org|pk|in|io|app|me|xyz|tv|link|gg|co)\/[^\s]*)/i;
+  /(https?:\/\/[^\s]+|www\.[^\s]+|chat\.whatsapp\.com\/[A-Za-z0-9]+|whatsapp\.com\/channel\/[A-Za-z0-9]+|wa\.me\/[0-9]+|t\.me\/[A-Za-z0-9_]+|youtu\.be\/[^\s]+|discord\.gg\/[A-Za-z0-9]+|bit\.ly\/[^\s]+|tinyurl\.com\/[^\s]+|shorturl\.at\/[^\s]+|(?:instagram|tiktok|facebook|twitter|x|snapchat)\.com\/[^\s]+|fb\.watch\/[^\s]+|\b[a-z0-9-]+\.(?:com|net|org|pk|in|io|app|me|xyz|tv|link|gg|co|site|shop|online)\/[^\s]*)/i;
 
 const ABUSIVE_WORDS_REGEX =
   /(?:\b(madarchod|maderchod|madar\s*chod|bhenchod|behenchod|bhosdike|bhosdika|bhosdi|bsdk|bkl|mc|bc|mkc|bhen\s*ke\s*lode|chutiya|chutiye|chutiyapa|chut|choot|harami|haramzada|haramzadi|haramkhor|kamina|kameena|kameene|kutti|kutta|kutte|kamine|gandu|gaand|gand|randi|randwa|randi\s*ka|lund|lauda|lavda|loda|lodu|chodu|chodna|chod|bhadwa|bhadwe|kanjar|kanjri|tatti|suwar|suar|ullu\s+ka\s+pattha|teri\s+ma+|teri\s+behan|maa\s+ki\s+chut|fuck(?:ing|er|ed|off)?|motherfucker|bitch(?:es|ing)?|asshole|bastard|dickhead|dick|cock|pussy|slut|whore|cunt|bullshit|shit)\b|(?:m[\W_]*a[\W_]*d[\W_]*a[\W_]*r[\W_]*c[\W_]*h[\W_]*o[\W_]*d|b[\W_]*h[\W_]*e[\W_]*n[\W_]*c[\W_]*h[\W_]*o[\W_]*d|c[\W_]*h[\W_]*u[\W_]*t[\W_]*i[\W_]*y[\W_]*a|b[\W_]*h[\W_]*o[\W_]*s[\W_]*d[\W_]*i))/i;
@@ -70,27 +73,43 @@ export async function handleGroupParticipantsUpdate(
     const cfg = loadConfig();
 
     if (!groupCfg.welcome && !groupCfg.goodbye) return;
-
-    let groupSubject = 'this group';
-    try {
-      const meta = await getCachedGroupMetadata(sock, groupId);
-      groupSubject = meta.subject || groupSubject;
-    } catch {
-      // Ignore metadata fetch failure
-    }
+    if (cfg.mode === 'self') return;
 
     for (const participant of update.participants) {
-      const jid = typeof participant === 'string' ? participant : participant.id;
-      const num = jidUserPart(jid);
+      const pObj = typeof participant === 'string' ? { id: participant } : participant;
+      const rawJid = pObj.id;
+      const pnFromObj = (pObj as { phoneNumber?: string }).phoneNumber;
+      let targetDm = pnFromObj || rawJid;
+
+      if (isLidUser(targetDm) && sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const mapped = await sock.signalRepository.lidMapping.getPNForLID(targetDm);
+          if (mapped) targetDm = mapped;
+        } catch {
+          // Ignore missing LID mapping
+        }
+      }
+      targetDm = normalizeBareJid(targetDm) || rawJid;
+
+      const num = jidUserPart(targetDm);
+      const notifyName =
+        (pObj as { notify?: string; name?: string }).notify ||
+        (pObj as { notify?: string; name?: string }).name ||
+        lookupKnownUserName(targetDm) ||
+        lookupKnownUserName(rawJid);
+      const displayName = (notifyName && notifyName.trim()) || (num ? `+${num}` : 'Friend');
+
       if (update.action === 'add' && groupCfg.welcome) {
-        await sock.sendMessage(groupId, {
-          text: `*Welcome to ${groupSubject}!*\nHello @${num}, welcome to the group.\n\n> Powered by *${cfg.botName}*`,
-          mentions: [jid],
-        });
+        // Short, nice welcome directed solely to the joining user using their name — never mentions group name
+        await sock
+          .sendMessage(targetDm, {
+            text: `Hello *${displayName}*! Welcome — glad to have you here. ✨`,
+          })
+          .catch(() => {});
       } else if (update.action === 'remove' && groupCfg.goodbye) {
         await sock.sendMessage(groupId, {
-          text: `*Goodbye @${num}*\nThanks for being part of *${groupSubject}*.`,
-          mentions: [jid],
+          text: `*Goodbye @${num}*\nWishing you all the best ahead.`,
+          mentions: [rawJid],
         });
       }
     }
@@ -365,8 +384,13 @@ export async function enforceAntiStatusMention(
   const isStatusMention = Boolean(
     rawMsg.groupStatusMentionMessage ||
       rawMsg.statusMentionMessage ||
+      rawMsg.groupStatusMessage ||
+      rawMsg.groupStatusMessageV2 ||
       inner?.groupStatusMentionMessage ||
       inner?.statusMentionMessage ||
+      inner?.groupStatusMessage ||
+      inner?.groupStatusMessageV2 ||
+      ctxInfo?.remoteJid === 'status@broadcast' ||
       msgCtx?.statusMentionMessageInfo ||
       (Array.isArray(msgCtx?.statusMentions) && msgCtx.statusMentions.length > 0) ||
       ctxInfo?.statusMentionMessageInfo ||

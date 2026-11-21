@@ -20,6 +20,14 @@ export interface LiveScreenState {
   updatedAt: string;
 }
 
+export interface PortalBannerState {
+  enabled: boolean;
+  mediaType: LiveMediaType;
+  mediaUrl: string;
+  caption: string;
+  updatedAt: string;
+}
+
 export interface AdminAlert {
   id: string;
   title: string;
@@ -42,12 +50,22 @@ const defaultLiveScreen: LiveScreenState = {
   updatedAt: new Date().toISOString(),
 };
 
+const defaultPortalBanner: PortalBannerState = {
+  enabled: false,
+  mediaType: 'none',
+  mediaUrl: '',
+  caption: '',
+  updatedAt: new Date().toISOString(),
+};
+
 let storageInitialized = false;
 let liveScreenCache: LiveScreenState | null = null;
+let portalBannerCache: PortalBannerState | null = null;
 let alertsCache: AdminAlert[] | null = null;
 
 registerDbHydrationHook(() => {
   liveScreenCache = null;
+  portalBannerCache = null;
   alertsCache = null;
 });
 
@@ -97,6 +115,39 @@ export const liveStore = {
     };
     liveScreenCache = next;
     dbSetSync('live_screen', next);
+    return next;
+  },
+
+  getPortalBanner(): PortalBannerState {
+    if (portalBannerCache) return portalBannerCache;
+    ensureStorage();
+    const fromDb = dbGetSync<PortalBannerState>('portal_banner');
+    if (fromDb) {
+      portalBannerCache = fromDb;
+      return portalBannerCache;
+    }
+    portalBannerCache = { ...defaultPortalBanner };
+    dbSetSync('portal_banner', portalBannerCache);
+    return portalBannerCache;
+  },
+
+  updatePortalBanner(patch: Partial<PortalBannerState>): PortalBannerState {
+    ensureStorage();
+    const current = this.getPortalBanner();
+    const mediaType: LiveMediaType =
+      patch.mediaType === 'image' || patch.mediaType === 'video' || patch.mediaType === 'none'
+        ? patch.mediaType
+        : current.mediaType;
+
+    const next: PortalBannerState = {
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
+      mediaType,
+      mediaUrl: typeof patch.mediaUrl === 'string' ? patch.mediaUrl.trim() : current.mediaUrl,
+      caption: typeof patch.caption === 'string' ? patch.caption.trim() : current.caption,
+      updatedAt: new Date().toISOString(),
+    };
+    portalBannerCache = next;
+    dbSetSync('portal_banner', next);
     return next;
   },
 
@@ -171,9 +222,26 @@ export const liveStore = {
 
     const filename = `live_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.${ext}`;
     fs.writeFileSync(path.join(mediaDir, filename), buffer);
+    if (buffer.length <= 8 * 1024 * 1024) {
+      dbSetSync(`media_blob:${filename}`, {
+        mimeType: mimeType.toLowerCase(),
+        base64: buffer.toString('base64'),
+      });
+    }
     return {
       filename,
       url: `/api/public/media/${filename}`,
+    };
+  },
+
+  readPersistedMedia(filename: string): { mimeType: string; buffer: Buffer } | null {
+    const safeName = path.basename(filename || '');
+    if (!safeName) return null;
+    const saved = dbGetSync<{ mimeType: string; base64: string }>(`media_blob:${safeName}`);
+    if (!saved?.base64) return null;
+    return {
+      mimeType: saved.mimeType || 'application/octet-stream',
+      buffer: Buffer.from(saved.base64, 'base64'),
     };
   },
 };

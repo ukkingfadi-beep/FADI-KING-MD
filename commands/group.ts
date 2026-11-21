@@ -1351,4 +1351,91 @@ export const groupCommands: BotCommand[] = [
       return msg;
     },
   },
+  {
+    name: 'poll',
+    aliases: ['fakepoll', 'fakevote', 'vote'],
+    category: 'group',
+    description: 'Real WhatsApp Poll ya custom vote counts ke sath Fake Poll banaye',
+    usage: 'poll Question? | Opt1:95 | Opt2:12 (or Question? | Opt1 | Opt2)',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const raw = ctx.text.trim();
+      if (!raw || !raw.includes('|')) {
+        const msg = [
+          `*Poll & Fake Voting Usage:*`,
+          `• Native Poll: \`${ctx.prefix}poll Best Bot? | FADI KING MD | Other\``,
+          `• Custom/Fake Votes: \`${ctx.prefix}fakepoll Best Bot? | FADI KING:98 | Other:4\``,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const parts = raw
+        .split('|')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const question = parts[0];
+      const optionTokens = parts.slice(1, 13);
+
+      if (!question || optionTokens.length < 2) {
+        const msg = 'Provide a question and at least 2 options separated by `|`.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      // Check if user provided configured vote counts (e.g. `Option A:120` or `Option A=120`) or ran fakepoll
+      const parsedOptions = optionTokens.map((tok) => {
+        const match = tok.match(/^(.*?)\s*[:=]\s*(\d+)\s*$/);
+        if (match) {
+          return { label: match[1].trim() || tok, votes: Math.max(0, Number(match[2])), explicit: true };
+        }
+        return { label: tok, votes: 0, explicit: false };
+      });
+
+      const hasExplicitCounts = parsedOptions.some((o) => o.explicit) || ctx.commandName === 'fakepoll' || ctx.commandName === 'fakevote';
+
+      if (hasExplicitCounts) {
+        // Assign sensible default votes if someone ran `.fakepoll Q | A | B` without numbers
+        const finalOptions = parsedOptions.map((o, idx) => ({
+          label: o.label,
+          votes: o.explicit ? o.votes : idx === 0 ? 85 : Math.max(2, 20 - idx * 5),
+        }));
+        const totalVotes = Math.max(
+          1,
+          finalOptions.reduce((sum, o) => sum + o.votes, 0)
+        );
+        const lines = [
+          `📊 *POLL RESULTS*`,
+          `*${question}*`,
+          '',
+          ...finalOptions.map((opt, idx) => {
+            const pct = Math.round((opt.votes / totalVotes) * 100);
+            const filled = Math.max(1, Math.round(pct / 10));
+            const bar = '█'.repeat(Math.min(10, filled)) + '░'.repeat(Math.max(0, 10 - filled));
+            return `${idx + 1}. *${opt.label}*\n   ${bar} *${pct}%* (${opt.votes} votes)`;
+          }),
+          '',
+          `Total Votes: *${totalVotes}*`,
+        ];
+        const card = lines.join('\n');
+        await ctx.reply(card);
+        return card;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated Poll] *${question}*\n${parsedOptions.map((o, i) => `${i + 1}. ${o.label}`).join('\n')}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      await ctx.sock.sendMessage(ctx.chatId, {
+        poll: {
+          name: question,
+          values: parsedOptions.map((o) => o.label),
+          selectableCount: 1,
+        },
+      });
+      return `Poll created: ${question}`;
+    },
+  },
 ];

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { RefreshCw, ShieldAlert, Trash2, Wifi, WifiOff } from 'lucide-react';
+import { RefreshCw, ShieldAlert, Trash2, Users, Wifi, WifiOff } from 'lucide-react';
 import type { BotStatusResponse } from '../types/bot';
 
 interface AdminLogsPanelProps {
@@ -15,11 +15,18 @@ function formatDuration(totalSeconds: number): string {
   return `${h}h ${m}m ${s}s`;
 }
 
+function formatDateTime(iso: string): string {
+  if (!iso) return '';
+  return iso.slice(0, 19).replace('T', ' ');
+}
+
 export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanelProps) {
   const [busy, setBusy] = useState(false);
   const bot = status?.bot;
   const config = status?.config;
   const stats = status?.stats;
+  const isBotOnline = Boolean(stats?.botOnline || bot?.status === 'connected');
+  const paidUsers = stats?.paidUsers || [];
 
   async function handleRestart() {
     setBusy(true);
@@ -53,19 +60,23 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
 
   return (
     <div className="space-y-8">
-      {/* Admin Telemetry & Socket Controls */}
+      {/* Admin Live Status, Paid Users & Socket Controls */}
       <section className="glass-surface rounded-2xl p-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">
           <div className="flex items-center gap-2.5">
-            {bot?.status === 'connected' ? (
+            {isBotOnline ? (
               <Wifi className="w-4 h-4 text-emerald-400" />
             ) : (
-              <WifiOff className="w-4 h-4 text-[#A78BFA]" />
+              <WifiOff className="w-4 h-4 text-rose-400" />
             )}
             <div>
               <h2 className="text-lg font-semibold text-white">Bot Health & Session Lifecycle</h2>
               <p className="text-xs text-[#9E97C2]">
-                Status: {bot?.status || 'idle'} · Prefix {config?.prefix || '.'} · Mode {config?.mode || 'public'}
+                Server: <span className="text-emerald-300 font-semibold">Online</span> · Bot:{' '}
+                <span className={isBotOnline ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+                  {isBotOnline ? 'Online' : 'Offline'}
+                </span>{' '}
+                · Mode {config?.mode === 'self' ? 'Private' : 'Public'} · Prefix {config?.prefix || '.'}
               </p>
             </div>
           </div>
@@ -92,23 +103,29 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
           <div>
-            <div className="text-xs text-[#948DB8]">Active VIPs</div>
+            <div className="text-xs text-[#948DB8]">Server Status</div>
+            <div className="mt-1 text-xl font-semibold text-emerald-400">
+              {stats?.serverOnline !== false ? 'Online' : 'Offline'}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-[#948DB8]">Bot Status</div>
+            <div className={`mt-1 text-xl font-semibold ${isBotOnline ? 'text-emerald-400' : 'text-amber-300'}`}>
+              {isBotOnline ? 'Online' : 'Offline'}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-[#948DB8]">Active / Paid Users</div>
             <div className="mt-1 text-xl font-semibold font-mono tabular-nums text-white">
-              {stats?.activeVips ?? 0}
+              {stats?.activePaidUsersCount ?? stats?.activeVips ?? 0}
             </div>
           </div>
           <div>
             <div className="text-xs text-[#948DB8]">Total Pairings</div>
             <div className="mt-1 text-xl font-semibold font-mono tabular-nums text-white">
               {stats?.totalPairings ?? 0}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-[#948DB8]">Rate-Limit Blocks</div>
-            <div className="mt-1 text-xl font-semibold font-mono tabular-nums text-white">
-              {stats?.activeBlocks ?? 0}
             </div>
           </div>
           <div>
@@ -122,12 +139,52 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
         <div className="pt-4 border-t border-white/[0.07] flex items-start gap-2.5 text-xs text-[#A9A2C8]">
           <ShieldAlert className="w-4 h-4 text-[#A78BFA] shrink-0 mt-0.5" />
           <div className="font-mono tabular-nums">
-            Anti-Ban Guardrails: Pair CD {config?.pairCooldownSeconds ?? 60}s · Cmd CD {config?.cmdCooldownSeconds ?? 3}s / Grp {config?.groupCmdCooldownSeconds ?? 2}s · Tag {config?.tagCooldownSeconds ?? 120}s ({config?.tagMaxPerHour ?? 6}/hr) · Broadcast {config?.broadcastDelayMinMs ?? 2500}–{config?.broadcastDelayMaxMs ?? 5500}ms (cap {config?.maxBroadcastTargets ?? 25}) · Reconnect Cap {config?.maxReconnectAttempts ?? 8}
+            Anti-Ban Guardrails: Pair CD {config?.pairCooldownSeconds ?? 10}s · Cmd CD {config?.cmdCooldownSeconds ?? 1}s / Grp {config?.groupCmdCooldownSeconds ?? 1}s · Broadcast {config?.broadcastDelayMinMs ?? 2500}–{config?.broadcastDelayMaxMs ?? 5500}ms · SingleTick {config?.singleTick ? 'ON' : 'OFF'} · AI {config?.aiEnabled ? 'ON' : 'OFF'} · AutoReact {config?.autoReact ? 'ON' : 'OFF'}
           </div>
         </div>
       </section>
 
-      {/* Pairing Audit & Live Event Logs */}
+      {/* Active / Paid User Phone Numbers (Admin-Only Private Directory) */}
+      <section className="glass-surface rounded-2xl p-6 space-y-4">
+        <div className="flex items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">
+          <div className="flex items-center gap-2.5">
+            <Users className="w-4 h-4 text-[#A78BFA]" />
+            <h3 className="text-base font-semibold text-white">
+              Active / Paid User Phone Numbers ({paidUsers.length})
+            </h3>
+          </div>
+          <span className="text-xs text-[#9E97C2]">Admin Only</span>
+        </div>
+
+        {paidUsers.length === 0 ? (
+          <div className="py-6 text-center text-sm text-[#8B84AD]">
+            No active paid users registered yet.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {paidUsers.map((u) => (
+              <div
+                key={u.number}
+                className="px-4 py-3 rounded-xl bg-white/[0.03] border border-white/[0.07] flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <div className="text-sm font-mono tabular-nums text-white truncate">
+                    +{u.number}
+                  </div>
+                  <div className="text-xs text-[#9E97C2] truncate">
+                    {u.name} · <span className="capitalize">{u.tier}</span>
+                  </div>
+                </div>
+                <span className="text-[11px] font-mono tabular-nums text-[#C4B5FD] shrink-0">
+                  {u.pairingCount}x
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Pairing Audit & Live Event Logs with Full Date + Time */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <section className="glass-surface rounded-2xl p-6">
           <div className="flex items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">
@@ -170,7 +227,7 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
                     <p className="text-xs text-[#9E97C2] truncate mt-0.5">{item.reason}</p>
                   </div>
                   <span className="text-[11px] font-mono tabular-nums text-[#7C759E] shrink-0">
-                    {item.timestamp.slice(11, 19)}
+                    {formatDateTime(item.timestamp)}
                   </span>
                 </div>
               ))
@@ -195,7 +252,7 @@ export function AdminLogsPanel({ status, adminToken, onRefresh }: AdminLogsPanel
               status.logs.map((entry) => (
                 <div key={entry.id} className="py-2.5 flex items-start gap-3">
                   <span className="text-[#6F6891] tabular-nums shrink-0">
-                    {entry.timestamp.slice(11, 19)}
+                    {formatDateTime(entry.timestamp)}
                   </span>
                   <span
                     className={`shrink-0 uppercase ${

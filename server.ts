@@ -5,6 +5,7 @@ import JSZip from 'jszip';
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from './config/bot.config.ts';
 import { getAllCommands } from './commands/index.ts';
 import {
+  applySingleTickPresenceAcrossSockets,
   disconnectMainBot,
   getBotSnapshot,
   initializeSavedSessionOnBoot,
@@ -60,6 +61,7 @@ const SOURCE_FILES = [
   'utils/adminAuth.ts',
   'utils/liveStore.ts',
   'utils/anticallStore.ts',
+  'utils/geminiService.ts',
   'utils/db.ts',
   'server.ts',
   '.env.example',
@@ -103,38 +105,38 @@ async function startServer(): Promise<void> {
   app.get('/api/public/state', (_req, res) => {
     const cfg = loadConfig();
     const snap = getBotSnapshot();
-    const connectedSub = snap.subSessions.find((s) => s.status === 'connected');
-    const effectiveStatus =
-      snap.status === 'connected'
-        ? 'connected'
-        : connectedSub
-          ? 'connected'
-          : snap.status;
-    const effectivePhone = snap.connectedUser?.phone || connectedSub?.connectedUser?.phone || connectedSub?.phone || null;
+    const activePaidUsersCount = vipStore.listVips().filter((v) => v.active).length;
 
     res.json({
       bot: {
-        status: effectiveStatus,
+        status: snap.status === 'qr_ready' || snap.status === 'pairing_ready' || snap.status === 'connecting' ? snap.status : 'idle',
         qrDataUrl: snap.qrDataUrl,
         pairingCode: snap.pairingCode,
-        pairingPhone: snap.pairingPhone,
-        connectedPhone: effectivePhone,
-        lastError: snap.lastError,
-        uptimeSeconds: snap.uptimeSeconds,
         vipOnlyPairing: cfg.vipOnlyPairing,
-        pairCooldownSeconds: cfg.pairCooldownSeconds,
-        maxPairAttempts: cfg.maxPairAttempts,
-        pairWindowMinutes: cfg.pairWindowMinutes,
         prefix: cfg.prefix,
         botName: cfg.botName,
-        activeSessions: snap.subSessions.map((s) => ({
-          phone: s.phone,
-          status: s.status,
-        })),
+        activePaidUsersCount,
       },
+      portalBanner: liveStore.getPortalBanner(),
       liveScreen: liveStore.getLiveScreen(),
       alerts: liveStore.getAlerts(25),
     });
+  });
+
+  app.get('/api/bot/pair-status', (req, res) => {
+    const cleanPhone = normalizePhone(String(req.query?.phone || ''));
+    if (!isValidPhone(cleanPhone)) {
+      return res.json({ status: 'idle' });
+    }
+    const snap = getBotSnapshot();
+    const sub = snap.subSessions.find((s) => s.phone === cleanPhone);
+    if (sub) {
+      return res.json({ status: sub.status });
+    }
+    if (snap.connectedUser?.phone === cleanPhone && snap.status === 'connected') {
+      return res.json({ status: 'connected' });
+    }
+    return res.json({ status: snap.pairingPhone === cleanPhone ? snap.status : 'idle' });
   });
 
   app.get('/api/public/media/:filename', (req, res) => {
@@ -143,10 +145,15 @@ async function startServer(): Promise<void> {
       return res.status(400).end();
     }
     const fullPath = path.join(liveStore.getMediaDir(), safeName);
-    if (!fs.existsSync(fullPath)) {
-      return res.status(404).end();
+    if (fs.existsSync(fullPath)) {
+      return res.sendFile(fullPath);
     }
-    return res.sendFile(fullPath);
+    const persisted = liveStore.readPersistedMedia(safeName);
+    if (persisted) {
+      res.setHeader('Content-Type', persisted.mimeType);
+      return res.send(persisted.buffer);
+    }
+    return res.status(404).end();
   });
 
   app.post('/api/bot/start-qr', async (_req, res) => {
@@ -361,6 +368,11 @@ async function startServer(): Promise<void> {
     const cfg = loadConfig();
     const snapshot = getBotSnapshot();
     const vips = vipStore.listVips();
+    const activePaidUsers = vips.filter((v) => v.active);
+    const botOnline =
+      snapshot.status === 'connected' ||
+      snapshot.subSessions.some((s) => s.status === 'connected');
+
     res.json({
       bot: snapshot,
       config: {
@@ -397,11 +409,24 @@ async function startServer(): Promise<void> {
         antiScamBlockAllStickers: cfg.antiScamBlockAllStickers,
         antiStatusMentionGlobal: cfg.antiStatusMentionGlobal,
         autoForwardIbToOpenGcs: cfg.autoForwardIbToOpenGcs,
+        autoReact: cfg.autoReact,
+        aiEnabled: cfg.aiEnabled,
+        singleTick: cfg.singleTick,
         stickerPack: cfg.stickerPack,
         stickerAuthor: cfg.stickerAuthor,
       },
       stats: {
-        activeVips: vips.filter((v) => v.active).length,
+        serverOnline: true,
+        botOnline,
+        activeVips: activePaidUsers.length,
+        activePaidUsersCount: activePaidUsers.length,
+        paidUsers: activePaidUsers.map((v) => ({
+          number: v.number,
+          name: v.name,
+          tier: v.tier,
+          pairingCount: v.pairingCount,
+          lastPairedAt: v.lastPairedAt,
+        })),
         totalPairings: vips.reduce((sum, v) => sum + v.pairingCount, 0),
         commandCount: getAllCommands().length,
         activeBlocks: pairingRateLimiter.getActiveBlocks().length,
@@ -507,6 +532,9 @@ async function startServer(): Promise<void> {
         typeof body.autoForwardIbToOpenGcs === 'boolean'
           ? body.autoForwardIbToOpenGcs
           : undefined,
+      autoReact: typeof body.autoReact === 'boolean' ? body.autoReact : undefined,
+      aiEnabled: typeof body.aiEnabled === 'boolean' ? body.aiEnabled : undefined,
+      singleTick: typeof body.singleTick === 'boolean' ? body.singleTick : undefined,
       stickerPack: typeof body.stickerPack === 'string' ? body.stickerPack : undefined,
       stickerAuthor: typeof body.stickerAuthor === 'string' ? body.stickerAuthor : undefined,
     });
@@ -515,6 +543,9 @@ async function startServer(): Promise<void> {
       updated.autoJoinChannelInvite !== prevCfg.autoJoinChannelInvite
     ) {
       void syncAutoJoinsAcrossConnectedSessions();
+    }
+    if (updated.singleTick !== prevCfg.singleTick) {
+      void applySingleTickPresenceAcrossSockets(updated.singleTick);
     }
     logger.info('config', `Updated configuration (mode=${updated.mode}, prefix=${updated.prefix})`);
     res.json({ ok: true, config: updated });
@@ -638,7 +669,22 @@ async function startServer(): Promise<void> {
     res.json(result);
   });
 
-  // Live Screen & Bell Alerts Admin Controls
+  // Portal Header Banner & Live Screen & Bell Alerts Admin Controls
+  app.put('/api/admin/portal-banner', requireAdmin, (req, res) => {
+    const body = req.body || {};
+    const updated = liveStore.updatePortalBanner({
+      enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+      mediaType:
+        body.mediaType === 'image' || body.mediaType === 'video' || body.mediaType === 'none'
+          ? body.mediaType
+          : undefined,
+      mediaUrl: typeof body.mediaUrl === 'string' ? body.mediaUrl : undefined,
+      caption: typeof body.caption === 'string' ? body.caption : undefined,
+    });
+    logger.info('portalBanner', `Updated top portal banner (enabled=${updated.enabled}, media=${updated.mediaType})`);
+    res.json({ ok: true, portalBanner: updated });
+  });
+
   app.put('/api/admin/live-screen', requireAdmin, (req, res) => {
     const body = req.body || {};
     const updated = liveStore.updateLiveScreen({

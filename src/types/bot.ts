@@ -24,6 +24,14 @@ export interface LiveScreenState {
   updatedAt: string;
 }
 
+export interface PortalBannerState {
+  enabled: boolean;
+  mediaType: LiveMediaType;
+  mediaUrl: string;
+  caption: string;
+  updatedAt: string;
+}
+
 export interface AdminAlert {
   id: string;
   title: string;
@@ -37,18 +45,12 @@ export interface PublicStateResponse {
     status: ConnectionStatus;
     qrDataUrl: string | null;
     pairingCode: string | null;
-    pairingPhone: string | null;
-    connectedPhone: string | null;
-    lastError: string | null;
-    uptimeSeconds: number;
     vipOnlyPairing: boolean;
-    pairCooldownSeconds: number;
-    maxPairAttempts: number;
-    pairWindowMinutes: number;
     prefix: string;
     botName: string;
-    activeSessions?: Array<{ phone: string; status: ConnectionStatus }>;
+    activePaidUsersCount: number;
   };
+  portalBanner: PortalBannerState;
   liveScreen: LiveScreenState;
   alerts: AdminAlert[];
 }
@@ -87,6 +89,9 @@ export interface BotConfigView {
   antiScamBlockAllStickers: boolean;
   antiStatusMentionGlobal: boolean;
   autoForwardIbToOpenGcs: boolean;
+  autoReact: boolean;
+  aiEnabled: boolean;
+  singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
 }
@@ -141,7 +146,17 @@ export interface BotStatusResponse {
   };
   config: BotConfigView;
   stats: {
+    serverOnline: boolean;
+    botOnline: boolean;
     activeVips: number;
+    activePaidUsersCount: number;
+    paidUsers: Array<{
+      number: string;
+      name: string;
+      tier: VipTier;
+      pairingCount: number;
+      lastPairedAt?: string;
+    }>;
     totalPairings: number;
     commandCount: number;
     activeBlocks: number;

@@ -4,8 +4,11 @@ import { isValidPhone, loadConfig, normalizePhone } from '../config/bot.config.t
 import {
   extractBodyText,
   extractContextInfo,
+  extractRawTargetCandidates,
   hasValidMediaPayload,
+  isLidUser,
   jidUserPart,
+  normalizeBareJid,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import {
@@ -93,15 +96,15 @@ const VIP_QUOTES = [
 
 export const mediaCommands: BotCommand[] = [
   {
-    name: 'sticker',
-    aliases: ['s', 'stiker'],
+    name: 's',
+    aliases: ['sticker', 'stiker'],
     category: 'media',
-    description: 'Image ya short video/GIF ko sticker mein convert kare',
-    usage: 'sticker (reply or attach media)',
+    description: 'Photo, video ya GIF par reply karke WhatsApp sticker banaye',
+    usage: 's (reply or attach photo/video/GIF)',
     cooldownSeconds: 2,
     execute: async (ctx) => {
       if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
-        const msg = 'Reply to an image or short video on WhatsApp with `.sticker` to generate a WebP sticker.';
+        const msg = 'Reply to a photo, video, or GIF on WhatsApp with `.s` to convert it into a sticker.';
         await ctx.reply(msg);
         return msg;
       }
@@ -111,13 +114,13 @@ export const mediaCommands: BotCommand[] = [
       const mediaType = detectMediaType(targetMsgContent);
 
       if (mediaType !== 'image' && mediaType !== 'video') {
-        const msg = `Please send or reply to an image/short video with \`${ctx.prefix}sticker\`.`;
+        const msg = `Please send or reply to a photo, video, or GIF with \`${ctx.prefix}s\`.`;
         await ctx.reply(msg);
         return msg;
       }
 
       if (!hasValidMediaPayload(targetMsgContent)) {
-        const msg = 'Media payload unavailable or expired. Resend the image/video and reply with `.sticker`.';
+        const msg = 'Media payload unavailable or expired. Resend the photo/video/GIF and reply with `.s`.';
         await ctx.reply(msg);
         return msg;
       }
@@ -715,9 +718,94 @@ export const mediaCommands: BotCommand[] = [
     },
   },
   {
+    name: 'savedp',
+    aliases: ['dpsave', 'getdp', 'pp', 'getpp', 'dp'],
+    category: 'media',
+    description: 'Mention, reply ya ID se kisi ki bhi profile photo IB mein save kare (.dpsave)',
+    usage: 'dpsave (@user / ID / number / reply)',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg =
+          'Mention, reply, or pass a user ID/number with `.dpsave` (or `.savedp`) on WhatsApp to save their profile DP to your IB.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const candidates = extractRawTargetCandidates(ctx.msg, ctx.args);
+      if (candidates.length === 0 && !ctx.isGroup) {
+        const peer = ctx.msg.key?.remoteJidAlt || ctx.chatId;
+        if (peer) candidates.push(normalizeBareJid(peer));
+      }
+      if (candidates.length === 0) {
+        const msg = `Mention a user, reply to their message, or pass an ID/number.\nUsage: \`${ctx.prefix}dpsave @user\` or \`${ctx.prefix}dpsave 923001234567\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let targetJid = normalizeBareJid(candidates[0]);
+      if (isLidUser(targetJid) && ctx.sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await ctx.sock.signalRepository.lidMapping.getPNForLID(targetJid);
+          if (pn) targetJid = normalizeBareJid(pn);
+        } catch {
+          // Keep original JID if LID lookup unavailable
+        }
+      }
+
+      const cfg = loadConfig();
+      const ownBotPhone = normalizePhone(jidUserPart(ctx.sock.user?.id));
+      const senderPhone = normalizePhone(ctx.senderNumber);
+      const targetDmPhone =
+        ctx.msg.key?.fromMe && ownBotPhone
+          ? ownBotPhone
+          : senderPhone || ownBotPhone || cfg.ownerNumber;
+      const targetDm = `${targetDmPhone}@s.whatsapp.net`;
+
+      try {
+        let ppUrl: string | undefined;
+        try {
+          ppUrl = await ctx.sock.profilePictureUrl(targetJid, 'image');
+        } catch {
+          ppUrl = undefined;
+        }
+        if (!ppUrl) {
+          ppUrl = await ctx.sock.profilePictureUrl(targetJid, 'preview').catch(() => undefined);
+        }
+
+        if (!ppUrl) {
+          const msg = `Profile photo is hidden or unavailable for +${jidUserPart(targetJid)}.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const res = await fetch(ppUrl, { signal: AbortSignal.timeout(10_000) });
+        if (!res.ok) {
+          throw new Error(`Failed fetching profile photo (HTTP ${res.status})`);
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        const targetLabel = jidUserPart(targetJid);
+        await ctx.sock.sendMessage(targetDm, {
+          image: buf,
+          caption: `*Saved Profile DP*\n• User: +${targetLabel}`,
+        });
+        if (targetDm !== ctx.chatId) {
+          await ctx.reply(`Saved profile DP of +${targetLabel} to your IB!`);
+        }
+        return `Saved DP of +${targetLabel} to IB.`;
+      } catch (err) {
+        const errMsg = (err as Error).message || 'Profile photo hidden or unavailable.';
+        const msg = /item-not-found|401|404/i.test(errMsg)
+          ? `Could not fetch DP for +${jidUserPart(targetJid)} (privacy hidden or no DP set).`
+          : `DPSave failed: ${errMsg}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
     name: 'react',
     category: 'media',
-    description: 'Replied message par emoji reaction lagaye',
+    description: 'Replied message par custom emoji reaction lagaye',
     usage: 'react <emoji>',
     cooldownSeconds: 1,
     execute: async (ctx) => {
@@ -745,6 +833,66 @@ export const mediaCommands: BotCommand[] = [
         },
       });
       return `Reacted with ${emoji}.`;
+    },
+  },
+  {
+    name: 'fakereact',
+    aliases: ['freact', 'reactboost'],
+    category: 'media',
+    description: 'Replied message par custom/fake reactions aur reaction count card lagaye',
+    usage: 'fakereact <emoji1> [count | emoji2 emoji3...]',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const args = ctx.args.filter(Boolean);
+      const firstEmoji = args[0] && !/^\d+$/.test(args[0]) ? args[0] : '🔥';
+      const numericArg = args.find((a) => /^\d+$/.test(a));
+      const emojiList = args.filter((a) => !/^\d+$/.test(a));
+      if (emojiList.length === 0) emojiList.push(firstEmoji);
+
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const count = numericArg ? Number(numericArg) : 25;
+        const msg = `*Reaction Summary*\n${emojiList.map((e) => `• ${e} × *${count}*`).join('\n')}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const ctxInfo = extractContextInfo(ctx.msg.message);
+      if (!ctxInfo?.stanzaId) {
+        const msg = `Reply to any message with \`${ctx.prefix}fakereact 🔥 99\` or \`${ctx.prefix}fakereact ❤️ 🔥 💯\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const targetKey = {
+        remoteJid: ctx.chatId,
+        fromMe: Boolean(ctxInfo.participant === ctx.sock.user?.id),
+        id: ctxInfo.stanzaId,
+        participant: ctxInfo.participant || undefined,
+      };
+
+      // Apply live reaction(s) sequentially
+      const emojisToSend = emojiList.slice(0, 5);
+      for (let i = 0; i < emojisToSend.length; i += 1) {
+        await ctx.sock.sendMessage(ctx.chatId, {
+          react: { text: emojisToSend[i], key: targetKey },
+        });
+        if (i < emojisToSend.length - 1) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+
+      if (numericArg) {
+        const count = Math.max(1, Math.min(999999, Number(numericArg)));
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            text: `*Message Reactions*\n${emojisToSend.map((e) => `${e}  *${count}*`).join('   ·   ')}`,
+          },
+          { quoted: ctx.msg }
+        );
+      }
+
+      return `Applied reaction(s): ${emojisToSend.join(' ')}`;
     },
   },
 ];
