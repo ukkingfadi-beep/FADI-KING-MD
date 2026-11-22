@@ -22,6 +22,7 @@ import {
   extractQuotedMessage,
   getCachedViewOnceMedia,
   getCachedViewOnceMeta,
+  getUnavailableViewOnceKey,
   isFfmpegAvailable,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
@@ -333,33 +334,66 @@ export const mediaCommands: BotCommand[] = [
         : ctx.msg.key;
 
       // 2. Fallback to cached original WAMessage (RAM + remoteJidAlt + disk metadata)
-      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
-        const ramLookups = ctx.getCachedMessage
-          ? [
-              ctx.getCachedMessage(ctx.chatId, stanzaId),
-              ctx.msg.key?.remoteJidAlt
-                ? ctx.getCachedMessage(ctx.msg.key.remoteJidAlt, stanzaId)
-                : undefined,
-              ctxInfo?.remoteJid ? ctx.getCachedMessage(ctxInfo.remoteJid, stanzaId) : undefined,
-            ]
-          : [];
-        for (const cachedOrig of ramLookups) {
-          if (cachedOrig?.message) {
-            const cachedInner =
-              unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
-            if (cachedInner && hasValidMediaPayload(cachedInner)) {
-              inner = cachedInner;
-              sourceKey = cachedOrig.key || sourceKey;
-              break;
+      const remoteJidAlt = ctx.msg.key?.remoteJidAlt;
+      const lookupCachedInner = () => {
+        if (!stanzaId) return null;
+        if (ctx.getCachedMessage) {
+          const ramLookups = [
+            ctx.getCachedMessage(ctx.chatId, stanzaId),
+            remoteJidAlt ? ctx.getCachedMessage(remoteJidAlt, stanzaId) : undefined,
+            ctxInfo?.remoteJid ? ctx.getCachedMessage(ctxInfo.remoteJid, stanzaId) : undefined,
+          ];
+          for (const cachedOrig of ramLookups) {
+            if (cachedOrig?.message) {
+              const cachedInner =
+                unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
+              if (cachedInner && hasValidMediaPayload(cachedInner)) {
+                return { inner: cachedInner, key: cachedOrig.key || sourceKey };
+              }
             }
           }
         }
+        const diskMeta = getCachedViewOnceMeta(stanzaId);
+        if (diskMeta?.message && hasValidMediaPayload(diskMeta.message)) {
+          return { inner: diskMeta.message, key: diskMeta.key || sourceKey };
+        }
+        return null;
+      };
 
-        if (!inner || !hasValidMediaPayload(inner)) {
-          const diskMeta = getCachedViewOnceMeta(stanzaId);
-          if (diskMeta?.message && hasValidMediaPayload(diskMeta.message)) {
-            inner = diskMeta.message;
-            sourceKey = diskMeta.key || sourceKey;
+      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
+        const hit = lookupCachedInner();
+        if (hit) {
+          inner = hit.inner;
+          sourceKey = hit.key;
+        }
+      }
+
+      // 3. On-demand PDO placeholder resend request to primary mobile phone when View-Once payload was withheld
+      const unavailKey = stanzaId ? getUnavailableViewOnceKey(stanzaId) : undefined;
+      if (
+        stanzaId &&
+        (!inner || !hasValidMediaPayload(unwrapViewOnce(inner) || unwrapMessage(inner) || inner)) &&
+        typeof ctx.sock.requestPlaceholderResend === 'function'
+      ) {
+        const resendKey = unavailKey || sourceKey;
+        try {
+          await ctx.sock.requestPlaceholderResend(resendKey);
+        } catch {
+          // Ignore PDO request error if already inflight
+        }
+        for (let attempt = 0; attempt < 11; attempt += 1) {
+          await new Promise((r) => setTimeout(r, 450));
+          await waitForViewOnceInflight(stanzaId);
+          const preCachedAfterPdo = getCachedViewOnceMedia(ctx.chatId, stanzaId);
+          if (preCachedAfterPdo) {
+            await sendRecoveredMedia(preCachedAfterPdo);
+            return 'View-Once media unwrapped.';
+          }
+          const hit = lookupCachedInner();
+          if (hit) {
+            inner = hit.inner;
+            sourceKey = hit.key;
+            break;
           }
         }
       }
@@ -379,8 +413,9 @@ export const mediaCommands: BotCommand[] = [
       }
 
       if (!hasValidMediaPayload(unwrappedInner)) {
-        const msg =
-          'This View-Once media expired or was opened before the bot received it. Ask the sender to send it again.';
+        const msg = unavailKey
+          ? 'WhatsApp withheld this View-Once media key from linked Web sessions (`view_once_unavailable_fanout`) and your primary phone did not resend it.'
+          : 'This View-Once media has no decryption key (WhatsApp blocked View-Once fanout to linked Web sessions or it was already opened/expired before arrival).';
         await ctx.reply(msg);
         return msg;
       }

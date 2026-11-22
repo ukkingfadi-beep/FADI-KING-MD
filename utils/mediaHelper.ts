@@ -144,9 +144,15 @@ function ensureDownloadableUrl(message: proto.IMessage): proto.IMessage {
     const media = clone[key];
     if (!media) continue;
     const cleanUrl = typeof media.url === 'string' ? media.url.trim() : '';
-    const cleanDirect = typeof media.directPath === 'string' ? media.directPath.trim() : '';
+    const rawDirect =
+      typeof media.directPath === 'string' && media.directPath.trim()
+        ? media.directPath.trim()
+        : 'thumbnailDirectPath' in media &&
+            typeof (media as { thumbnailDirectPath?: unknown }).thumbnailDirectPath === 'string'
+          ? (media as { thumbnailDirectPath: string }).thumbnailDirectPath.trim()
+          : '';
     const resolvedUrl =
-      cleanUrl || (cleanDirect ? `https://mmg.whatsapp.net${cleanDirect.startsWith('/') ? '' : '/'}${cleanDirect}` : '');
+      cleanUrl || (rawDirect ? `https://mmg.whatsapp.net${rawDirect.startsWith('/') ? '' : '/'}${rawDirect}` : '');
     const normalizedKey = toBinaryBuffer(media.mediaKey);
     const normalizedEncSha = toBinaryBuffer(media.fileEncSha256);
     const normalizedSha = toBinaryBuffer(media.fileSha256);
@@ -233,6 +239,22 @@ const MAX_VIEW_ONCE_CACHE_ITEMS = 45;
 const MAX_VIEW_ONCE_CACHE_BYTES = 25 * 1024 * 1024;
 const viewOnceMediaCache = new Map<string, CachedViewOnceEntry>();
 const viewOnceInflight = new Map<string, Promise<void>>();
+const unavailableViewOnceKeys = new Map<string, WAMessage['key']>();
+
+export function recordUnavailableViewOnceKey(key: WAMessage['key'] | null | undefined): void {
+  const id = key?.id;
+  if (!id) return;
+  unavailableViewOnceKeys.set(id, key);
+  if (unavailableViewOnceKeys.size > 200) {
+    const oldest = unavailableViewOnceKeys.keys().next().value;
+    if (oldest) unavailableViewOnceKeys.delete(oldest);
+  }
+}
+
+export function getUnavailableViewOnceKey(msgId: string): WAMessage['key'] | undefined {
+  if (!msgId) return undefined;
+  return unavailableViewOnceKeys.get(msgId);
+}
 
 function getViewOnceDiskDir(): string {
   const dir = path.join(resolveDataDir(), 'viewonce_cache');

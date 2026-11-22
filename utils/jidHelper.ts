@@ -88,9 +88,14 @@ export function hasValidMediaPayload(
     message.stickerMessage ||
     message.documentMessage;
   if (!media) return false;
+  const thumbPath =
+    'thumbnailDirectPath' in media && typeof (media as { thumbnailDirectPath?: unknown }).thumbnailDirectPath === 'string'
+      ? (media as { thumbnailDirectPath: string }).thumbnailDirectPath.trim()
+      : '';
   const hasUrlOrPath = Boolean(
     (typeof media.url === 'string' && media.url.trim().length > 0) ||
-      (typeof media.directPath === 'string' && media.directPath.trim().length > 0)
+      (typeof media.directPath === 'string' && media.directPath.trim().length > 0) ||
+      thumbPath.length > 0
   );
   const key = media.mediaKey as unknown;
   const hasKey = Boolean(
