@@ -88,7 +88,19 @@ export function hasValidMediaPayload(
     message.stickerMessage ||
     message.documentMessage;
   if (!media) return false;
-  return Boolean((media.url || media.directPath) && media.mediaKey);
+  const hasUrlOrPath = Boolean(
+    (typeof media.url === 'string' && media.url.trim().length > 0) ||
+      (typeof media.directPath === 'string' && media.directPath.trim().length > 0)
+  );
+  const key = media.mediaKey as unknown;
+  const hasKey = Boolean(
+    key &&
+      ((key instanceof Uint8Array && key.length > 0) ||
+        (Buffer.isBuffer(key) && key.length > 0) ||
+        (typeof key === 'string' && key.length > 0) ||
+        (typeof key === 'object' && Array.isArray((key as { data?: number[] }).data)))
+  );
+  return hasUrlOrPath && hasKey;
 }
 
 export function extractFirstUrl(text: string): string | null {
@@ -357,6 +369,7 @@ export function extractContextInfo(
     inner.extendedTextMessage?.contextInfo ||
     inner.imageMessage?.contextInfo ||
     inner.videoMessage?.contextInfo ||
+    inner.ptvMessage?.contextInfo ||
     inner.audioMessage?.contextInfo ||
     inner.stickerMessage?.contextInfo ||
     inner.documentMessage?.contextInfo ||

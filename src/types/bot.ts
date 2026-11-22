@@ -202,6 +202,7 @@ export interface GroupConfig {
   antilinkMode?: AntilinkMode;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  aiEnabled?: boolean;
   welcome: boolean;
   goodbye: boolean;
 }

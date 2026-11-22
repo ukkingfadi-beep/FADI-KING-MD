@@ -2,6 +2,7 @@ import {
   generateWAMessageContent,
   generateWAMessageFromContent,
   getUrlInfo,
+  proto,
   type AnyMessageContent,
   type GroupParticipant,
   type WAMessage,
@@ -9,6 +10,7 @@ import {
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
 import { normalizeFileSha256 } from '../handlers/group.ts';
 import {
+  extractContextInfo,
   extractFirstUrl,
   extractRawTargetCandidates,
   findParticipant,
@@ -1436,6 +1438,293 @@ export const groupCommands: BotCommand[] = [
         },
       });
       return `Poll created: ${question}`;
+    },
+  },
+  {
+    name: 'groupdp',
+    aliases: ['gdp', 'gcpp', 'groupicon'],
+    category: 'group',
+    description: 'Group ki high-resolution profile picture (DP) nikal kar chat mein bheje',
+    usage: 'groupdp',
+    groupOnly: true,
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Group DP fetch ready for ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const cfg = loadConfig();
+      let groupSubject = 'WhatsApp Group';
+      try {
+        const meta = await getCachedGroupMetadata(ctx.sock, ctx.chatId);
+        if (meta?.subject) groupSubject = meta.subject;
+      } catch {
+        // Optional metadata
+      }
+
+      let dpUrl: string | undefined;
+      try {
+        dpUrl = await ctx.sock.profilePictureUrl(ctx.chatId, 'image');
+      } catch {
+        try {
+          dpUrl = await ctx.sock.profilePictureUrl(ctx.chatId, 'preview');
+        } catch {
+          dpUrl = undefined;
+        }
+      }
+
+      if (!dpUrl) {
+        const msg = 'No profile picture found for this group (or group DP is hidden/removed).';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const res = await fetch(dpUrl, { signal: AbortSignal.timeout(15_000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            image: buffer,
+            caption: `🖼️ *Group Profile Picture*\n• Group: *${groupSubject}*\n• Saved by *${cfg.botName || 'FADI KING MD'}*`,
+          },
+          { quoted: ctx.msg ?? undefined }
+        );
+        return `Sent group DP for ${groupSubject}.`;
+      } catch (err) {
+        const msg = `Failed to download group DP: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'approve',
+    aliases: ['approveall', 'acceptall'],
+    category: 'group',
+    description: 'Current group ke tamam pending join requests ek sath approve kare',
+    usage: 'approve',
+    groupOnly: true,
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: true });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Approved all pending join requests in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const pending = await ctx.sock.groupRequestParticipantsList(ctx.chatId);
+        const jids = pending
+          .map((p) => (typeof p === 'string' ? p : p.jid))
+          .filter((j): j is string => Boolean(j));
+
+        if (jids.length === 0) {
+          const msg = 'No pending join requests found in this group.';
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        let approved = 0;
+        const BATCH = 15;
+        for (let i = 0; i < jids.length; i += BATCH) {
+          const chunk = jids.slice(i, i + BATCH);
+          await ctx.sock.groupRequestParticipantsUpdate(ctx.chatId, chunk, 'approve');
+          approved += chunk.length;
+          if (i + BATCH < jids.length) {
+            await new Promise((r) => setTimeout(r, 800));
+          }
+        }
+
+        invalidateGroupMetadataCache(ctx.chatId);
+        const msg = `✅ Approved *${approved}* pending join request(s) in this group.`;
+        await ctx.reply(msg);
+        return msg;
+      } catch (err) {
+        const msg = `Failed to approve pending requests: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'kickall',
+    aliases: ['removeall', 'cleanmembers'],
+    category: 'group',
+    description: 'Group se tamam non-admin members ko safe rate-limit delay ke sath remove kare',
+    usage: 'kickall',
+    groupOnly: true,
+    cooldownSeconds: 10,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: true });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Paced kickall started for non-admin members in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const cfg = loadConfig();
+      const ownerClean = normalizePhone(cfg.ownerNumber);
+      const botJids = await getBotJids(ctx.sock);
+      const botSet = new Set(botJids.map((j) => jidUserPart(j)));
+
+      const nonAdmins = check.participants.filter((p) => {
+        if (isParticipantAdmin(p)) return false;
+        const userPart = jidUserPart(p.id);
+        const pnPart = jidUserPart(p.phoneNumber || p.id);
+        if (botSet.has(userPart) || botSet.has(pnPart)) return false;
+        if (ownerClean && (normalizePhone(userPart) === ownerClean || normalizePhone(pnPart) === ownerClean)) {
+          return false;
+        }
+        return true;
+      });
+
+      if (nonAdmins.length === 0) {
+        const msg = 'No non-admin members to remove from this group.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      await ctx.reply(
+        `Removing *${nonAdmins.length}* non-admin member(s) safely with anti-ban delay...`
+      );
+
+      let removed = 0;
+      for (let i = 0; i < nonAdmins.length; i += 1) {
+        const target = nonAdmins[i];
+        try {
+          await ctx.sock.groupParticipantsUpdate(ctx.chatId, [target.id], 'remove');
+          removed += 1;
+        } catch (err) {
+          logger.warn('kickall', `Skipped ${target.id} in ${ctx.chatId}: ${(err as Error).message}`);
+        }
+        if (i < nonAdmins.length - 1) {
+          await new Promise((r) => setTimeout(r, 1350));
+        }
+      }
+
+      invalidateGroupMetadataCache(ctx.chatId);
+      const doneMsg = `✅ Kickall finished: removed *${removed}/${nonAdmins.length}* non-admin member(s).`;
+      await ctx.reply(doneMsg);
+      return doneMsg;
+    },
+  },
+  {
+    name: 'pin',
+    aliases: ['pinmsg'],
+    category: 'group',
+    description: 'Replied message ko group chat mein pin kare (24h, 7d, ya 30d)',
+    usage: 'pin [24h|7d|30d] (reply to a message)',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+      if (!check.ok) {
+        const errText = check.reason || 'Group Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg = `[Simulated] Pinned replied message in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const ctxInfo = extractContextInfo(ctx.msg.message);
+      if (!ctxInfo?.stanzaId) {
+        const msg = `Reply to the message you want to pin using \`${ctx.prefix}pin\` (optional: \`24h\`, \`7d\`, \`30d\`).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const durArg = ctx.args[0]?.toLowerCase();
+      const durationSec: 86400 | 604800 | 2592000 =
+        durArg === '24h' || durArg === '1d'
+          ? 86400
+          : durArg === '30d' || durArg === '1m'
+            ? 2592000
+            : 604800;
+
+      const botJids = await getBotJids(ctx.sock);
+      const participant = ctxInfo.participant || undefined;
+      const isFromBot = Boolean(
+        participant && botJids.some((b) => jidUserPart(b) === jidUserPart(participant))
+      );
+
+      await ctx.sock.sendMessage(ctx.chatId, {
+        pin: {
+          remoteJid: ctx.chatId,
+          id: ctxInfo.stanzaId,
+          fromMe: isFromBot,
+          participant,
+        },
+        type: proto.PinInChat.Type.PIN_FOR_ALL,
+        time: durationSec,
+      });
+
+      const label = durationSec === 86400 ? '24 hours' : durationSec === 2592000 ? '30 days' : '7 days';
+      return `Pinned message for ${label}.`;
+    },
+  },
+  {
+    name: 'unpin',
+    aliases: ['unpinmsg'],
+    category: 'group',
+    description: 'Replied message ko group chat se unpin kare',
+    usage: 'unpin (reply to pinned message)',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+      if (!check.ok) {
+        const errText = check.reason || 'Group Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg = `[Simulated] Unpinned replied message in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const ctxInfo = extractContextInfo(ctx.msg.message);
+      if (!ctxInfo?.stanzaId) {
+        const msg = `Reply to the pinned message you want to unpin using \`${ctx.prefix}unpin\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const botJids = await getBotJids(ctx.sock);
+      const participant = ctxInfo.participant || undefined;
+      const isFromBot = Boolean(
+        participant && botJids.some((b) => jidUserPart(b) === jidUserPart(participant))
+      );
+
+      await ctx.sock.sendMessage(ctx.chatId, {
+        pin: {
+          remoteJid: ctx.chatId,
+          id: ctxInfo.stanzaId,
+          fromMe: isFromBot,
+          participant,
+        },
+        type: proto.PinInChat.Type.UNPIN_FOR_ALL,
+      });
+
+      return 'Message unpinned.';
     },
   },
 ];

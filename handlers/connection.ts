@@ -18,6 +18,11 @@ import {
 import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
 import {
+  backupAuthDirToDb,
+  deleteAuthBackupFromDb,
+  restoreAuthDirsFromDb,
+} from '../utils/db.ts';
+import {
   extractChannelTargets,
   extractGroupInviteCodes,
   getGroupMetadataFromCacheOnly,
@@ -72,8 +77,31 @@ const messageCache = new Map<string, WAMessage>();
 const messageByIdCache = new Map<string, WAMessage>();
 const persistedSessionsCache = new Set<string>();
 const pendingFreshPairs = new Set<string>();
+const authBackupTimers = new Map<string, NodeJS.Timeout>();
 let mainHasSavedCredsCache = false;
 let persistedCacheLoaded = false;
+
+function scheduleAuthBackup(sessionKey: string, authDir: string, delayMs = 2500): void {
+  const existing = authBackupTimers.get(sessionKey);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    authBackupTimers.delete(sessionKey);
+    if (hasSavedAuth(authDir)) {
+      void backupAuthDirToDb(sessionKey, authDir);
+    }
+  }, delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  authBackupTimers.set(sessionKey, timer);
+}
+
+function isSocketWsDead(sock: WASocket | null | undefined): boolean {
+  if (!sock) return true;
+  const ws = (sock as unknown as { ws?: { isClosed?: boolean; isClosing?: boolean; readyState?: number } }).ws;
+  if (!ws) return false;
+  if (ws.isClosed || ws.isClosing) return true;
+  if (typeof ws.readyState === 'number' && ws.readyState > 1) return true;
+  return false;
+}
 
 function createBoundedCacheStore(maxEntries = 3000, ttlMs = 10 * 60_000): CacheStore {
   const store = new Map<string, { value: unknown; expiresAt: number }>();
@@ -389,6 +417,7 @@ function handleSessionOpenActions(params: {
 
   persistedSessionsCache.add(sessionKey);
   if (sessionKey === 'main') mainHasSavedCredsCache = true;
+  scheduleAuthBackup(sessionKey, authDir, 800);
 
   if (phone) {
     vipStore.recordConnectedSession({
@@ -620,10 +649,10 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       markOnlineOnConnect: !cfg.singleTick,
-      connectTimeoutMs: 25_000,
-      defaultQueryTimeoutMs: 25_000,
-      keepAliveIntervalMs: 18_000,
-      retryRequestDelayMs: 250,
+      connectTimeoutMs: 30_000,
+      defaultQueryTimeoutMs: 30_000,
+      keepAliveIntervalMs: 15_000,
+      retryRequestDelayMs: 300,
       maxMsgRetryCount: 2,
       msgRetryCounterCache: sharedMsgRetryCache,
       generateHighQualityLinkPreview: false,
@@ -632,7 +661,10 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
     });
 
     mainSock = sock;
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      scheduleAuthBackup('main', authDir);
+    });
 
     let mainPairingTriggered = false;
     let mainFallbackTimer: NodeJS.Timeout | null = null;
@@ -789,6 +821,16 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       }
     });
 
+    sock.ev.on('messages.update', (updates) => {
+      for (const upd of updates) {
+        if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
+          const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
+          cacheMessage(synthetic);
+          void precacheViewOnceMedia(sock, synthetic);
+        }
+      }
+    });
+
     sock.ev.on('group-participants.update', async (update) => {
       await handleGroupParticipantsUpdate(sock, update);
     });
@@ -846,6 +888,7 @@ export async function disconnectMainBot(clearSession = false): Promise<void> {
     const authDir = path.join(loadConfig().sessionDir, 'main');
     fs.rmSync(authDir, { recursive: true, force: true });
     fs.mkdirSync(authDir, { recursive: true });
+    deleteAuthBackupFromDb('main');
     mainHasSavedCredsCache = false;
     persistedSessionsCache.delete('main');
     pendingFreshPairs.delete('main');
@@ -906,10 +949,10 @@ async function connectSubSession(params: {
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: !loadConfig().singleTick,
-    connectTimeoutMs: 25_000,
-    defaultQueryTimeoutMs: 25_000,
-    keepAliveIntervalMs: 18_000,
-    retryRequestDelayMs: 250,
+    connectTimeoutMs: 30_000,
+    defaultQueryTimeoutMs: 30_000,
+    keepAliveIntervalMs: 15_000,
+    retryRequestDelayMs: 300,
     maxMsgRetryCount: 2,
     msgRetryCounterCache: sharedMsgRetryCache,
     generateHighQualityLinkPreview: false,
@@ -925,7 +968,10 @@ async function connectSubSession(params: {
   };
 
   vipSubSockets.set(sessionId, { sock, info: sessionInfo });
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    scheduleAuthBackup(sessionId, authDir);
+  });
 
   let pairingCodePromise: Promise<string> | undefined;
   if (params.requestPairingCode) {
@@ -1075,6 +1121,16 @@ async function connectSubSession(params: {
       void precacheViewOnceMedia(sock, m);
       if (type === 'notify') {
         void handleIncomingMessage(sock, m, getCachedMessage);
+      }
+    }
+  });
+
+  sock.ev.on('messages.update', (updates) => {
+    for (const upd of updates) {
+      if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
+        const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
+        cacheMessage(synthetic);
+        void precacheViewOnceMedia(sock, synthetic);
       }
     }
   });
@@ -1263,7 +1319,13 @@ function ensureKeepAliveWatchdog(): void {
         const mainAuthDir = path.join(cfg.sessionDir, 'main');
         const mainSaved = await hasSavedAuthAsync(mainAuthDir);
         mainHasSavedCredsCache = mainSaved;
-        if (
+
+        // Detect half-dead WebSocket that didn't fire close event on Railway
+        if (botState.status === 'connected' && isSocketWsDead(mainSock)) {
+          logger.warn('watchdog', 'Main WebSocket became stale/closed while marked connected. Reconnecting...');
+          botState.status = 'disconnected';
+          void startMainBot();
+        } else if (
           mainSaved &&
           botState.status !== 'connected' &&
           botState.status !== 'connecting' &&
@@ -1286,8 +1348,13 @@ function ensureKeepAliveWatchdog(): void {
           if (!entry.name.startsWith('vip_')) continue;
           const active = vipSubSockets.get(entry.name);
           const hasPending = vipReconnectTimers.has(entry.name);
+          const subWsDead = Boolean(active && active.info.status === 'connected' && isSocketWsDead(active.sock));
+          if (subWsDead && active) {
+            active.info.status = 'disconnected';
+          }
           if (
             (!active ||
+              subWsDead ||
               (active.info.status !== 'connected' &&
                 active.info.status !== 'connecting' &&
                 active.info.status !== 'pairing_ready' &&
@@ -1304,10 +1371,42 @@ function ensureKeepAliveWatchdog(): void {
         watchdogRunning = false;
       }
     })();
-  }, 30_000);
+  }, 25_000);
   if (typeof watchdogTimer.unref === 'function') {
     watchdogTimer.unref();
   }
+}
+
+export function closeAllSocketsGracefully(): void {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  for (const timer of vipReconnectTimers.values()) {
+    clearTimeout(timer);
+  }
+  vipReconnectTimers.clear();
+
+  if (mainSock) {
+    try {
+      mainSock.end(undefined);
+    } catch {
+      // Ignore
+    }
+    mainSock = null;
+  }
+  for (const entry of vipSubSockets.values()) {
+    try {
+      entry.sock.end(undefined);
+    } catch {
+      // Ignore
+    }
+  }
+  vipSubSockets.clear();
 }
 
 export function initializeSavedSessionOnBoot(): void {
@@ -1315,6 +1414,11 @@ export function initializeSavedSessionOnBoot(): void {
   void getFastWaVersion();
 
   void (async () => {
+    const restoredCount = await restoreAuthDirsFromDb(cfg.sessionDir);
+    if (restoredCount > 0) {
+      logger.info('boot', `Hydrated ${restoredCount} saved WhatsApp auth session(s) from database.`);
+    }
+
     const mainAuthDir = path.join(cfg.sessionDir, 'main');
     if (await hasSavedAuthAsync(mainAuthDir)) {
       mainHasSavedCredsCache = true;

@@ -92,6 +92,24 @@ const commandEmojiMap: Record<string, string> = {
   bc: '📡',
   ib: '📨',
   mode: '⚙️',
+  botlink: '🌐',
+  groupdp: '🖼️',
+  gdp: '🖼️',
+  approve: '✅',
+  kickall: '💥',
+  pin: '📌',
+  unpin: '📍',
+  contactsave: '📱',
+  tiktok: '🎵',
+  ig: '📸',
+  yt: '▶️',
+  fb: '📘',
+  twitter: '🐦',
+  pinterest: '📌',
+  toimg: '🖼️',
+  info: 'ℹ️',
+  calc: '🧮',
+  qr: '📷',
 };
 
 export async function resolveMenuImageBuffer(configuredUrl: string): Promise<Buffer | null> {
@@ -463,6 +481,60 @@ export const generalCommands: BotCommand[] = [
       const msg = lines.join('\n');
       await ctx.reply(msg);
       return msg;
+    },
+  },
+  {
+    name: 'botlink',
+    aliases: ['portal', 'website', 'linkbot', 'deploylink'],
+    category: 'general',
+    description: 'Bot ke official Web Pairing Portal aur home URL ka link bheje',
+    usage: 'botlink',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const cfg = loadConfig();
+      const railwayDomain =
+        process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || process.env.RAILWAY_STATIC_URL?.trim();
+      const portalUrl =
+        process.env.APP_URL?.trim() ||
+        (railwayDomain
+          ? railwayDomain.startsWith('http')
+            ? railwayDomain
+            : `https://${railwayDomain}`
+          : '') ||
+        process.env.PUBLIC_PORTAL_URL?.trim() ||
+        'https://github.com/fadiking/fadi-king-md';
+
+      const channelLine = cfg.menuChannelUrl?.trim()
+        ? `• Official Channel: ${cfg.menuChannelUrl.trim()}`
+        : cfg.autoJoinChannelInvite?.trim()
+          ? `• Official Channel: ${cfg.autoJoinChannelInvite.trim()}`
+          : '';
+
+      const output = [
+        `🌐 *${cfg.botName || 'FADI KING MD'} — Official Portal*`,
+        `• Web Pairing Portal: ${portalUrl}`,
+        ...(channelLine ? [channelLine] : []),
+        `• Prefix: \`${cfg.prefix}\` | Mode: ${(cfg.mode || 'public').toUpperCase()}`,
+        `• Owner: ${cfg.ownerName || 'FADI KING'} (+${cfg.ownerNumber})`,
+        '',
+        `Open the portal link to generate an 8-digit pairing code or scan QR.`,
+      ].join('\n');
+
+      if (ctx.sock && !ctx.isSimulated) {
+        const contextInfo = await resolveNewsletterContext(ctx.sock, cfg).catch(() => null);
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            text: output,
+            ...(contextInfo ? { contextInfo } : {}),
+          },
+          { quoted: ctx.msg ?? undefined }
+        );
+        return output;
+      }
+
+      await ctx.reply(output);
+      return output;
     },
   },
 ];

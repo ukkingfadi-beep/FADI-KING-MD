@@ -4,9 +4,18 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
-import { downloadMediaMessage, getContentType, proto, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
+import {
+  downloadContentFromMessage,
+  downloadMediaMessage,
+  getContentType,
+  proto,
+  type MediaType,
+  type WAMessage,
+  type WASocket,
+} from '@whiskeysockets/baileys';
 import pino from 'pino';
 
+import { resolveDataDir } from './db.ts';
 import {
   extractContextInfo,
   hasValidMediaPayload,
@@ -94,16 +103,42 @@ export function unwrapViewOnce(message: proto.IMessage | null | undefined): prot
   return null;
 }
 
+function toBinaryBuffer(val: unknown): Uint8Array | undefined {
+  if (!val) return undefined;
+  if (val instanceof Uint8Array || Buffer.isBuffer(val)) return val;
+  if (typeof val === 'string') {
+    try {
+      return Buffer.from(val, 'base64');
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof val === 'object' && Array.isArray((val as { data?: number[] }).data)) {
+    return Uint8Array.from((val as { data: number[] }).data);
+  }
+  return undefined;
+}
+
 function ensureDownloadableUrl(message: proto.IMessage): proto.IMessage {
   const clone: proto.IMessage = { ...message };
   for (const key of ['imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage', 'stickerMessage', 'documentMessage'] as const) {
     const media = clone[key];
-    if (media && !media.url && media.directPath) {
-      clone[key] = {
-        ...media,
-        url: `https://mmg.whatsapp.net${media.directPath}`,
-      } as typeof media;
-    }
+    if (!media) continue;
+    const cleanUrl = typeof media.url === 'string' ? media.url.trim() : '';
+    const cleanDirect = typeof media.directPath === 'string' ? media.directPath.trim() : '';
+    const resolvedUrl =
+      cleanUrl || (cleanDirect ? `https://mmg.whatsapp.net${cleanDirect.startsWith('/') ? '' : '/'}${cleanDirect}` : '');
+    const normalizedKey = toBinaryBuffer(media.mediaKey);
+    const normalizedEncSha = toBinaryBuffer(media.fileEncSha256);
+    const normalizedSha = toBinaryBuffer(media.fileSha256);
+
+    clone[key] = {
+      ...media,
+      ...(resolvedUrl ? { url: resolvedUrl } : {}),
+      ...(normalizedKey ? { mediaKey: normalizedKey } : {}),
+      ...(normalizedEncSha ? { fileEncSha256: normalizedEncSha } : {}),
+      ...(normalizedSha ? { fileSha256: normalizedSha } : {}),
+    } as typeof media;
   }
   return clone;
 }
@@ -112,20 +147,58 @@ export async function downloadMessageMedia(
   sock: WASocket,
   targetMessage: WAMessage
 ): Promise<Buffer> {
-  const normalizedMessage = targetMessage.message
-    ? { ...targetMessage, message: ensureDownloadableUrl(unwrapMessage(targetMessage.message) || targetMessage.message) }
+  const unwrapped = targetMessage.message ? unwrapMessage(targetMessage.message) || targetMessage.message : undefined;
+  const normalizedInner = unwrapped ? ensureDownloadableUrl(unwrapped) : undefined;
+  const normalizedMessage: WAMessage = normalizedInner
+    ? { ...targetMessage, message: normalizedInner }
     : targetMessage;
 
-  const result = await downloadMediaMessage(
-    normalizedMessage,
-    'buffer',
-    {},
-    {
-      logger: silentLogger as unknown as Parameters<typeof sock.updateMediaMessage>[0] extends never ? never : any,
-      reuploadRequest: sock.updateMediaMessage,
+  try {
+    const result = await downloadMediaMessage(
+      normalizedMessage,
+      'buffer',
+      {},
+      {
+        logger: silentLogger as unknown as Parameters<typeof sock.updateMediaMessage>[0] extends never ? never : any,
+        reuploadRequest: sock.updateMediaMessage,
+      }
+    );
+    const buf = Buffer.isBuffer(result) ? result : Buffer.from(result);
+    if (buf.length > 0) return buf;
+  } catch (primaryErr) {
+    // Fall back to direct HKDF stream decryption via downloadContentFromMessage
+    if (normalizedInner) {
+      const mapping: Array<[keyof proto.IMessage, MediaType]> = [
+        ['imageMessage', 'image'],
+        ['videoMessage', 'video'],
+        ['ptvMessage', 'ptv'],
+        ['audioMessage', 'audio'],
+        ['stickerMessage', 'sticker'],
+        ['documentMessage', 'document'],
+      ];
+      for (const [field, mediaType] of mapping) {
+        const node = normalizedInner[field] as
+          | { mediaKey?: Uint8Array | null; directPath?: string | null; url?: string | null }
+          | undefined;
+        if (node && node.mediaKey && (node.directPath || node.url)) {
+          try {
+            const stream = await downloadContentFromMessage(node, mediaType);
+            const chunks: Buffer[] = [];
+            for await (const chunk of stream) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            const directBuf = Buffer.concat(chunks);
+            if (directBuf.length > 0) return directBuf;
+          } catch {
+            // Throw original error below if direct fallback also fails
+          }
+        }
+      }
     }
-  );
-  return Buffer.isBuffer(result) ? result : Buffer.from(result);
+    throw primaryErr;
+  }
+
+  throw new Error('Downloaded media buffer was empty.');
 }
 
 export interface CachedViewOnceEntry {
@@ -137,10 +210,89 @@ export interface CachedViewOnceEntry {
   seconds?: number;
 }
 
-const MAX_VIEW_ONCE_CACHE_ITEMS = 40;
-const MAX_VIEW_ONCE_CACHE_BYTES = 20 * 1024 * 1024;
+const MAX_VIEW_ONCE_CACHE_ITEMS = 45;
+const MAX_VIEW_ONCE_CACHE_BYTES = 25 * 1024 * 1024;
 const viewOnceMediaCache = new Map<string, CachedViewOnceEntry>();
 const viewOnceInflight = new Map<string, Promise<void>>();
+
+function getViewOnceDiskDir(): string {
+  const dir = path.join(resolveDataDir(), 'viewonce_cache');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+function safeCacheId(msgId: string): string {
+  return msgId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 96);
+}
+
+async function persistViewOnceToDisk(msgId: string, entry: CachedViewOnceEntry): Promise<void> {
+  try {
+    const dir = getViewOnceDiskDir();
+    const id = safeCacheId(msgId);
+    const binPath = path.join(dir, `${id}.bin`);
+    const metaPath = path.join(dir, `${id}.json`);
+    const meta = {
+      type: entry.type,
+      mimetype: entry.mimetype,
+      caption: entry.caption,
+      ptt: entry.ptt,
+      seconds: entry.seconds,
+      savedAt: Date.now(),
+    };
+    await Promise.all([
+      fs.promises.writeFile(binPath, entry.buffer),
+      fs.promises.writeFile(metaPath, JSON.stringify(meta), 'utf-8'),
+    ]);
+
+    // Auto-prune old View-Once files beyond 45 entries
+    const files = await fs.promises.readdir(dir).catch(() => []);
+    const metas = files.filter((f) => f.endsWith('.json'));
+    if (metas.length > MAX_VIEW_ONCE_CACHE_ITEMS) {
+      const stats = await Promise.all(
+        metas.map(async (f) => ({
+          name: f,
+          mtime: (await fs.promises.stat(path.join(dir, f)).catch(() => ({ mtimeMs: 0 }))).mtimeMs,
+        }))
+      );
+      stats.sort((a, b) => a.mtime - b.mtime);
+      for (const old of stats.slice(0, stats.length - MAX_VIEW_ONCE_CACHE_ITEMS)) {
+        const stem = old.name.replace(/\.json$/, '');
+        await fs.promises.unlink(path.join(dir, `${stem}.json`)).catch(() => {});
+        await fs.promises.unlink(path.join(dir, `${stem}.bin`)).catch(() => {});
+      }
+    }
+  } catch {
+    // Non-fatal disk cache failure
+  }
+}
+
+function readViewOnceFromDisk(msgId: string): CachedViewOnceEntry | undefined {
+  if (!msgId) return undefined;
+  try {
+    const dir = getViewOnceDiskDir();
+    const id = safeCacheId(msgId);
+    const metaPath = path.join(dir, `${id}.json`);
+    const binPath = path.join(dir, `${id}.bin`);
+    if (!fs.existsSync(metaPath) || !fs.existsSync(binPath)) return undefined;
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as Partial<CachedViewOnceEntry>;
+    const buffer = fs.readFileSync(binPath);
+    if (!buffer.length || !meta.type) return undefined;
+    const entry: CachedViewOnceEntry = {
+      type: meta.type,
+      buffer,
+      mimetype: meta.mimetype,
+      caption: meta.caption,
+      ptt: meta.ptt,
+      seconds: meta.seconds,
+    };
+    viewOnceMediaCache.set(`id:${msgId}`, entry);
+    return entry;
+  } catch {
+    return undefined;
+  }
+}
 
 export function getCachedViewOnceMedia(
   chatId: string,
@@ -151,7 +303,8 @@ export function getCachedViewOnceMedia(
   return (
     viewOnceMediaCache.get(`${bareChat}:${msgId}`) ||
     viewOnceMediaCache.get(`${chatId}:${msgId}`) ||
-    viewOnceMediaCache.get(`id:${msgId}`)
+    viewOnceMediaCache.get(`id:${msgId}`) ||
+    readViewOnceFromDisk(msgId)
   );
 }
 
@@ -218,6 +371,8 @@ export async function precacheViewOnceMedia(
         if (!oldest) break;
         viewOnceMediaCache.delete(oldest);
       }
+
+      void persistViewOnceToDisk(msgId, entry);
     } catch {
       // Fallback to live download / reupload on .vv invocation
     } finally {

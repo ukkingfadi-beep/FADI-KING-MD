@@ -41,6 +41,7 @@ export interface GroupConfig {
   antidelete?: boolean;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  aiEnabled?: boolean;
   welcome: boolean;
   goodbye: boolean;
   warnings?: Record<string, number>;
@@ -491,7 +492,8 @@ export const vipStore = {
         antidelete: false,
         antiScam: cfg.antiScamGlobal,
         antiStatusMention: cfg.antiStatusMentionGlobal,
-        welcome: true,
+        aiEnabled: false,
+        welcome: false,
         goodbye: false,
       };
     }
@@ -504,6 +506,9 @@ export const vipStore = {
         typeof found.antiStatusMention === 'boolean'
           ? found.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      aiEnabled: Boolean(found.aiEnabled),
+      welcome: Boolean(found.welcome),
+      goodbye: Boolean(found.goodbye),
     };
   },
 
@@ -518,6 +523,9 @@ export const vipStore = {
         typeof g.antiStatusMention === 'boolean'
           ? g.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      aiEnabled: Boolean(g.aiEnabled),
+      welcome: Boolean(g.welcome),
+      goodbye: Boolean(g.goodbye),
     }));
   },
 
@@ -546,6 +554,7 @@ export const vipStore = {
     if (typeof patch.antiStatusMention === 'boolean') {
       cleanPatch.antiStatusMention = patch.antiStatusMention;
     }
+    if (typeof patch.aiEnabled === 'boolean') cleanPatch.aiEnabled = patch.aiEnabled;
     if (typeof patch.welcome === 'boolean') cleanPatch.welcome = patch.welcome;
     if (typeof patch.goodbye === 'boolean') cleanPatch.goodbye = patch.goodbye;
     if (patch.warnings && typeof patch.warnings === 'object') cleanPatch.warnings = patch.warnings;

@@ -6,13 +6,17 @@ import { generateAiChatReply } from '../utils/geminiService.ts';
 import {
   extractBodyText,
   extractRawTargetCandidates,
+  findParticipant,
+  getCachedGroupMetadata,
   isLidUser,
+  isParticipantAdmin,
   jidUserPart,
   normalizeBareJid,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { extractQuotedMessage } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
+import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand, CommandContext } from './types.ts';
 
 function sleep(ms: number): Promise<void> {
@@ -512,23 +516,78 @@ export const ownerCommands: BotCommand[] = [
     name: 'ai',
     aliases: ['gpt', 'assistant'],
     category: 'owner',
-    description: 'Global AI Assistant auto-replies on/off kare ya direct AI sawal puche',
-    usage: 'ai <on|off|your question>',
-    ownerOnly: true,
+    description: 'Jis group mein .ai on kare wahan har sawal ka reply kare, ya DM/direct sawal puchhe',
+    usage: 'ai <on|off|global on|global off|your question>',
     execute: async (ctx) => {
-      const arg = ctx.args[0]?.toLowerCase();
+      const arg0 = ctx.args[0]?.toLowerCase();
+      const arg1 = ctx.args[1]?.toLowerCase();
       const cfg = loadConfig();
-      if (arg === 'on' || arg === 'off') {
-        saveConfig({ aiEnabled: arg === 'on' });
-        const msg = `Global AI Assistant auto-replies turned *${arg.toUpperCase()}* (persisted in database).`;
+
+      if (arg0 === 'global') {
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: \`${ctx.prefix}ai global\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        if (arg1 === 'on' || arg1 === 'off') {
+          saveConfig({ aiEnabled: arg1 === 'on' });
+          const msg = `DM Global AI Auto-Reply turned *${arg1.toUpperCase()}*.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const msg = `DM Global AI Auto-Reply is *${cfg.aiEnabled ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ai global on\` / \`off\``;
         await ctx.reply(msg);
         return msg;
       }
+
+      if (arg0 === 'on' || arg0 === 'off') {
+        const enabled = arg0 === 'on';
+        if (ctx.isGroup) {
+          if (!ctx.isOwner) {
+            if (!ctx.sock || ctx.isSimulated) {
+              const msg = 'Group Admin or Owner permission required.';
+              await ctx.reply(msg);
+              return msg;
+            }
+            const meta = await getCachedGroupMetadata(ctx.sock, ctx.chatId, true);
+            const senderP = findParticipant(meta.participants, ctx.senderCandidates || [ctx.senderJid]);
+            if (!isParticipantAdmin(senderP)) {
+              const msg = 'Only Group Admins or the Bot Owner can toggle AI chat in this group.';
+              await ctx.reply(msg);
+              return msg;
+            }
+          }
+          vipStore.updateGroupConfig(ctx.chatId, { aiEnabled: enabled });
+          const msg = enabled
+            ? `Group AI Chat turned *ON* for *this group only*! Every message/question here will now receive an AI reply.`
+            : `Group AI Chat turned *OFF* for this group.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: DM \`${ctx.prefix}ai ${arg0}\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        saveConfig({ aiEnabled: enabled });
+        const msg = `DM AI Auto-Replies turned *${arg0.toUpperCase()}* (persisted in database).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
       if (!ctx.text.trim()) {
-        const msg = `AI Assistant is currently *${cfg.aiEnabled ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ai on\`, \`${ctx.prefix}ai off\`, or \`${ctx.prefix}ai <question>\``;
+        if (ctx.isGroup) {
+          const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+          const msg = `This Group AI Chat is currently *${groupCfg.aiEnabled ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ai on\`, \`${ctx.prefix}ai off\`, or \`${ctx.prefix}ai <question>\``;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const msg = `DM AI Assistant is currently *${cfg.aiEnabled ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}ai on\`, \`${ctx.prefix}ai off\`, or \`${ctx.prefix}ai <question>\``;
         await ctx.reply(msg);
         return msg;
       }
+
       try {
         const answer = await generateAiChatReply(ctx.text.trim(), ctx.pushName);
         await ctx.reply(answer);

@@ -6,6 +6,7 @@ import { isValidPhone, loadConfig, normalizePhone, saveConfig } from './config/b
 import { getAllCommands } from './commands/index.ts';
 import {
   applySingleTickPresenceAcrossSockets,
+  closeAllSocketsGracefully,
   disconnectMainBot,
   getBotSnapshot,
   initializeSavedSessionOnBoot,
@@ -57,6 +58,7 @@ const SOURCE_FILES = [
   'utils/vipStore.ts',
   'utils/rateLimiter.ts',
   'utils/mediaHelper.ts',
+  'utils/socialDownloader.ts',
   'utils/logger.ts',
   'utils/jidHelper.ts',
   'utils/adminAuth.ts',
@@ -646,6 +648,7 @@ async function startServer(): Promise<void> {
       antiScam: typeof req.body?.antiScam === 'boolean' ? req.body.antiScam : undefined,
       antiStatusMention:
         typeof req.body?.antiStatusMention === 'boolean' ? req.body.antiStatusMention : undefined,
+      aiEnabled: typeof req.body?.aiEnabled === 'boolean' ? req.body.aiEnabled : undefined,
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });
@@ -817,6 +820,18 @@ async function startServer(): Promise<void> {
   httpServer.keepAliveTimeout = 65_000;
   httpServer.headersTimeout = 66_000;
   httpServer.maxRequestsPerSocket = 0;
+
+  const gracefulShutdown = (signal: string) => {
+    logger.info('server', `Received ${signal}. Closing WhatsApp sockets cleanly before exit...`);
+    closeAllSocketsGracefully();
+    httpServer.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 2500).unref();
+  };
+
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 void startServer();

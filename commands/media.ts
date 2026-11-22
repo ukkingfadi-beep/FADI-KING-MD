@@ -5,25 +5,34 @@ import {
   extractBodyText,
   extractContextInfo,
   extractRawTargetCandidates,
+  getBotJids,
   hasValidMediaPayload,
   isLidUser,
   jidUserPart,
+  lookupKnownUserName,
   normalizeBareJid,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import {
+  convertAudioPartsToWhatsAppVoice,
   convertMediaToWebpSticker,
   convertStickerToPng,
   detectMediaType,
   downloadMessageMedia,
   extractQuotedMessage,
   getCachedViewOnceMedia,
+  isFfmpegAvailable,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
   waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
+import {
+  downloadSocialMedia,
+  extractFirstValidUrl,
+  type SocialPlatform,
+} from '../utils/socialDownloader.ts';
 import { vipStore } from '../utils/vipStore.ts';
-import type { BotCommand } from './types.ts';
+import type { BotCommand, CommandContext } from './types.ts';
 
 function evaluateSafeMath(expr: string): number {
   const clean = expr.replace(/\s+/g, '');
@@ -210,44 +219,107 @@ export const mediaCommands: BotCommand[] = [
         return msg;
       }
 
+      const sendRecoveredMedia = async (params: {
+        type: 'image' | 'video' | 'audio';
+        buffer: Buffer;
+        caption?: string;
+        mimetype?: string;
+        ptt?: boolean;
+        seconds?: number;
+      }) => {
+        const cfg = loadConfig();
+        if (params.type === 'image') {
+          await ctx.sock!.sendMessage(
+            ctx.chatId,
+            {
+              image: params.buffer,
+              caption: params.caption || `👁️ View-Once Photo extracted by ${cfg.botName}`,
+            },
+            { quoted: ctx.msg! }
+          );
+          return;
+        }
+        if (params.type === 'video') {
+          await ctx.sock!.sendMessage(
+            ctx.chatId,
+            {
+              video: params.buffer,
+              caption: params.caption || `👁️ View-Once Video extracted by ${cfg.botName}`,
+            },
+            { quoted: ctx.msg! }
+          );
+          return;
+        }
+
+        // Audio / Voice Note recovery: convert non-ogg payloads cleanly to playable OGG/Opus PTT when ffmpeg is available
+        const mime = (params.mimetype || '').toLowerCase();
+        const isOggOpus = mime.includes('ogg') || mime.includes('opus');
+        if (!isOggOpus && (await isFfmpegAvailable())) {
+          try {
+            const inputExt: 'mp3' | 'wav' = mime.includes('wav') ? 'wav' : 'mp3';
+            const converted = await convertAudioPartsToWhatsAppVoice([params.buffer], inputExt);
+            await ctx.sock!.sendMessage(
+              ctx.chatId,
+              {
+                audio: converted.buffer,
+                mimetype: 'audio/ogg; codecs=opus',
+                ptt: true,
+                seconds: converted.seconds,
+              },
+              { quoted: ctx.msg! }
+            );
+            return;
+          } catch {
+            // Fall through to raw audio buffer send below
+          }
+        }
+
+        await ctx.sock!.sendMessage(
+          ctx.chatId,
+          {
+            audio: params.buffer,
+            mimetype: params.mimetype || 'audio/ogg; codecs=opus',
+            ptt: params.ptt ?? true,
+            seconds: params.seconds,
+          },
+          { quoted: ctx.msg! }
+        );
+      };
+
       const ctxInfo = extractContextInfo(ctx.msg.message);
       const stanzaId = ctxInfo?.stanzaId || '';
 
-      // 1. Check pre-cached View-Once media buffer first (works even after View-Once was opened)
+      // 1. Check pre-cached View-Once media buffer first (RAM + disk cache, survives restarts)
       if (stanzaId) {
         await waitForViewOnceInflight(stanzaId);
         const preCached = getCachedViewOnceMedia(ctx.chatId, stanzaId);
         if (preCached) {
-          if (preCached.type === 'image') {
-            await ctx.sock.sendMessage(ctx.chatId, {
-              image: preCached.buffer,
-              caption: preCached.caption || `View-Once extracted by ${loadConfig().botName}`,
-            });
-          } else if (preCached.type === 'video') {
-            await ctx.sock.sendMessage(ctx.chatId, {
-              video: preCached.buffer,
-              caption: preCached.caption || `View-Once extracted by ${loadConfig().botName}`,
-            });
-          } else {
-            await ctx.sock.sendMessage(ctx.chatId, {
-              audio: preCached.buffer,
-              mimetype: preCached.mimetype || 'audio/ogg; codecs=opus',
-              ptt: Boolean(preCached.ptt ?? true),
-              seconds: preCached.seconds,
-            });
-          }
+          await sendRecoveredMedia(preCached);
           return 'View-Once media unwrapped.';
         }
       }
 
+      const rawQuoted = ctxInfo?.quotedMessage || null;
       const quoted = extractQuotedMessage(ctx.msg);
-      let inner = unwrapViewOnce(quoted) || unwrapViewOnce(ctx.msg.message) || quoted;
+      let inner =
+        unwrapViewOnce(rawQuoted) ||
+        unwrapViewOnce(quoted) ||
+        unwrapViewOnce(ctx.msg.message) ||
+        quoted ||
+        rawQuoted;
+
+      const botJids = await getBotJids(ctx.sock);
+      const quotedParticipant = ctxInfo?.participant || undefined;
+      const quotedFromBot = Boolean(
+        quotedParticipant && botJids.some((b) => jidUserPart(b) === jidUserPart(quotedParticipant))
+      );
+
       let sourceKey = stanzaId
         ? {
             remoteJid: ctx.chatId,
-            fromMe: false,
+            fromMe: quotedFromBot,
             id: stanzaId,
-            participant: ctxInfo?.participant || undefined,
+            participant: quotedParticipant,
           }
         : ctx.msg.key;
 
@@ -270,16 +342,17 @@ export const mediaCommands: BotCommand[] = [
         return msg;
       }
 
-      const type = detectMediaType(inner);
+      const unwrappedInner = unwrapViewOnce(inner) || unwrapMessage(inner) || inner;
+      const type = detectMediaType(unwrappedInner);
       if (type !== 'image' && type !== 'video' && type !== 'audio') {
         const msg = 'No View-Once image, video, or voice note detected in the quoted message.';
         await ctx.reply(msg);
         return msg;
       }
 
-      if (!hasValidMediaPayload(inner)) {
+      if (!hasValidMediaPayload(unwrappedInner)) {
         const msg =
-          'This View-Once media was opened or sent before the bot started caching. Ask the sender to send it again.';
+          'This View-Once media expired or was opened before the bot received it. Ask the sender to send it again.';
         await ctx.reply(msg);
         return msg;
       }
@@ -287,29 +360,27 @@ export const mediaCommands: BotCommand[] = [
       try {
         const targetInfo: WAMessage = {
           key: sourceKey,
-          message: inner,
+          message: unwrappedInner,
         };
         const buffer = await downloadMessageMedia(ctx.sock, targetInfo);
 
-        if (type === 'image') {
-          await ctx.sock.sendMessage(ctx.chatId, {
-            image: buffer,
-            caption: inner.imageMessage?.caption || `View-Once extracted by ${loadConfig().botName}`,
-          });
-        } else if (type === 'video') {
-          await ctx.sock.sendMessage(ctx.chatId, {
-            video: buffer,
-            caption: inner.videoMessage?.caption || `View-Once extracted by ${loadConfig().botName}`,
-          });
-        } else {
-          const audioMeta = inner.audioMessage;
-          await ctx.sock.sendMessage(ctx.chatId, {
-            audio: buffer,
-            mimetype: audioMeta?.mimetype || 'audio/ogg; codecs=opus',
-            ptt: audioMeta?.ptt !== false,
-            seconds: audioMeta?.seconds || undefined,
-          });
-        }
+        await sendRecoveredMedia({
+          type,
+          buffer,
+          caption: unwrappedInner.imageMessage?.caption || unwrappedInner.videoMessage?.caption || undefined,
+          mimetype:
+            unwrappedInner.audioMessage?.mimetype ||
+            unwrappedInner.videoMessage?.mimetype ||
+            unwrappedInner.ptvMessage?.mimetype ||
+            unwrappedInner.imageMessage?.mimetype ||
+            undefined,
+          ptt: unwrappedInner.audioMessage ? unwrappedInner.audioMessage.ptt !== false : undefined,
+          seconds:
+            unwrappedInner.audioMessage?.seconds ||
+            unwrappedInner.videoMessage?.seconds ||
+            unwrappedInner.ptvMessage?.seconds ||
+            undefined,
+        });
         return 'View-Once media unwrapped.';
       } catch (err) {
         const msg = `View-Once download failed: ${(err as Error).message}`;
@@ -938,4 +1009,225 @@ export const mediaCommands: BotCommand[] = [
       return `Applied reaction(s): ${emojisToSend.join(' ')}`;
     },
   },
+  {
+    name: 'contactsave',
+    aliases: ['savecontact', 'vcard', 'vcf'],
+    category: 'media',
+    description: 'Replied/mentioned member ka contact vCard banaye taaki owner number save kar sake',
+    usage: 'contactsave [@user | phone | reply] [Optional Custom Name]',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const candidates = extractRawTargetCandidates(ctx.msg, ctx.args);
+      let targetJid = candidates[0] || (!ctx.isGroup ? ctx.chatId : '');
+
+      if (!targetJid) {
+        const msg = `Reply to a member's message, mention \`@user\`, or pass a phone number with \`${ctx.prefix}contactsave\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let resolvedJid = normalizeBareJid(targetJid);
+      if (isLidUser(resolvedJid) && ctx.sock?.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await ctx.sock.signalRepository.lidMapping.getPNForLID(resolvedJid);
+          if (pn) resolvedJid = normalizeBareJid(pn);
+        } catch {
+          // Keep original JID if LID lookup unavailable
+        }
+      }
+
+      const cleanPhone = normalizePhone(jidUserPart(resolvedJid));
+      if (!isValidPhone(cleanPhone)) {
+        const msg = 'Could not resolve a valid phone number for that user (WhatsApp privacy LID hidden).';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      // Allow owner/user to specify a custom name after mention/number, else use known WhatsApp name
+      const customName = ctx.args
+        .filter((a) => !a.startsWith('@') && !/^\+?\d{7,15}$/.test(a))
+        .join(' ')
+        .trim();
+      const displayName =
+        customName ||
+        lookupKnownUserName(resolvedJid) ||
+        lookupKnownUserName(targetJid) ||
+        `+${cleanPhone}`;
+
+      const safeVcardName = displayName.replace(/[\r\n;]/g, ' ').trim();
+      const vcard = [
+        'BEGIN:VCARD',
+        'VERSION:3.0',
+        `FN:${safeVcardName}`,
+        `TEL;type=CELL;type=VOICE;waid=${cleanPhone}:+${cleanPhone}`,
+        'END:VCARD',
+      ].join('\n');
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `📱 *Contact Card Generated*\n• Name: *${safeVcardName}*\n• Number: +${cleanPhone}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      await ctx.sock.sendMessage(
+        ctx.chatId,
+        {
+          contacts: {
+            displayName: safeVcardName,
+            contacts: [{ vcard }],
+          },
+        },
+        { quoted: ctx.msg ?? undefined }
+      );
+      return `Sent vCard contact for ${safeVcardName} (+${cleanPhone}).`;
+    },
+  },
+  ...createSocialDownloaderCommands(),
 ];
+
+async function runSocialDownloaderCommand(
+  ctx: CommandContext,
+  platform: SocialPlatform,
+  label: string,
+  audioOnly = false
+): Promise<string> {
+  const quotedMsgText = ctx.msg ? extractBodyText(extractQuotedMessage(ctx.msg) || undefined) : '';
+  const url = extractFirstValidUrl(ctx.text || quotedMsgText);
+  if (!url) {
+    const msg = `Provide a ${label} link.\nUsage: \`${ctx.prefix}${ctx.commandName} <url>\``;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  if (!ctx.sock || ctx.isSimulated) {
+    const msg = `[Simulated] Ready to download ${label} media without watermark from:\n${url}`;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  await ctx.reply(`⏳ Downloading ${label} media (${audioOnly ? 'Audio' : 'No-Watermark HD'})...`);
+
+  try {
+    const result = await downloadSocialMedia({ platform, url, audioOnly });
+    const cfg = loadConfig();
+    const captionHeader = [
+      `✅ *${label} Downloader*`,
+      result.title ? `• Title: ${result.title}` : '',
+      result.author ? `• Creator: ${result.author}` : '',
+      `• Downloaded by *${cfg.botName || 'FADI KING MD'}*`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    for (let i = 0; i < result.items.length; i += 1) {
+      const item = result.items[i];
+      const itemCaption = i === 0 ? captionHeader : undefined;
+      if (item.kind === 'video') {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            video: item.buffer,
+            mimetype: item.mimetype || 'video/mp4',
+            caption: itemCaption,
+          },
+          { quoted: ctx.msg ?? undefined }
+        );
+      } else if (item.kind === 'image') {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            image: item.buffer,
+            caption: itemCaption,
+          },
+          { quoted: ctx.msg ?? undefined }
+        );
+      } else {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            audio: item.buffer,
+            mimetype: item.mimetype || 'audio/mpeg',
+            ptt: false,
+            fileName: item.filename || `${platform}-audio.mp3`,
+          },
+          { quoted: ctx.msg ?? undefined }
+        );
+      }
+    }
+
+    return `Delivered ${result.items.length} ${label} media file(s).`;
+  } catch (err) {
+    const msg = `${label} download failed: ${(err as Error).message}`;
+    await ctx.reply(msg);
+    return msg;
+  }
+}
+
+function createSocialDownloaderCommands(): BotCommand[] {
+  return [
+    {
+      name: 'tiktok',
+      aliases: ['tt', 'tiktokdl', 'ttdl'],
+      category: 'media',
+      description: 'TikTok video ya slideshow bina watermark HD quality mein download kare',
+      usage: 'tiktok <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => {
+        const audioOnly = ctx.args.some((a) => a.toLowerCase() === '--audio' || a.toLowerCase() === 'audio');
+        return runSocialDownloaderCommand(ctx, 'tiktok', 'TikTok', audioOnly);
+      },
+    },
+    {
+      name: 'ig',
+      aliases: ['instagram', 'reel', 'igdl'],
+      category: 'media',
+      description: 'Instagram Reels, Videos aur Posts bina watermark download kare',
+      usage: 'ig <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => runSocialDownloaderCommand(ctx, 'instagram', 'Instagram', false),
+    },
+    {
+      name: 'yt',
+      aliases: ['youtube', 'ytmp4', 'ytmp3', 'yta', 'ytv'],
+      category: 'media',
+      description: 'YouTube video (.yt/.ytmp4) ya MP3 audio (.ytmp3/.yta) download kare',
+      usage: 'yt <url> | ytmp3 <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => {
+        const cmd = ctx.commandName.toLowerCase();
+        const audioOnly =
+          cmd === 'ytmp3' ||
+          cmd === 'yta' ||
+          ctx.args.some((a) => a.toLowerCase() === '--audio' || a.toLowerCase() === 'mp3');
+        return runSocialDownloaderCommand(ctx, 'youtube', 'YouTube', audioOnly);
+      },
+    },
+    {
+      name: 'fb',
+      aliases: ['facebook', 'fbdl', 'fbvideo'],
+      category: 'media',
+      description: 'Facebook Reels aur HD videos direct download kare',
+      usage: 'fb <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => runSocialDownloaderCommand(ctx, 'facebook', 'Facebook', false),
+    },
+    {
+      name: 'twitter',
+      aliases: ['x', 'tw', 'xdl'],
+      category: 'media',
+      description: 'Twitter / X videos aur photos high quality mein download kare',
+      usage: 'twitter <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => runSocialDownloaderCommand(ctx, 'twitter', 'Twitter / X', false),
+    },
+    {
+      name: 'pinterest',
+      aliases: ['pinmedia', 'pindl', 'pint'],
+      category: 'media',
+      description: 'Pinterest videos aur high-res images download kare',
+      usage: 'pinterest <url>',
+      cooldownSeconds: 5,
+      execute: async (ctx) => runSocialDownloaderCommand(ctx, 'pinterest', 'Pinterest', false),
+    },
+  ];
+}

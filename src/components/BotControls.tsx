@@ -258,7 +258,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
 
   async function toggleGroupSetting(
     groupId: string,
-    field: 'welcome' | 'goodbye' | 'antiScam' | 'antiStatusMention',
+    field: 'welcome' | 'goodbye' | 'antiScam' | 'antiStatusMention' | 'aiEnabled',
     value: boolean
   ) {
     await fetch(`/api/groups/${encodeURIComponent(groupId)}`, {
@@ -288,7 +288,8 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
         antilinkMode: 'warn',
         antiScam: true,
         antiStatusMention: true,
-        welcome: true,
+        aiEnabled: false,
+        welcome: false,
         goodbye: false,
       }),
     });
@@ -888,6 +889,20 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                         }`}
                       >
                         Anti-Mention Status: {(g.antiStatusMention ?? form.antiStatusMentionGlobal) ? 'On' : 'Off'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          toggleGroupSetting(g.groupId, 'aiEnabled', !Boolean(g.aiEnabled))
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                          Boolean(g.aiEnabled)
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-white/[0.06] text-[#9E97C2]'
+                        }`}
+                      >
+                        AI Chat: {Boolean(g.aiEnabled) ? 'On' : 'Off'}
                       </button>
 
                       {(['welcome', 'goodbye'] as const).map((field) => (

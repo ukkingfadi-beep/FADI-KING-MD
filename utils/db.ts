@@ -226,3 +226,82 @@ export function getDatabaseStatus(): {
     postgresConfigured: Boolean(process.env.DATABASE_URL?.trim()),
   };
 }
+
+const AUTH_BACKUP_PREFIX = 'auth_backup:';
+
+export async function backupAuthDirToDb(sessionKey: string, authDir: string): Promise<void> {
+  if (!sessionKey || !fs.existsSync(authDir)) return;
+  try {
+    const entries = await fs.promises.readdir(authDir, { withFileTypes: true });
+    const files: Record<string, string> = {};
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      // Skip large transient pre-key churn beyond recent essentials if huge, keep all small auth JSONs
+      const fullPath = path.join(authDir, entry.name);
+      const content = await fs.promises.readFile(fullPath, 'utf-8').catch(() => '');
+      if (content) {
+        files[entry.name] = content;
+      }
+    }
+    if (!files['creds.json']) return;
+    dbSetSync(`${AUTH_BACKUP_PREFIX}${sessionKey}`, {
+      updatedAt: Date.now(),
+      files,
+    });
+  } catch (err) {
+    logger.warn('database', `Auth backup skipped for ${sessionKey}: ${(err as Error).message}`);
+  }
+}
+
+export async function restoreAuthDirsFromDb(sessionDir: string): Promise<number> {
+  let restored = 0;
+  try {
+    const db = getSqliteDb();
+    const rows = db
+      .prepare('SELECT store_key, payload FROM fkmd_store WHERE store_key LIKE ?')
+      .all(`${AUTH_BACKUP_PREFIX}%`) as Array<{ store_key: string; payload: string }>;
+
+    for (const row of rows) {
+      const sessionKey = row.store_key.slice(AUTH_BACKUP_PREFIX.length).trim();
+      if (!sessionKey) continue;
+      const targetDir = path.join(sessionDir, sessionKey);
+      const credsPath = path.join(targetDir, 'creds.json');
+      // Only restore if local disk does not already have registered credentials
+      if (fs.existsSync(credsPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(credsPath, 'utf-8')) as { registered?: boolean };
+          if (parsed?.registered) continue;
+        } catch {
+          // Proceed with restore if local creds file is corrupted
+        }
+      }
+
+      const parsed = JSON.parse(row.payload) as { files?: Record<string, string> };
+      if (!parsed?.files?.['creds.json']) continue;
+
+      await fs.promises.mkdir(targetDir, { recursive: true });
+      for (const [fileName, fileContent] of Object.entries(parsed.files)) {
+        const safeName = path.basename(fileName);
+        if (!safeName.endsWith('.json')) continue;
+        await fs.promises.writeFile(path.join(targetDir, safeName), fileContent, 'utf-8');
+      }
+      restored += 1;
+    }
+  } catch (err) {
+    logger.warn('database', `Auth restore check failed: ${(err as Error).message}`);
+  }
+  return restored;
+}
+
+export function deleteAuthBackupFromDb(sessionKey: string): void {
+  const key = `${AUTH_BACKUP_PREFIX}${sessionKey}`;
+  try {
+    const db = getSqliteDb();
+    db.prepare('DELETE FROM fkmd_store WHERE store_key = ?').run(key);
+  } catch {
+    // Ignore local SQLite delete error
+  }
+  if (pgPool && pgReady) {
+    void pgPool.query('DELETE FROM fkmd_store WHERE store_key = $1', [key]).catch(() => {});
+  }
+}

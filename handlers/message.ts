@@ -166,22 +166,19 @@ export async function handleIncomingMessage(
         }
       }
 
-      // AI Auto-Reply when enabled (respects Private Mode: Owner-only in 'self' mode)
-      if (cfg.aiEnabled && !msg.key.fromMe && (cfg.mode !== 'self' || isOwner)) {
-        let shouldReplyWithAi = !isGroup;
+      // AI Auto-Reply:
+      // - In Groups: ONLY reply in groups where AI was explicitly turned ON (groupCfg.aiEnabled === true), and reply to every question/message!
+      // - In Private DMs/IB: reply when global cfg.aiEnabled is ON.
+      if (!msg.key.fromMe && (cfg.mode !== 'self' || isOwner)) {
+        let shouldReplyWithAi = false;
         if (isGroup) {
-          const ctxInfo = extractContextInfo(msg.message);
-          const botJids = await getBotJids(sock);
-          const mentionedBot = (ctxInfo?.mentionedJid || []).some((j) =>
-            botJids.includes(normalizeBareJid(j))
-          );
-          const repliedToBot = Boolean(
-            ctxInfo?.participant && botJids.includes(normalizeBareJid(ctxInfo.participant))
-          );
-          shouldReplyWithAi = mentionedBot || repliedToBot;
+          const groupCfg = vipStore.getGroupConfig(chatId);
+          shouldReplyWithAi = Boolean(groupCfg.aiEnabled);
+        } else {
+          shouldReplyWithAi = Boolean(cfg.aiEnabled);
         }
 
-        if (shouldReplyWithAi) {
+        if (shouldReplyWithAi && body.trim().length > 0) {
           try {
             const replyText = await generateAiChatReply(body, msg.pushName || 'Friend');
             await sock.sendMessage(chatId, { text: replyText }, { quoted: msg });
