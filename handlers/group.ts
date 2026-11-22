@@ -72,6 +72,64 @@ export async function handleGroupParticipantsUpdate(
     const groupCfg = vipStore.getGroupConfig(groupId);
     const cfg = loadConfig();
 
+    // Anti-Add & Anti-Bot check on newly added participants
+    if (update.action === 'add' && (groupCfg.antiAdd || groupCfg.antiBot) && cfg.mode !== 'self') {
+      try {
+        const meta = await getCachedGroupMetadata(sock, groupId, true);
+        const botJids = await getBotJids(sock);
+        const botParticipant = findParticipant(meta.participants, botJids);
+        const botIsAdmin = isParticipantAdmin(botParticipant);
+        const ownerNum = cfg.ownerNumber;
+
+        const authorRaw = (update as { author?: string }).author || '';
+        const authorBare = normalizeBareJid(authorRaw);
+        const authorParticipant = authorBare ? findParticipant(meta.participants, [authorBare]) : undefined;
+        const authorIsBot = Boolean(authorBare && botJids.some((b) => jidUserPart(b) === jidUserPart(authorBare)));
+        const authorIsOwner = Boolean(authorBare && ownerNum && jidUserPart(authorBare) === ownerNum);
+        const authorIsAdmin = isParticipantAdmin(authorParticipant) || authorIsBot || authorIsOwner;
+
+        if (botIsAdmin) {
+          for (const participant of update.participants) {
+            const pObj = typeof participant === 'string' ? { id: participant } : participant;
+            const rawJid = pObj.id;
+            const bareAdded = normalizeBareJid(rawJid);
+            if (!bareAdded) continue;
+            if (botJids.some((b) => jidUserPart(b) === jidUserPart(bareAdded))) continue;
+
+            const addedIsBot = bareAdded.endsWith('@bot');
+            const wasAddedByNonAdmin = Boolean(
+              groupCfg.antiAdd &&
+                authorBare &&
+                jidUserPart(authorBare) !== jidUserPart(bareAdded) &&
+                !authorIsAdmin
+            );
+
+            if ((groupCfg.antiBot && addedIsBot) || wasAddedByNonAdmin) {
+              await sock.groupParticipantsUpdate(groupId, [rawJid], 'remove').catch(() => {});
+              invalidateGroupMetadataCache(groupId);
+              const targetTag = jidUserPart(bareAdded);
+              const reasonText =
+                groupCfg.antiBot && addedIsBot
+                  ? `*Anti-Bot Guard*\nUnauthorized bot @${targetTag} was automatically removed.`
+                  : `*Anti-Add Guard*\n@${jidUserPart(authorBare)} is not allowed to add members here. Removed @${targetTag}.`;
+              await sock
+                .sendMessage(groupId, {
+                  text: reasonText,
+                  mentions: [rawJid, ...(authorBare ? [authorBare] : [])],
+                })
+                .catch(() => {});
+              logger.security(
+                'groupGuard',
+                `Removed ${bareAdded} from ${groupId} (antiAdd=${Boolean(groupCfg.antiAdd)}, antiBot=${Boolean(groupCfg.antiBot)})`
+              );
+            }
+          }
+        }
+      } catch (guardErr) {
+        logger.warn('groupGuard', `Participant guard error in ${groupId}: ${(guardErr as Error).message}`);
+      }
+    }
+
     if (!groupCfg.welcome && !groupCfg.goodbye) return;
     if (cfg.mode === 'self') return;
 
@@ -526,4 +584,218 @@ export async function handleAntidelete(
   } catch (err) {
     logger.warn('antidelete', `Antidelete recovery failed: ${(err as Error).message}`);
   }
+}
+
+const slowModeLastSeen = new Map<string, number>();
+const slowModeNoticeCooldown = new Map<string, number>();
+const guardWarnCooldown = new Map<string, number>();
+
+function canSendGuardNotice(key: string, cooldownMs = 10_000): boolean {
+  const now = Date.now();
+  const prev = guardWarnCooldown.get(key) || 0;
+  if (now - prev < cooldownMs) return false;
+  guardWarnCooldown.set(key, now);
+  if (guardWarnCooldown.size > 2000) {
+    for (const [k, ts] of guardWarnCooldown.entries()) {
+      if (now - ts > 60_000) guardWarnCooldown.delete(k);
+    }
+  }
+  return true;
+}
+
+function isAutomatedBotMessage(msg: WAMessage, senderCandidates: string[]): boolean {
+  if (senderCandidates.some((c) => c.endsWith('@bot'))) return true;
+  if (msg.message?.botInvokeMessage) return true;
+  const msgId = msg.key?.id || '';
+  // Other Baileys / MD automated bot stanza prefixes (not sent from official WA mobile/web clients)
+  if (/^BAE5[0-9A-F]{12}$/i.test(msgId)) return true;
+  if (/^3EB0[0-9A-F]{16,}$/i.test(msgId)) return true;
+  return false;
+}
+
+export async function enforceAdvancedGroupGuards(
+  sock: WASocket,
+  msg: WAMessage,
+  chatId: string,
+  senderCandidates: string[],
+  isOwner: boolean
+): Promise<boolean> {
+  if (!chatId.endsWith('@g.us') || isOwner || msg.key?.fromMe) return false;
+  const groupCfg = vipStore.getGroupConfig(chatId);
+
+  const mutedMap = groupCfg.mutedUsers || {};
+  const hasMutedEntries = Object.keys(mutedMap).length > 0;
+  const slowSeconds = Number(groupCfg.slowModeSeconds || 0);
+  const anyGuardEnabled =
+    hasMutedEntries ||
+    slowSeconds > 0 ||
+    Boolean(groupCfg.antiBot) ||
+    Boolean(groupCfg.antiForward) ||
+    Boolean(groupCfg.antiMedia) ||
+    Boolean(groupCfg.antiSticker);
+
+  if (!anyGuardEnabled) return false;
+
+  try {
+    let meta = await getCachedGroupMetadata(sock, chatId);
+    const senderParticipant = findParticipant(meta.participants, senderCandidates);
+    if (isParticipantAdmin(senderParticipant)) return false;
+
+    const botJids = await getBotJids(sock);
+    let botParticipant = findParticipant(meta.participants, botJids);
+    if (!isParticipantAdmin(botParticipant)) {
+      meta = await getCachedGroupMetadata(sock, chatId, true);
+      botParticipant = findParticipant(meta.participants, botJids);
+    }
+    const botIsAdmin = isParticipantAdmin(botParticipant);
+
+    const senderJid = senderParticipant?.id || senderCandidates[0] || chatId;
+    const senderKey = jidUserPart(senderParticipant?.phoneNumber || senderJid);
+    const now = Date.now();
+
+    const deleteCurrentMsg = async () => {
+      if (!botIsAdmin || !msg.key?.id) return;
+      await sock
+        .sendMessage(chatId, {
+          delete: {
+            remoteJid: chatId,
+            fromMe: false,
+            id: msg.key.id,
+            participant: msg.key.participant || senderParticipant?.id || senderJid,
+          },
+        })
+        .catch(() => {});
+    };
+
+    // 1. Muted User Check (prune expired records lazily)
+    if (hasMutedEntries) {
+      const candidateKeys = Array.from(
+        new Set([senderKey, ...senderCandidates.map((c) => jidUserPart(c))].filter(Boolean))
+      );
+      let activeMuteKey: string | null = null;
+      let expiredFound = false;
+      const nextMuted = { ...mutedMap };
+
+      for (const [k, rec] of Object.entries(nextMuted)) {
+        if (!rec || rec.expiresAt <= now) {
+          delete nextMuted[k];
+          expiredFound = true;
+        } else if (candidateKeys.includes(k)) {
+          activeMuteKey = k;
+        }
+      }
+      if (expiredFound) {
+        vipStore.updateGroupConfig(chatId, { mutedUsers: nextMuted });
+      }
+      if (activeMuteKey) {
+        await deleteCurrentMsg();
+        return true;
+      }
+    }
+
+    // 2. Anti-Bot Check
+    if (groupCfg.antiBot && isAutomatedBotMessage(msg, senderCandidates)) {
+      await deleteCurrentMsg();
+      if (botIsAdmin) {
+        await sock.groupParticipantsUpdate(chatId, [senderJid], 'remove').catch(() => {});
+        invalidateGroupMetadataCache(chatId);
+        await sock
+          .sendMessage(chatId, {
+            text: `*Anti-Bot Shield*\nRemoved automated bot account @${senderKey}.`,
+            mentions: [senderJid],
+          })
+          .catch(() => {});
+        logger.security('antiBot', `Kicked bot +${senderKey} in ${chatId}`);
+      }
+      return true;
+    }
+
+    // 3. Anti-Forward Check
+    const inner = unwrapMessage(msg.message);
+    const ctxInfo = extractContextInfo(msg.message);
+    const isForwardedMsg = Boolean(
+      ctxInfo?.isForwarded || Number(ctxInfo?.forwardingScore || 0) >= 1
+    );
+    if (groupCfg.antiForward && isForwardedMsg) {
+      if (!botIsAdmin) return false;
+      await deleteCurrentMsg();
+      if (canSendGuardNotice(`fwd:${chatId}:${senderKey}`)) {
+        await sock
+          .sendMessage(chatId, {
+            text: `*Anti-Forward Guard*\n@${senderKey}, forwarded messages are not allowed in this group.`,
+            mentions: [senderJid],
+          })
+          .catch(() => {});
+      }
+      return true;
+    }
+
+    // 4. Anti-Sticker Check
+    if (groupCfg.antiSticker && inner?.stickerMessage) {
+      if (!botIsAdmin) return false;
+      await deleteCurrentMsg();
+      if (canSendGuardNotice(`stk:${chatId}:${senderKey}`)) {
+        await sock
+          .sendMessage(chatId, {
+            text: `*Anti-Sticker Guard*\n@${senderKey}, stickers are disabled in this group.`,
+            mentions: [senderJid],
+          })
+          .catch(() => {});
+      }
+      return true;
+    }
+
+    // 5. Anti-Media Check (images, videos, ptv, audio/voice notes, documents)
+    const isMediaMsg = Boolean(
+      inner?.imageMessage ||
+        inner?.videoMessage ||
+        inner?.ptvMessage ||
+        inner?.audioMessage ||
+        inner?.documentMessage
+    );
+    if (groupCfg.antiMedia && isMediaMsg) {
+      if (!botIsAdmin) return false;
+      await deleteCurrentMsg();
+      if (canSendGuardNotice(`med:${chatId}:${senderKey}`)) {
+        await sock
+          .sendMessage(chatId, {
+            text: `*Anti-Media Guard*\n@${senderKey}, media files and voice notes are not allowed in this group.`,
+            mentions: [senderJid],
+          })
+          .catch(() => {});
+      }
+      return true;
+    }
+
+    // 6. Slow Mode Cooldown Check
+    if (slowSeconds > 0 && senderKey) {
+      const trackKey = `${chatId}:${senderKey}`;
+      const lastAt = slowModeLastSeen.get(trackKey) || 0;
+      const elapsedMs = now - lastAt;
+      if (elapsedMs < slowSeconds * 1000) {
+        const waitSec = Math.max(1, Math.ceil((slowSeconds * 1000 - elapsedMs) / 1000));
+        await deleteCurrentMsg();
+        const prevNotice = slowModeNoticeCooldown.get(trackKey) || 0;
+        if (now - prevNotice >= 8_000) {
+          slowModeNoticeCooldown.set(trackKey, now);
+          await sock
+            .sendMessage(chatId, {
+              text: `🐢 *Slow Mode Active (${slowSeconds}s)*\n@${senderKey}, please wait *${waitSec}s* before sending another message.`,
+              mentions: [senderJid],
+            })
+            .catch(() => {});
+        }
+        return true;
+      }
+      slowModeLastSeen.set(trackKey, now);
+      if (slowModeLastSeen.size > 5000) {
+        for (const [k, ts] of slowModeLastSeen.entries()) {
+          if (now - ts > 3600_000) slowModeLastSeen.delete(k);
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn('groupGuard', `Advanced guard failed in ${chatId}: ${(err as Error).message}`);
+  }
+  return false;
 }

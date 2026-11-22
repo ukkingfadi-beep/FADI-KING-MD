@@ -1,5 +1,8 @@
 import { loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
-import { applySingleTickPresenceAcrossSockets } from '../handlers/connection.ts';
+import {
+  applyAlwaysOnlinePresenceAcrossSockets,
+  applySingleTickPresenceAcrossSockets,
+} from '../handlers/connection.ts';
 import { dispatchOpenGcProtectedPost } from '../handlers/group.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
 import { generateAiChatReply } from '../utils/geminiService.ts';
@@ -641,6 +644,135 @@ export const ownerCommands: BotCommand[] = [
         void import('../handlers/connection.ts').then((m) => m.restartMainBot());
       }, 600);
       return msg;
+    },
+  },
+  {
+    name: 'alwaysonline',
+    aliases: ['onlinealways', 'keepavailable'],
+    category: 'owner',
+    description: 'Bot WhatsApp account ko hamesha Online (available) rakhne ka persistent toggle',
+    usage: 'alwaysonline <on|off>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const arg = ctx.args[0]?.toLowerCase();
+      const cfg = loadConfig();
+      if (arg !== 'on' && arg !== 'off') {
+        const msg = `Always Online is currently *${cfg.alwaysOnline ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}alwaysonline on\` or \`${ctx.prefix}alwaysonline off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      const enabled = arg === 'on';
+      saveConfig({
+        alwaysOnline: enabled,
+        ...(enabled && cfg.singleTick ? { singleTick: false } : {}),
+      });
+      await applyAlwaysOnlinePresenceAcrossSockets(enabled);
+      const msg = enabled
+        ? `🟢 *Always Online turned ON* — account presence will stay *available* across restarts.`
+        : `⚪ *Always Online turned OFF* — presence updated back to normal.`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'clearchat',
+    aliases: ['wipechat', 'clearmessages'],
+    category: 'owner',
+    description: 'Current chat ya group ki messages WhatsApp account se clear kare (Baileys chatModify)',
+    usage: 'clearchat',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Cleared message history for chat ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+      try {
+        const tsNum = Number(ctx.msg?.messageTimestamp || Math.floor(Date.now() / 1000)) || Math.floor(Date.now() / 1000);
+        const msgKey = {
+          remoteJid: ctx.chatId,
+          id: ctx.msg?.key?.id || `CLEAR_${Date.now()}`,
+          fromMe: Boolean(ctx.msg?.key?.fromMe),
+          ...(ctx.isGroup && !ctx.msg?.key?.fromMe
+            ? { participant: ctx.msg?.key?.participant || ctx.senderJid }
+            : {}),
+        };
+        await ctx.sock.chatModify(
+          {
+            clear: true,
+            lastMessages: [
+              {
+                key: msgKey,
+                messageTimestamp: tsNum,
+              },
+            ],
+          },
+          ctx.chatId
+        );
+        const msg = `🧹 *Chat Cleared* for \`${ctx.chatId}\`.`;
+        await ctx.reply(msg);
+        return msg;
+      } catch (err) {
+        const msg = `Failed to clear chat: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'blocklist',
+    aliases: ['blocked', 'blklist'],
+    category: 'owner',
+    description: 'WhatsApp account par tamam blocked contacts ki formatted list dikhaye',
+    usage: 'blocklist',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Blocked Contacts List (0 total).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+      try {
+        const rawList = await ctx.sock.fetchBlocklist();
+        const jids = Array.from(
+          new Set(
+            (rawList || []).filter((j): j is string => typeof j === 'string' && j.trim().length > 0)
+          )
+        );
+        if (jids.length === 0) {
+          const msg = `📛 *WhatsApp Blocklist*\nNo blocked contacts on this account.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        const formatted: string[] = [];
+        for (let i = 0; i < jids.length; i += 1) {
+          let bare = normalizeBareJid(jids[i]);
+          if (isLidUser(bare) && ctx.sock.signalRepository?.lidMapping?.getPNForLID) {
+            try {
+              const pn = await ctx.sock.signalRepository.lidMapping.getPNForLID(bare);
+              if (pn) bare = normalizeBareJid(pn);
+            } catch {
+              // Keep original JID if LID lookup unavailable
+            }
+          }
+          const user = jidUserPart(bare);
+          const label = bare.endsWith('@s.whatsapp.net') ? `+${normalizePhone(user)}` : bare;
+          formatted.push(`${i + 1}. ${label}`);
+        }
+
+        const msg = [
+          `📛 *WhatsApp Blocklist (${formatted.length})*`,
+          ...formatted.slice(0, 80),
+          ...(formatted.length > 80 ? [`...and ${formatted.length - 80} more.`] : []),
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      } catch (err) {
+        const msg = `Failed to fetch blocklist: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
     },
   },
 ];

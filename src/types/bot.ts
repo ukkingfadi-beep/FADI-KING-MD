@@ -91,6 +91,7 @@ export interface BotConfigView {
   autoForwardIbToOpenGcs: boolean;
   autoReact: boolean;
   aiEnabled: boolean;
+  alwaysOnline?: boolean;
   singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
@@ -202,6 +203,12 @@ export interface GroupConfig {
   antilinkMode?: AntilinkMode;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  antiAdd?: boolean;
+  antiForward?: boolean;
+  antiMedia?: boolean;
+  antiSticker?: boolean;
+  antiBot?: boolean;
+  slowModeSeconds?: number;
   aiEnabled?: boolean;
   welcome: boolean;
   goodbye: boolean;

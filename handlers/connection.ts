@@ -26,15 +26,18 @@ import {
   extractChannelTargets,
   extractGroupInviteCodes,
   getGroupMetadataFromCacheOnly,
+  hasValidMediaPayload,
   invalidateGroupMetadataCache,
   isLidUser,
   jidUserPart,
   normalizeBareJid,
   rememberUserName,
+  unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import { precacheViewOnceMedia } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
+import { startReminderScheduler } from '../utils/reminderStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
 import { handleIncomingMessage } from './message.ts';
@@ -141,6 +144,17 @@ function cacheMessage(msg: WAMessage): void {
   if (!jid || !id || !msg.message) return;
   const bareJid = normalizeBareJid(jid);
   const cacheKey = `${bareJid}:${id}`;
+
+  // Never overwrite an intact cached media message (e.g. unopened View-Once) with a stripped/opened update
+  const existing = messageCache.get(cacheKey) || messageByIdCache.get(id);
+  if (existing?.message) {
+    const existingHasMedia = hasValidMediaPayload(unwrapMessage(existing.message) || existing.message);
+    const nextHasMedia = hasValidMediaPayload(unwrapMessage(msg.message) || msg.message);
+    if (existingHasMedia && !nextHasMedia) {
+      return;
+    }
+  }
+
   messageCache.set(cacheKey, msg);
   messageByIdCache.set(id, msg);
   if (messageCache.size > 4000) {
@@ -391,7 +405,25 @@ export async function syncAutoJoinsAcrossConnectedSessions(): Promise<void> {
 }
 
 export async function applySingleTickPresenceAcrossSockets(singleTick: boolean): Promise<void> {
+  const cfg = loadConfig();
   const presence = singleTick ? 'unavailable' : 'available';
+  if (mainSock && botState.status === 'connected') {
+    await mainSock.sendPresenceUpdate(presence).catch(() => {});
+  }
+  for (const entry of vipSubSockets.values()) {
+    if (entry.info.status === 'connected') {
+      await entry.sock.sendPresenceUpdate(presence).catch(() => {});
+    }
+  }
+  if (!singleTick && cfg.alwaysOnline) {
+    await applyAlwaysOnlinePresenceAcrossSockets(true);
+  }
+}
+
+export async function applyAlwaysOnlinePresenceAcrossSockets(enabled: boolean): Promise<void> {
+  const cfg = loadConfig();
+  if (cfg.singleTick) return;
+  const presence = enabled ? 'available' : 'unavailable';
   if (mainSock && botState.status === 'connected') {
     await mainSock.sendPresenceUpdate(presence).catch(() => {});
   }
@@ -427,6 +459,12 @@ function handleSessionOpenActions(params: {
       incrementCount: effectiveFreshPair,
       status: 'connected',
     });
+  }
+
+  if (cfg.singleTick) {
+    void sock.sendPresenceUpdate('unavailable').catch(() => {});
+  } else if (cfg.alwaysOnline) {
+    void sock.sendPresenceUpdate('available').catch(() => {});
   }
 
   // 1. Send connection confirmation message into bot's own IB/DM
@@ -831,6 +869,13 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       }
     });
 
+    sock.ev.on('messaging-history.set', ({ messages }) => {
+      for (const msg of messages || []) {
+        cacheMessage(msg);
+        void precacheViewOnceMedia(sock, msg);
+      }
+    });
+
     sock.ev.on('group-participants.update', async (update) => {
       await handleGroupParticipantsUpdate(sock, update);
     });
@@ -1135,6 +1180,13 @@ async function connectSubSession(params: {
     }
   });
 
+  sock.ev.on('messaging-history.set', ({ messages }) => {
+    for (const m of messages || []) {
+      cacheMessage(m);
+      void precacheViewOnceMedia(sock, m);
+    }
+  });
+
   sock.ev.on('group-participants.update', async (update) => {
     await handleGroupParticipantsUpdate(sock, update);
   });
@@ -1367,6 +1419,17 @@ function ensureKeepAliveWatchdog(): void {
         if (toRestore.length > 0) {
           await restoreSessionsInBatches(toRestore.slice(0, 20), cfg.sessionDir);
         }
+
+        if (cfg.alwaysOnline && !cfg.singleTick) {
+          if (mainSock && botState.status === 'connected') {
+            void mainSock.sendPresenceUpdate('available').catch(() => {});
+          }
+          for (const entry of vipSubSockets.values()) {
+            if (entry.info.status === 'connected') {
+              void entry.sock.sendPresenceUpdate('available').catch(() => {});
+            }
+          }
+        }
       } finally {
         watchdogRunning = false;
       }
@@ -1457,5 +1520,21 @@ export function initializeSavedSessionOnBoot(): void {
   })();
 
   ensureKeepAliveWatchdog();
+  startReminderScheduler(async (chatId, text, mentions) => {
+    const targetSock =
+      mainSock && botState.status === 'connected'
+        ? mainSock
+        : Array.from(vipSubSockets.values()).find((e) => e.info.status === 'connected')?.sock || null;
+    if (!targetSock) return false;
+    try {
+      await targetSock.sendMessage(chatId, {
+        text,
+        ...(mentions && mentions.length > 0 ? { mentions } : {}),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  });
   logger.info('boot', `${cfg.botName} ready for high-concurrency 8-digit code & QR pairing (24/7 watchdog active).`);
 }

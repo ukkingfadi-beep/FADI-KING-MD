@@ -49,6 +49,7 @@ export interface BotConfig {
   autoForwardIbToOpenGcs: boolean;
   autoReact: boolean;
   aiEnabled: boolean;
+  alwaysOnline: boolean;
   singleTick: boolean;
   stickerPack: string;
   stickerAuthor: string;
@@ -109,6 +110,7 @@ const defaultConfig: BotConfig = {
   autoForwardIbToOpenGcs: process.env.AUTO_FORWARD_IB_TO_OPEN_GCS === 'true',
   autoReact: process.env.AUTO_REACT === 'true',
   aiEnabled: process.env.AI_ENABLED === 'true',
+  alwaysOnline: process.env.ALWAYS_ONLINE === 'true',
   singleTick: process.env.SINGLE_TICK === 'true',
   stickerPack: process.env.STICKER_PACK || 'FADI KING MD',
   stickerAuthor: process.env.STICKER_AUTHOR || 'VIP BOT',
@@ -357,6 +359,10 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof cleanPartial.aiEnabled === 'boolean'
         ? cleanPartial.aiEnabled
         : Boolean(current.aiEnabled),
+    alwaysOnline:
+      typeof cleanPartial.alwaysOnline === 'boolean'
+        ? cleanPartial.alwaysOnline
+        : Boolean(current.alwaysOnline),
     singleTick:
       typeof cleanPartial.singleTick === 'boolean'
         ? cleanPartial.singleTick
@@ -428,6 +434,7 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     autoForwardIbToOpenGcs: next.autoForwardIbToOpenGcs,
     autoReact: next.autoReact,
     aiEnabled: next.aiEnabled,
+    alwaysOnline: next.alwaysOnline,
     singleTick: next.singleTick,
     stickerPack: next.stickerPack,
     stickerAuthor: next.stickerAuthor,

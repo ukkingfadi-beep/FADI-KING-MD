@@ -5,6 +5,7 @@ import JSZip from 'jszip';
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from './config/bot.config.ts';
 import { getAllCommands } from './commands/index.ts';
 import {
+  applyAlwaysOnlinePresenceAcrossSockets,
   applySingleTickPresenceAcrossSockets,
   closeAllSocketsGracefully,
   disconnectMainBot,
@@ -64,6 +65,8 @@ const SOURCE_FILES = [
   'utils/adminAuth.ts',
   'utils/liveStore.ts',
   'utils/anticallStore.ts',
+  'utils/chatHistoryStore.ts',
+  'utils/reminderStore.ts',
   'utils/geminiService.ts',
   'utils/db.ts',
   'server.ts',
@@ -417,6 +420,7 @@ async function startServer(): Promise<void> {
         autoReact: cfg.autoReact,
         aiEnabled: cfg.aiEnabled,
         singleTick: cfg.singleTick,
+        alwaysOnline: cfg.alwaysOnline,
         stickerPack: cfg.stickerPack,
         stickerAuthor: cfg.stickerAuthor,
         menuImageUrl: cfg.menuImageUrl,
@@ -538,6 +542,7 @@ async function startServer(): Promise<void> {
       autoReact: typeof body.autoReact === 'boolean' ? body.autoReact : undefined,
       aiEnabled: typeof body.aiEnabled === 'boolean' ? body.aiEnabled : undefined,
       singleTick: typeof body.singleTick === 'boolean' ? body.singleTick : undefined,
+      alwaysOnline: typeof body.alwaysOnline === 'boolean' ? body.alwaysOnline : undefined,
       stickerPack: typeof body.stickerPack === 'string' ? body.stickerPack : undefined,
       stickerAuthor: typeof body.stickerAuthor === 'string' ? body.stickerAuthor : undefined,
       menuImageUrl: typeof body.menuImageUrl === 'string' ? body.menuImageUrl : undefined,
@@ -571,6 +576,9 @@ async function startServer(): Promise<void> {
     }
     if (updated.singleTick !== prevCfg.singleTick) {
       void applySingleTickPresenceAcrossSockets(updated.singleTick);
+    }
+    if (updated.alwaysOnline !== prevCfg.alwaysOnline) {
+      void applyAlwaysOnlinePresenceAcrossSockets(updated.alwaysOnline);
     }
     logger.info('config', `Updated configuration (mode=${updated.mode}, prefix=${updated.prefix})`);
     res.json({ ok: true, config: updated });
@@ -649,6 +657,15 @@ async function startServer(): Promise<void> {
       antiStatusMention:
         typeof req.body?.antiStatusMention === 'boolean' ? req.body.antiStatusMention : undefined,
       aiEnabled: typeof req.body?.aiEnabled === 'boolean' ? req.body.aiEnabled : undefined,
+      antiAdd: typeof req.body?.antiAdd === 'boolean' ? req.body.antiAdd : undefined,
+      antiForward: typeof req.body?.antiForward === 'boolean' ? req.body.antiForward : undefined,
+      antiMedia: typeof req.body?.antiMedia === 'boolean' ? req.body.antiMedia : undefined,
+      antiSticker: typeof req.body?.antiSticker === 'boolean' ? req.body.antiSticker : undefined,
+      antiBot: typeof req.body?.antiBot === 'boolean' ? req.body.antiBot : undefined,
+      slowModeSeconds:
+        typeof req.body?.slowModeSeconds === 'number' && Number.isFinite(req.body.slowModeSeconds)
+          ? Math.max(0, Math.min(3600, Math.round(req.body.slowModeSeconds)))
+          : undefined,
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });

@@ -21,11 +21,20 @@ import {
   downloadMessageMedia,
   extractQuotedMessage,
   getCachedViewOnceMedia,
+  getCachedViewOnceMeta,
   isFfmpegAvailable,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
   waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
+import { getRecentChatMessages } from '../utils/chatHistoryStore.ts';
+import {
+  generateFactCheckReply,
+  generateGrammarCorrection,
+  generateGroupSummary,
+  generatePlayfulRoast,
+  isGeminiConfigured,
+} from '../utils/geminiService.ts';
 import {
   downloadSocialMedia,
   extractFirstValidUrl,
@@ -323,15 +332,34 @@ export const mediaCommands: BotCommand[] = [
           }
         : ctx.msg.key;
 
-      // 2. Fallback to cached original WAMessage (WhatsApp strips mediaKey from quoted View-Once replies)
-      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId && ctx.getCachedMessage) {
-        const cachedOrig = ctx.getCachedMessage(ctx.chatId, stanzaId);
-        if (cachedOrig?.message) {
-          const cachedInner =
-            unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
-          if (cachedInner && hasValidMediaPayload(cachedInner)) {
-            inner = cachedInner;
-            sourceKey = cachedOrig.key || sourceKey;
+      // 2. Fallback to cached original WAMessage (RAM + remoteJidAlt + disk metadata)
+      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
+        const ramLookups = ctx.getCachedMessage
+          ? [
+              ctx.getCachedMessage(ctx.chatId, stanzaId),
+              ctx.msg.key?.remoteJidAlt
+                ? ctx.getCachedMessage(ctx.msg.key.remoteJidAlt, stanzaId)
+                : undefined,
+              ctxInfo?.remoteJid ? ctx.getCachedMessage(ctxInfo.remoteJid, stanzaId) : undefined,
+            ]
+          : [];
+        for (const cachedOrig of ramLookups) {
+          if (cachedOrig?.message) {
+            const cachedInner =
+              unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
+            if (cachedInner && hasValidMediaPayload(cachedInner)) {
+              inner = cachedInner;
+              sourceKey = cachedOrig.key || sourceKey;
+              break;
+            }
+          }
+        }
+
+        if (!inner || !hasValidMediaPayload(inner)) {
+          const diskMeta = getCachedViewOnceMeta(stanzaId);
+          if (diskMeta?.message && hasValidMediaPayload(diskMeta.message)) {
+            inner = diskMeta.message;
+            sourceKey = diskMeta.key || sourceKey;
           }
         }
       }
@@ -835,13 +863,13 @@ export const mediaCommands: BotCommand[] = [
     name: 'savedp',
     aliases: ['dpsave', 'getdp', 'pp', 'getpp', 'dp'],
     category: 'media',
-    description: 'Mention, reply ya ID se kisi ki bhi profile photo IB mein save kare (.dpsave)',
-    usage: 'dpsave (@user / ID / number / reply)',
+    description: 'Mention, reply ya ID se kisi ki bhi profile photo isi chat mein send kare (.savedp)',
+    usage: 'savedp (@user / ID / number / reply)',
     cooldownSeconds: 2,
     execute: async (ctx) => {
       if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
         const msg =
-          'Mention, reply, or pass a user ID/number with `.dpsave` (or `.savedp`) on WhatsApp to save their profile DP to your IB.';
+          'Mention, reply, or pass a user ID/number with `.savedp` (or `.dpsave`) on WhatsApp to send their profile DP here.';
         await ctx.reply(msg);
         return msg;
       }
@@ -852,7 +880,7 @@ export const mediaCommands: BotCommand[] = [
         if (peer) candidates.push(normalizeBareJid(peer));
       }
       if (candidates.length === 0) {
-        const msg = `Mention a user, reply to their message, or pass an ID/number.\nUsage: \`${ctx.prefix}dpsave @user\` or \`${ctx.prefix}dpsave 923001234567\``;
+        const msg = `Mention a user, reply to their message, or pass an ID/number.\nUsage: \`${ctx.prefix}savedp @user\` or \`${ctx.prefix}savedp 923001234567\``;
         await ctx.reply(msg);
         return msg;
       }
@@ -866,15 +894,6 @@ export const mediaCommands: BotCommand[] = [
           // Keep original JID if LID lookup unavailable
         }
       }
-
-      const cfg = loadConfig();
-      const ownBotPhone = normalizePhone(jidUserPart(ctx.sock.user?.id));
-      const senderPhone = normalizePhone(ctx.senderNumber);
-      const targetDmPhone =
-        ctx.msg.key?.fromMe && ownBotPhone
-          ? ownBotPhone
-          : senderPhone || ownBotPhone || cfg.ownerNumber;
-      const targetDm = `${targetDmPhone}@s.whatsapp.net`;
 
       try {
         let ppUrl: string | undefined;
@@ -898,19 +917,20 @@ export const mediaCommands: BotCommand[] = [
         }
         const buf = Buffer.from(await res.arrayBuffer());
         const targetLabel = jidUserPart(targetJid);
-        await ctx.sock.sendMessage(targetDm, {
-          image: buf,
-          caption: `*Saved Profile DP*\n• User: +${targetLabel}`,
-        });
-        if (targetDm !== ctx.chatId) {
-          await ctx.reply(`Saved profile DP of +${targetLabel} to your IB!`);
-        }
-        return `Saved DP of +${targetLabel} to IB.`;
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            image: buf,
+            caption: `*Profile DP*\n• User: +${targetLabel}`,
+          },
+          { quoted: ctx.msg }
+        );
+        return `Sent profile DP of +${targetLabel} in chat.`;
       } catch (err) {
         const errMsg = (err as Error).message || 'Profile photo hidden or unavailable.';
         const msg = /item-not-found|401|404/i.test(errMsg)
           ? `Could not fetch DP for +${jidUserPart(targetJid)} (privacy hidden or no DP set).`
-          : `DPSave failed: ${errMsg}`;
+          : `Savedp failed: ${errMsg}`;
         await ctx.reply(msg);
         return msg;
       }
@@ -1082,8 +1102,323 @@ export const mediaCommands: BotCommand[] = [
       return `Sent vCard contact for ${safeVcardName} (+${cleanPhone}).`;
     },
   },
+  {
+    name: 'roast',
+    aliases: ['burn', 'tease'],
+    category: 'media',
+    description: 'Mentioned ya replied user ko halka-phulka funny aur friendly roast kare',
+    usage: 'roast [@user | name | reply]',
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      const targets = extractRawTargetCandidates(ctx.msg, ctx.args);
+      const targetJid = targets[0] || '';
+      const cleanedArgs = ctx.args.filter((a) => !a.startsWith('@') && !/^\+?\d{7,15}$/.test(a));
+      const targetNum = targetJid ? jidUserPart(targetJid) : '';
+      const targetName =
+        (targetJid ? lookupKnownUserName(targetJid) : '') ||
+        cleanedArgs.join(' ').trim() ||
+        (targetNum ? `+${targetNum}` : ctx.pushName || 'Dost');
+
+      const fallbackRoasts = [
+        `Bhai ${targetName}, aapka Wi-Fi bhi aapke plans se zyada stable lagta hai! 😂`,
+        `${targetName}, itna slow reply karte ho ke WhatsApp khud "Last seen last year" likhne wala hai! 😅`,
+        `${targetName}, aapka alarm subah bajta hai toh phone bhi bolta hai "Rehne de bhai, kal uthna". ⏰😂`,
+        `${targetName}, group mein aapki entry aisi hoti hai jaise charger 1% par lagaya ho! ⚡😄`,
+        `${targetName}, itne serious mat bano — Google bhi kabhi kabhi "Did you mean..." puch leta hai! 🤣`,
+      ];
+
+      let roastLine = fallbackRoasts[Math.floor(Math.random() * fallbackRoasts.length)];
+      if (isGeminiConfigured()) {
+        try {
+          roastLine = await generatePlayfulRoast(targetName);
+        } catch {
+          // Use playful fallback if Gemini request temporarily fails
+        }
+      }
+
+      const headerTag = targetNum ? `@${targetNum}` : `*${targetName}*`;
+      const output = `🔥 ${headerTag}\n${roastLine}`;
+      if (ctx.sock && !ctx.isSimulated && targetJid) {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          { text: output, mentions: [targetJid] },
+          { quoted: ctx.msg ?? undefined }
+        );
+      } else {
+        await ctx.reply(output);
+      }
+      return output;
+    },
+  },
+  {
+    name: 'factcheck',
+    aliases: ['verify', 'fc'],
+    category: 'media',
+    description: 'AI ke zariye kisi claim ya replied message ki haqeeqat aur misinformation check kare',
+    usage: 'factcheck <claim> (or reply to a message)',
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const claim = ctx.text.trim() || quotedText;
+
+      if (!claim) {
+        const msg = `Reply to a message or enter a claim.\nExample: \`${ctx.prefix}factcheck Drinking warm water cures every virus\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const analysis = await generateFactCheckReply(claim);
+        const output = `🧐 *AI Fact-Check*\n\n${analysis}`;
+        await ctx.reply(output);
+        return output;
+      } catch (err) {
+        const msg = `Fact-check failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'summarize',
+    aliases: ['tldr', 'summary', 'recap'],
+    category: 'media',
+    description: 'Group ki recent chat history (50–100+ messages) ka concise AI summary banaye',
+    usage: 'summarize [count]',
+    groupOnly: true,
+    cooldownSeconds: 6,
+    execute: async (ctx) => {
+      const requested = ctx.args[0] ? Number(ctx.args[0]) : 60;
+      const count =
+        Number.isFinite(requested) && requested >= 10
+          ? Math.min(120, Math.floor(requested))
+          : 60;
+
+      const messages = getRecentChatMessages(ctx.chatId, count);
+      if (messages.length < 3) {
+        const msg = `Not enough recent messages captured in this group yet (${messages.length}/3 minimum). Send a few chat messages and try \`${ctx.prefix}summarize\` again.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const transcript = messages
+        .map((m) => `${m.senderName}: ${m.text}`)
+        .join('\n');
+
+      try {
+        const summary = await generateGroupSummary(transcript, messages.length);
+        const output = `📝 *Chat Summary (Last ${messages.length} messages)*\n\n${summary}`;
+        await ctx.reply(output);
+        return output;
+      } catch (err) {
+        const msg = `Summarize failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'grammar',
+    aliases: ['fixgrammar', 'spellcheck'],
+    category: 'media',
+    description: 'Text ya replied message ki grammar, spelling aur phrasing AI se sahi kare',
+    usage: 'grammar <text> (or reply to a message)',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const input = ctx.text.trim() || quotedText;
+
+      if (!input) {
+        const msg = `Reply to a message or pass text.\nExample: \`${ctx.prefix}grammar i goes to school yesterday\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const result = await generateGrammarCorrection(input);
+        const output = `✍️ *Grammar & Phrasing Check*\n\n${result}`;
+        await ctx.reply(output);
+        return output;
+      } catch (err) {
+        const msg = `Grammar check failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'checklink',
+    aliases: ['scanlink', 'urlcheck', 'safetycheck'],
+    category: 'media',
+    description: 'Kisi URL ke redirects trace kar ke phishing, spoofing aur safety risk check kare',
+    usage: 'checklink <url> (or reply to a message containing a link)',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const quotedText = ctx.msg ? extractBodyText(extractQuotedMessage(ctx.msg) || undefined) : '';
+      const rawUrl = extractFirstValidUrl(ctx.text || quotedText);
+      if (!rawUrl) {
+        const msg = `Provide a link or reply to a message with a link.\nExample: \`${ctx.prefix}checklink https://example.com\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const report = await inspectUrlSafety(rawUrl);
+      await ctx.reply(report);
+      return report;
+    },
+  },
   ...createSocialDownloaderCommands(),
 ];
+
+function isPrivateOrLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  if (h === 'localhost' || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
+  if (h === '::1' || h.startsWith('[::1]')) return true;
+  return false;
+}
+
+async function inspectUrlSafety(initialUrl: string): Promise<string> {
+  let currentUrl: URL;
+  try {
+    currentUrl = new URL(initialUrl);
+  } catch {
+    return `⚠️ *Invalid URL:* Could not parse \`${initialUrl}\`.`;
+  }
+
+  const findings: string[] = [];
+  let riskScore = 0;
+
+  if (currentUrl.protocol !== 'https:') {
+    riskScore += 2;
+    findings.push(`Uses unencrypted *${currentUrl.protocol.replace(':', '').toUpperCase()}* instead of HTTPS.`);
+  }
+
+  const host = currentUrl.hostname.toLowerCase();
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.startsWith('[')) {
+    riskScore += 3;
+    findings.push('Host is a raw IP address rather than a registered domain.');
+  }
+  if (host.includes('xn--')) {
+    riskScore += 3;
+    findings.push('Contains Punycode (`xn--`) which can be used for look-alike domain spoofing.');
+  }
+
+  const shorteners = new Set([
+    'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'cutt.ly', 'rb.gy', 'ow.ly', 'shorturl.at',
+  ]);
+  if (shorteners.has(host)) {
+    riskScore += 1;
+    findings.push(`URL shortener detected (*${host}*). Tracing redirect target...`);
+  }
+
+  const riskyTlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.top', '.xyz', '.zip', '.mov', '.click', '.work'];
+  if (riskyTlds.some((tld) => host.endsWith(tld))) {
+    riskScore += 2;
+    findings.push(`Uses high-risk or commonly abused TLD (*${host.slice(host.lastIndexOf('.'))}*).`);
+  }
+
+  if (
+    /whatsapp|paypal|binance|facebook|instagram|google|apple|amazon|bank|verify|login|free-?nitro|claim|airdrop/i.test(
+      host + currentUrl.pathname
+    ) &&
+    !/(^|\.)(whatsapp\.com|whatsapp\.net|facebook\.com|instagram\.com|google\.com|youtube\.com|apple\.com|amazon\.com|paypal\.com|binance\.com|github\.com)$/i.test(
+      host
+    )
+  ) {
+    riskScore += 3;
+    findings.push('Domain or path mimics a sensitive brand/login or giveaway lure.');
+  }
+
+  if (currentUrl.username || currentUrl.password || currentUrl.href.includes('@')) {
+    riskScore += 3;
+    findings.push('Contains `@` or embedded credentials in URL (classic spoofing technique).');
+  }
+
+  const chain: string[] = [currentUrl.toString()];
+  let finalUrl = currentUrl.toString();
+  let httpStatus = 'Not queried';
+
+  if (isPrivateOrLoopbackHost(host)) {
+    riskScore += 4;
+    findings.push('Points to a private/loopback internal network address (blocked from probing).');
+  } else {
+    let cursor = currentUrl.toString();
+    for (let hop = 0; hop < 5; hop += 1) {
+      try {
+        const parsedHop = new URL(cursor);
+        if (isPrivateOrLoopbackHost(parsedHop.hostname)) {
+          riskScore += 4;
+          findings.push(`Redirected into private/local host (*${parsedHop.hostname}*).`);
+          break;
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3500);
+        const res = await fetch(cursor, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LinkSafetyCheck/1.0)' },
+        });
+        clearTimeout(timer);
+        httpStatus = `HTTP ${res.status}`;
+        void res.body?.cancel().catch(() => {});
+
+        const location = res.headers.get('location');
+        if (location && res.status >= 300 && res.status < 400) {
+          const nextUrl = new URL(location, cursor).toString();
+          chain.push(nextUrl);
+          cursor = nextUrl;
+          finalUrl = nextUrl;
+        } else {
+          break;
+        }
+      } catch (err) {
+        httpStatus = `Unreachable (${(err as Error).name === 'AbortError' ? 'Timeout' : 'Network error'})`;
+        break;
+      }
+    }
+  }
+
+  if (chain.length > 2) {
+    riskScore += 1;
+    findings.push(`Followed *${chain.length - 1}* HTTP redirect(s) to final destination.`);
+  }
+
+  const finalHost = (() => {
+    try {
+      return new URL(finalUrl).hostname.toLowerCase();
+    } catch {
+      return host;
+    }
+  })();
+
+  if (finalHost !== host && riskyTlds.some((tld) => finalHost.endsWith(tld))) {
+    riskScore += 2;
+    findings.push(`Final destination domain (*${finalHost}*) uses a suspicious TLD.`);
+  }
+
+  const verdict =
+    riskScore >= 4
+      ? '🔴 *HIGH RISK / SUSPICIOUS*'
+      : riskScore >= 2
+        ? '🟡 *CAUTION ADVISED*'
+        : '🟢 *LOOKS SAFE (Low Risk)*';
+
+  return [
+    `🔎 *Link Safety Inspection*`,
+    `• Verdict: ${verdict}`,
+    `• Submitted Host: \`${host}\``,
+    `• Final Destination: ${finalUrl}`,
+    `• Probe Status: ${httpStatus} (${chain.length - 1} redirect${chain.length - 1 === 1 ? '' : 's'})`,
+    ...(findings.length > 0
+      ? ['', '*Signals Found:*', ...findings.map((f) => `• ${f}`)]
+      : ['', '• No common phishing, IP-literal, punycode, or HTTP downgrade red flags detected.']),
+  ].join('\n');
+}
 
 async function runSocialDownloaderCommand(
   ctx: CommandContext,

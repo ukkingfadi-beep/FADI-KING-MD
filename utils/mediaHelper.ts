@@ -23,6 +23,7 @@ import {
   unwrapMessage,
 } from './jidHelper.ts';
 import { isGeminiConfigured, synthesizePakistaniFemaleTts } from './geminiService.ts';
+import { logger } from './logger.ts';
 
 const execFileAsync = promisify(execFile);
 const silentLogger = pino({ level: 'silent' });
@@ -51,7 +52,7 @@ export function extractQuotedMessage(msg: WAMessage): proto.IMessage | null {
 
 export function isViewOnceMediaMessage(message: proto.IMessage | null | undefined): boolean {
   let current: proto.IMessage | undefined = message || undefined;
-  for (let depth = 0; depth < 6 && current; depth += 1) {
+  for (let depth = 0; depth < 8 && current; depth += 1) {
     if (
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
@@ -70,6 +71,10 @@ export function isViewOnceMediaMessage(message: proto.IMessage | null | undefine
     const next: proto.IMessage | null | undefined =
       current.ephemeralMessage?.message ||
       current.documentWithCaptionMessage?.message ||
+      current.deviceSentMessage?.message ||
+      current.botInvokeMessage?.message ||
+      current.groupStatusMessage?.message ||
+      current.groupStatusMessageV2?.message ||
       current.associatedChildMessage?.message;
     if (!next) break;
     current = next;
@@ -80,13 +85,17 @@ export function isViewOnceMediaMessage(message: proto.IMessage | null | undefine
 export function unwrapViewOnce(message: proto.IMessage | null | undefined): proto.IMessage | null {
   if (!message) return null;
   let current: proto.IMessage | undefined = message;
-  for (let depth = 0; depth < 6 && current; depth += 1) {
+  for (let depth = 0; depth < 8 && current; depth += 1) {
     const next: proto.IMessage | null | undefined =
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
       current.viewOnceMessageV2Extension?.message ||
       current.ephemeralMessage?.message ||
       current.documentWithCaptionMessage?.message ||
+      current.deviceSentMessage?.message ||
+      current.botInvokeMessage?.message ||
+      current.groupStatusMessage?.message ||
+      current.groupStatusMessageV2?.message ||
       current.associatedChildMessage?.message;
     if (!next) break;
     current = next;
@@ -113,8 +122,18 @@ function toBinaryBuffer(val: unknown): Uint8Array | undefined {
       return undefined;
     }
   }
-  if (typeof val === 'object' && Array.isArray((val as { data?: number[] }).data)) {
-    return Uint8Array.from((val as { data: number[] }).data);
+  if (typeof val === 'object') {
+    const obj = val as { data?: number[] } & Record<string, unknown>;
+    if (Array.isArray(obj.data)) {
+      return Uint8Array.from(obj.data);
+    }
+    if ('0' in obj) {
+      const nums: number[] = [];
+      for (let i = 0; String(i) in obj; i += 1) {
+        nums.push(Number(obj[String(i)] || 0));
+      }
+      if (nums.length > 0) return Uint8Array.from(nums);
+    }
   }
   return undefined;
 }
@@ -315,6 +334,77 @@ export async function waitForViewOnceInflight(msgId: string): Promise<void> {
   }
 }
 
+function serializeMediaFieldsForDisk(inner: proto.IMessage): Record<string, unknown> | null {
+  for (const field of ['imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage'] as const) {
+    const m = inner[field];
+    if (!m) continue;
+    const keyBuf = toBinaryBuffer(m.mediaKey);
+    const encSha = toBinaryBuffer(m.fileEncSha256);
+    const sha = toBinaryBuffer(m.fileSha256);
+    return {
+      field,
+      payload: {
+        url: typeof m.url === 'string' ? m.url : undefined,
+        directPath: typeof m.directPath === 'string' ? m.directPath : undefined,
+        mimetype: typeof m.mimetype === 'string' ? m.mimetype : undefined,
+        caption: 'caption' in m && typeof m.caption === 'string' ? m.caption : undefined,
+        ptt: 'ptt' in m ? m.ptt : undefined,
+        seconds: 'seconds' in m ? m.seconds : undefined,
+        mediaKey: keyBuf ? Buffer.from(keyBuf).toString('base64') : undefined,
+        fileEncSha256: encSha ? Buffer.from(encSha).toString('base64') : undefined,
+        fileSha256: sha ? Buffer.from(sha).toString('base64') : undefined,
+        viewOnce: true,
+      },
+    };
+  }
+  return null;
+}
+
+async function persistViewOnceMetaToDisk(msg: WAMessage, inner: proto.IMessage): Promise<void> {
+  const msgId = msg.key?.id;
+  if (!msgId) return;
+  const serialized = serializeMediaFieldsForDisk(inner);
+  if (!serialized) return;
+  try {
+    const dir = getViewOnceDiskDir();
+    const id = safeCacheId(msgId);
+    const origPath = path.join(dir, `${id}.orig.json`);
+    await fs.promises.writeFile(
+      origPath,
+      JSON.stringify({ key: msg.key, ...serialized, savedAt: Date.now() }),
+      'utf-8'
+    );
+  } catch {
+    // Non-fatal metadata persistence error
+  }
+}
+
+export function getCachedViewOnceMeta(msgId: string): WAMessage | undefined {
+  if (!msgId) return undefined;
+  try {
+    const dir = getViewOnceDiskDir();
+    const id = safeCacheId(msgId);
+    const origPath = path.join(dir, `${id}.orig.json`);
+    if (!fs.existsSync(origPath)) return undefined;
+    const raw = JSON.parse(fs.readFileSync(origPath, 'utf-8')) as {
+      key?: WAMessage['key'];
+      field?: 'imageMessage' | 'videoMessage' | 'ptvMessage' | 'audioMessage';
+      payload?: Record<string, unknown>;
+    };
+    if (!raw?.field || !raw?.payload) return undefined;
+    const p = { ...raw.payload };
+    if (typeof p.mediaKey === 'string') p.mediaKey = Buffer.from(p.mediaKey, 'base64');
+    if (typeof p.fileEncSha256 === 'string') p.fileEncSha256 = Buffer.from(p.fileEncSha256, 'base64');
+    if (typeof p.fileSha256 === 'string') p.fileSha256 = Buffer.from(p.fileSha256, 'base64');
+    return {
+      key: raw.key || { id: msgId },
+      message: { [raw.field]: p } as proto.IMessage,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export async function precacheViewOnceMedia(
   sock: WASocket,
   msg: WAMessage
@@ -334,13 +424,34 @@ export async function precacheViewOnceMedia(
   const mediaType = detectMediaType(inner);
   if (mediaType !== 'image' && mediaType !== 'video' && mediaType !== 'audio') return;
 
+  // Immediately persist raw mediaKey/directPath metadata so restarts never lose it
+  void persistViewOnceMetaToDisk(msg, inner);
+
   const task = (async () => {
     try {
-      const buf = await downloadMessageMedia(sock, {
-        key: msg.key,
-        message: inner,
-      });
-      if (!buf || buf.length === 0 || buf.length > MAX_VIEW_ONCE_CACHE_BYTES) return;
+      let buf: Buffer | null = null;
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          buf = await downloadMessageMedia(sock, {
+            key: msg.key,
+            message: inner,
+          });
+          if (buf && buf.length > 0) break;
+        } catch (err) {
+          lastErr = err;
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 900));
+          }
+        }
+      }
+      if (!buf || buf.length === 0) {
+        if (lastErr) {
+          logger.warn('viewOnce', `Precache download deferred for ${msgId}: ${(lastErr as Error).message}`);
+        }
+        return;
+      }
+      if (buf.length > MAX_VIEW_ONCE_CACHE_BYTES) return;
 
       const entry: CachedViewOnceEntry = {
         type: mediaType,
@@ -373,8 +484,8 @@ export async function precacheViewOnceMedia(
       }
 
       void persistViewOnceToDisk(msgId, entry);
-    } catch {
-      // Fallback to live download / reupload on .vv invocation
+    } catch (err) {
+      logger.warn('viewOnce', `Precache error for ${msgId}: ${(err as Error).message}`);
     } finally {
       viewOnceInflight.delete(msgId);
     }

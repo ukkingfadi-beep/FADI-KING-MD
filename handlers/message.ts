@@ -13,10 +13,13 @@ import {
   resolveSenderInfo,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { recordChatMessage } from '../utils/chatHistoryStore.ts';
 import { commandRateLimiter, getRandomDelayMs } from '../utils/rateLimiter.ts';
+import { formatDurationHuman } from '../utils/reminderStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import {
   dispatchOpenGcProtectedPost,
+  enforceAdvancedGroupGuards,
   enforceAntilink,
   enforceAntiScam,
   enforceAntiStatusMention,
@@ -26,6 +29,79 @@ import {
 const AUTO_REACT_EMOJIS = ['❤️', '🔥', '👍', '😂', '😮', '✨', '💯', '🤩', '👏', '🥳'];
 
 const processedMsgIds = new Set<string>();
+const afkNoticeCooldown = new Map<string, number>();
+
+async function notifyIfMentionedAfk(
+  sock: WASocket,
+  msg: WAMessage,
+  chatId: string,
+  senderCandidates: string[]
+): Promise<void> {
+  if (msg.key.fromMe) return;
+  const ctxInfo = extractContextInfo(msg.message);
+  if (!ctxInfo) return;
+
+  const targetJids = new Set<string>();
+  if (Array.isArray(ctxInfo.mentionedJid)) {
+    for (const j of ctxInfo.mentionedJid) {
+      const bare = normalizeBareJid(j);
+      if (bare) targetJids.add(bare);
+    }
+  }
+  if (ctxInfo.participant) {
+    const bare = normalizeBareJid(ctxInfo.participant);
+    if (bare) targetJids.add(bare);
+  }
+  if (targetJids.size === 0) return;
+
+  const senderParts = new Set(senderCandidates.map((c) => jidUserPart(c)));
+  const botParts = new Set((await getBotJids(sock)).map((j) => jidUserPart(j)));
+
+  for (const jid of targetJids) {
+    const candidates = [jid];
+    if (jid.endsWith('@lid') && sock.signalRepository?.lidMapping?.getPNForLID) {
+      try {
+        const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+        if (pn) candidates.push(normalizeBareJid(pn));
+      } catch {
+        // Ignore missing LID mapping
+      }
+    }
+    if (candidates.some((c) => senderParts.has(jidUserPart(c)) || botParts.has(jidUserPart(c)))) {
+      continue;
+    }
+
+    const afkEntry = vipStore.findAfkUser(candidates);
+    if (!afkEntry) continue;
+
+    const cdKey = `${chatId}:${afkEntry.number}`;
+    const now = Date.now();
+    if (now - (afkNoticeCooldown.get(cdKey) || 0) < 20_000) continue;
+    afkNoticeCooldown.set(cdKey, now);
+    if (afkNoticeCooldown.size > 400) {
+      const oldest = afkNoticeCooldown.keys().next().value;
+      if (oldest) afkNoticeCooldown.delete(oldest);
+    }
+
+    const mentionJid = afkEntry.jid || `${afkEntry.number}@s.whatsapp.net`;
+    const awayDur = formatDurationHuman(Math.max(1000, now - afkEntry.since));
+    await sock
+      .sendMessage(
+        chatId,
+        {
+          text: [
+            `💤 *@${afkEntry.number} is currently AFK*`,
+            `• Reason: ${afkEntry.reason || 'Away from keyboard'}`,
+            `• Away for: ${awayDur}`,
+          ].join('\n'),
+          mentions: [mentionJid],
+        },
+        { quoted: msg }
+      )
+      .catch(() => {});
+    break;
+  }
+}
 
 function markProcessed(id: string | undefined | null): boolean {
   if (!id) return true;
@@ -110,6 +186,15 @@ export async function handleIncomingMessage(
         isOwner
       );
       if (scamBlocked) return;
+
+      const advancedBlocked = await enforceAdvancedGroupGuards(
+        sock,
+        msg,
+        chatId,
+        senderCandidates,
+        isOwner
+      );
+      if (advancedBlocked) return;
     }
 
     // Auto-React on incoming messages when enabled (disabled in Single Tick Shield & non-owner Private mode)
@@ -142,7 +227,15 @@ export async function handleIncomingMessage(
     const activePrefix = cfg.prefix;
     const supportedPrefixes = Array.from(new Set([activePrefix, '.', '/']));
     const matchedPrefix = supportedPrefixes.find((p) => body.startsWith(p));
+
+    if (!msg.key.fromMe) {
+      void notifyIfMentionedAfk(sock, msg, chatId, senderCandidates);
+    }
+
     if (!matchedPrefix) {
+      if (isGroup && body) {
+        recordChatMessage(chatId, senderJid, msg.pushName || `+${senderNumber}`, body);
+      }
       // If Owner has Auto-IB-Forward enabled and posts a non-command link/text inside the Bot's own IB,
       // dispatch it automatically to all Open GCs with Anti-Delete Lock!
       if (!isGroup && isOwner && cfg.autoForwardIbToOpenGcs) {

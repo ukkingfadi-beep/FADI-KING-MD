@@ -95,3 +95,45 @@ export async function synthesizePakistaniFemaleTts(rawText: string): Promise<Buf
   }
   return Buffer.from(base64Audio, 'base64');
 }
+
+async function runGeminiTextTask(systemInstruction: string, prompt: string): Promise<string> {
+  const ai = getGeminiClient();
+  const response = await ai.models.generateContent({
+    model: 'gemini-4-hydrogen',
+    contents: [{ role: 'user', parts: [{ text: prompt.slice(0, 12_000) }] }],
+    config: { systemInstruction },
+  });
+  const text = (response.text || '').trim();
+  if (!text) {
+    throw new Error('AI model returned an empty response.');
+  }
+  return text;
+}
+
+export async function generateFactCheckReply(claim: string): Promise<string> {
+  return runGeminiTextTask(
+    'You are an objective fact-checker for WhatsApp chats. Evaluate the claim clearly using WhatsApp markdown. Start with a bold Verdict (Likely True / Misleading / False / Needs Context / Unverified), then give 2-3 concise bullet points explaining why and noting any misinformation risks. Keep total output under 180 words.',
+    `Fact-check this claim:\n${claim}`
+  );
+}
+
+export async function generateGroupSummary(transcript: string, msgCount: number): Promise<string> {
+  return runGeminiTextTask(
+    'You summarize WhatsApp group chat conversations clearly in concise bullet points. Highlight main topics discussed, key decisions/questions, and important updates. Match the dominant language (English/Urdu/Roman Urdu) and keep total output under 220 words.',
+    `Summarize these recent ${msgCount} group messages:\n\n${transcript}`
+  );
+}
+
+export async function generateGrammarCorrection(text: string): Promise<string> {
+  return runGeminiTextTask(
+    'You are an expert English and Urdu/Roman Urdu editor. Check the text for grammar, spelling, punctuation, and clarity. Return:\n1) *Corrected Version:* (clean corrected text)\n2) *Notes:* (1-3 short bullet points on key fixes made, or "No errors found" if already clean). Keep concise for WhatsApp.',
+    `Check and correct grammar/spelling/phrasing:\n${text}`
+  );
+}
+
+export async function generatePlayfulRoast(targetName: string): Promise<string> {
+  return runGeminiTextTask(
+    'Write a short, witty, playful, lighthearted roast (2-3 sentences max) about the named friend for a WhatsApp group. Keep it clever, funny, and strictly friendly/non-abusive (no slurs, hate, profanity, or harassment).',
+    `Roast "${targetName}" playfully.`
+  );
+}

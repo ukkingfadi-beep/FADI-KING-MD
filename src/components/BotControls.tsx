@@ -46,6 +46,7 @@ const DEFAULT_BOT_CONFIG_FORM: BotConfigView = {
   autoReact: false,
   aiEnabled: false,
   singleTick: false,
+  alwaysOnline: false,
   stickerPack: 'FADI KING MD',
   stickerAuthor: 'VIP BOT',
   menuImageUrl: '/assets/aistudio/IMG-20261114-WA0040_492a0008_492a0008.jpg',
@@ -111,6 +112,7 @@ function normalizeBotConfigForm(cfg: Partial<BotConfigView>): BotConfigView {
     autoReact: Boolean(cfg.autoReact ?? DEFAULT_BOT_CONFIG_FORM.autoReact),
     aiEnabled: Boolean(cfg.aiEnabled ?? DEFAULT_BOT_CONFIG_FORM.aiEnabled),
     singleTick: Boolean(cfg.singleTick ?? DEFAULT_BOT_CONFIG_FORM.singleTick),
+    alwaysOnline: Boolean(cfg.alwaysOnline ?? DEFAULT_BOT_CONFIG_FORM.alwaysOnline),
     stickerPack:
       typeof cfg.stickerPack === 'string' ? cfg.stickerPack : DEFAULT_BOT_CONFIG_FORM.stickerPack,
     stickerAuthor:
@@ -258,8 +260,19 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
 
   async function toggleGroupSetting(
     groupId: string,
-    field: 'welcome' | 'goodbye' | 'antiScam' | 'antiStatusMention' | 'aiEnabled',
-    value: boolean
+    field:
+      | 'welcome'
+      | 'goodbye'
+      | 'antiScam'
+      | 'antiStatusMention'
+      | 'aiEnabled'
+      | 'antiAdd'
+      | 'antiForward'
+      | 'antiMedia'
+      | 'antiSticker'
+      | 'antiBot'
+      | 'slowModeSeconds',
+    value: boolean | number
   ) {
     await fetch(`/api/groups/${encodeURIComponent(groupId)}`, {
       method: 'PATCH',
@@ -776,6 +789,16 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 />
                 Single Tick Shield (Suppress Blue Ticks & Presence — WA Ban Risk)
               </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.alwaysOnline}
+                  onChange={(e) => updateForm({ alwaysOnline: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Always Online (.alwaysonline on/off)
+              </label>
             </div>
 
             <button
@@ -904,6 +927,51 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                       >
                         AI Chat: {Boolean(g.aiEnabled) ? 'On' : 'Off'}
                       </button>
+
+                      {(['antiAdd', 'antiForward', 'antiMedia', 'antiSticker', 'antiBot'] as const).map(
+                        (field) => {
+                          const labels: Record<typeof field, string> = {
+                            antiAdd: 'Anti-Add',
+                            antiForward: 'Anti-Forward',
+                            antiMedia: 'Anti-Media',
+                            antiSticker: 'Anti-Sticker',
+                            antiBot: 'Anti-Bot',
+                          };
+                          const active = Boolean(g[field]);
+                          return (
+                            <button
+                              key={field}
+                              type="button"
+                              onClick={() => toggleGroupSetting(g.groupId, field, !active)}
+                              className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                                active
+                                  ? 'bg-emerald-600 text-white'
+                                  : 'bg-white/[0.06] text-[#9E97C2]'
+                              }`}
+                            >
+                              {labels[field]}: {active ? 'On' : 'Off'}
+                            </button>
+                          );
+                        }
+                      )}
+
+                      <select
+                        value={String(g.slowModeSeconds ?? 0)}
+                        onChange={(e) =>
+                          toggleGroupSetting(g.groupId, 'slowModeSeconds', Number(e.target.value))
+                        }
+                        aria-label={`Slow mode for ${g.groupId}`}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border border-white/[0.1] focus:outline-none cursor-pointer ${
+                          (g.slowModeSeconds ?? 0) > 0
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-[#0A0714] text-[#9E97C2]'
+                        }`}
+                      >
+                        <option value="0">Slow Mode: Off</option>
+                        <option value="10">Slow Mode: 10s</option>
+                        <option value="30">Slow Mode: 30s</option>
+                        <option value="60">Slow Mode: 60s</option>
+                      </select>
 
                       {(['welcome', 'goodbye'] as const).map((field) => (
                         <button

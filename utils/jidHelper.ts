@@ -98,7 +98,8 @@ export function hasValidMediaPayload(
       ((key instanceof Uint8Array && key.length > 0) ||
         (Buffer.isBuffer(key) && key.length > 0) ||
         (typeof key === 'string' && key.length > 0) ||
-        (typeof key === 'object' && Array.isArray((key as { data?: number[] }).data)))
+        (typeof key === 'object' && Array.isArray((key as { data?: number[] }).data) && (key as { data: number[] }).data.length > 0) ||
+        (typeof key === 'object' && !Array.isArray(key) && '0' in (key as Record<string, unknown>)))
   );
   return hasUrlOrPath && hasKey;
 }
@@ -329,13 +330,17 @@ export function unwrapMessage(
 ): proto.IMessage | undefined {
   if (!message) return undefined;
   let current: proto.IMessage | undefined = message;
-  for (let depth = 0; depth < 6 && current; depth += 1) {
+  for (let depth = 0; depth < 8 && current; depth += 1) {
     const next: proto.IMessage | null | undefined =
       current.ephemeralMessage?.message ||
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
       current.viewOnceMessageV2Extension?.message ||
       current.documentWithCaptionMessage?.message ||
+      current.deviceSentMessage?.message ||
+      current.botInvokeMessage?.message ||
+      current.groupStatusMessage?.message ||
+      current.groupStatusMessageV2?.message ||
       current.editedMessage?.message?.protocolMessage?.editedMessage ||
       current.associatedChildMessage?.message;
     if (!next) break;

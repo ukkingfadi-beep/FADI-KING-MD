@@ -2,7 +2,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { loadConfig, saveConfig } from '../config/bot.config.ts';
+import { getBotSnapshot } from '../handlers/connection.ts';
 import { liveStore } from '../utils/liveStore.ts';
+import { addReminder, formatDurationHuman, parseDurationMs } from '../utils/reminderStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand, CommandCategory } from './types.ts';
 import { getAllCommands } from './index.ts';
@@ -110,6 +112,31 @@ const commandEmojiMap: Record<string, string> = {
   info: 'ℹ️',
   calc: '🧮',
   qr: '📷',
+  rejectall: '❌',
+  approveall: '✅',
+  antiadd: '🚷',
+  antiforward: '⛔',
+  antimedia: '📵',
+  antisticker: '🚫',
+  alwaysonline: '🟢',
+  clearchat: '🧹',
+  blocklist: '📛',
+  roast: '🔥',
+  botinfo: '📊',
+  antibot: '🤖',
+  muteuser: '🔇',
+  unmuteuser: '🔊',
+  factcheck: '🧐',
+  summarize: '📝',
+  grammar: '✍️',
+  reminder: '⏰',
+  giveaway: '🎁',
+  afkon: '💤',
+  afkoff: '⚡',
+  clearwarn: '🧽',
+  slowmode: '🐢',
+  checklink: '🔎',
+  pollcreate: '🗳️',
 };
 
 export async function resolveMenuImageBuffer(configuredUrl: string): Promise<Buffer | null> {
@@ -535,6 +562,137 @@ export const generalCommands: BotCommand[] = [
 
       await ctx.reply(output);
       return output;
+    },
+  },
+  {
+    name: 'botinfo',
+    aliases: ['stats', 'sysinfo', 'health'],
+    category: 'general',
+    description: 'Bot ki uptime, active groups/chats, RAM, CPU load aur version stats dikhaye',
+    usage: 'botinfo',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const cfg = loadConfig();
+      const snap = getBotSnapshot();
+      const mem = process.memoryUsage();
+      const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+      const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+      const loadAvg = os.loadavg();
+      const cpuCores = os.cpus()?.length || 1;
+      const connectedSubs = snap.subSessions.filter((s) => s.status === 'connected').length;
+
+      let activeGroupsCount: string = String(vipStore.listGroupConfigs().length);
+      if (ctx.sock && !ctx.isSimulated) {
+        try {
+          const allGroups = await ctx.sock.groupFetchAllParticipating();
+          activeGroupsCount = String(Object.keys(allGroups || {}).length);
+        } catch {
+          // Keep cached config count if group list fetch fails
+        }
+      }
+
+      const output = [
+        `📊 *${cfg.botName || 'FADI KING MD'} — System & Bot Health*`,
+        `• Version: *v2.5 MD* | Prefix: \`${cfg.prefix}\``,
+        `• Mode: *${cfg.mode === 'self' ? 'PRIVATE (Owner)' : 'PUBLIC'}*`,
+        `• Uptime: *${formatUptime(process.uptime())}*`,
+        `• Active Groups: *${activeGroupsCount}*`,
+        `• Connected Sessions: *${(snap.status === 'connected' ? 1 : 0) + connectedSubs}*`,
+        `• Total Commands: *${getAllCommands().length}*`,
+        `• Memory Usage: *${rssMb} MB RSS* (${heapMb} MB Heap)`,
+        `• CPU Load (1m/5m): *${loadAvg[0].toFixed(2)} / ${loadAvg[1].toFixed(2)}* (${cpuCores} cores)`,
+        `• Platform: ${os.platform()} ${os.arch()} (Node ${process.version})`,
+        `• Owner: ${cfg.ownerName || 'FADI KING'} (+${cfg.ownerNumber})`,
+      ].join('\n');
+
+      await ctx.reply(output);
+      return output;
+    },
+  },
+  {
+    name: 'reminder',
+    aliases: ['remind', 'remindme', 'alarm'],
+    category: 'general',
+    description: 'Persistent reminder set kare jo server restart ke baad bhi waqt par mention kare',
+    usage: 'reminder <duration> <message> (e.g. .reminder 30m Check logs)',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const durationToken = ctx.args[0]?.trim() || '';
+      const messageText = ctx.args.slice(1).join(' ').trim();
+
+      if (!durationToken || !messageText) {
+        const msg = `Usage: \`${ctx.prefix}reminder <duration> <message>\`\nExamples:\n• \`${ctx.prefix}reminder 10m Check WhatsApp messages\`\n• \`${ctx.prefix}reminder 1h30m Restart backup\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const delayMs = parseDurationMs(durationToken);
+      if (!delayMs) {
+        const msg = `Invalid duration \`${durationToken}\`. Use formats like \`30s\`, \`10m\`, \`2h\`, \`1d\`, or \`1h30m\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const reminder = addReminder({
+        chatId: ctx.chatId,
+        userJid: ctx.senderJid,
+        userNumber: ctx.senderNumber,
+        text: messageText,
+        delayMs,
+      });
+
+      const msg = [
+        `⏰ *Reminder Scheduled*`,
+        `• In: *${formatDurationHuman(delayMs)}*`,
+        `• Message: ${reminder.text}`,
+        `• Will notify: +${reminder.userNumber}`,
+      ].join('\n');
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'afkon',
+    aliases: ['afk'],
+    category: 'general',
+    description: 'Apna AFK (Away From Keyboard) status reason ke sath active kare',
+    usage: 'afkon [reason]',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const reason = ctx.text.trim() || 'Busy right now — will reply later.';
+      const entry = vipStore.setAfkUser({
+        jid: ctx.senderJid,
+        number: ctx.senderNumber,
+        name: ctx.pushName,
+        reason,
+      });
+      const msg = [
+        `💤 *AFK Mode Enabled*`,
+        `• User: +${entry.number}`,
+        `• Reason: ${entry.reason}`,
+        `_Anyone who mentions or replies to you will be notified automatically._`,
+      ].join('\n');
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'afkoff',
+    aliases: ['back', 'unafk'],
+    category: 'general',
+    description: 'Apna AFK status band kare aur wapas active mode mein aaye',
+    usage: 'afkoff',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const candidates = ctx.senderCandidates?.length
+        ? ctx.senderCandidates
+        : [ctx.senderJid, ctx.senderNumber];
+      const cleared = candidates.map((c) => vipStore.clearAfkUser(c)).find(Boolean) || null;
+      const msg = cleared
+        ? `⚡ *Welcome back!* Your AFK status has been turned *OFF*.`
+        : `Your AFK mode is not currently active.`;
+      await ctx.reply(msg);
+      return msg;
     },
   },
 ];

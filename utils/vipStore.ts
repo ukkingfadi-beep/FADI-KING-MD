@@ -34,6 +34,19 @@ export interface PairedUserEntry {
   lastPairedAt: string;
 }
 
+export interface MutedUserEntry {
+  expiresAt: number;
+  reason?: string;
+}
+
+export interface AfkUserEntry {
+  number: string;
+  jid: string;
+  name: string;
+  reason: string;
+  since: number;
+}
+
 export interface GroupConfig {
   groupId: string;
   antilink: boolean;
@@ -41,6 +54,13 @@ export interface GroupConfig {
   antidelete?: boolean;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  antiAdd?: boolean;
+  antiForward?: boolean;
+  antiMedia?: boolean;
+  antiSticker?: boolean;
+  antiBot?: boolean;
+  slowModeSeconds?: number;
+  mutedUsers?: Record<string, MutedUserEntry>;
   aiEnabled?: boolean;
   welcome: boolean;
   goodbye: boolean;
@@ -83,6 +103,7 @@ let groupsCache: Record<string, GroupConfig> | null = null;
 let pairingLogsCache: PairingAuditEntry[] | null = null;
 let bannedStickersCache: BannedStickerEntry[] | null = null;
 let protectedPostsCache: Record<string, ProtectedPostEntry> | null = null;
+let afkUsersCache: Record<string, AfkUserEntry> | null = null;
 
 registerDbHydrationHook(() => {
   vipsCache = null;
@@ -91,6 +112,7 @@ registerDbHydrationHook(() => {
   pairingLogsCache = null;
   bannedStickersCache = null;
   protectedPostsCache = null;
+  afkUsersCache = null;
 });
 
 function readStoreKey<T>(key: string, legacyPath: string, fallback: T): T {
@@ -492,6 +514,13 @@ export const vipStore = {
         antidelete: false,
         antiScam: cfg.antiScamGlobal,
         antiStatusMention: cfg.antiStatusMentionGlobal,
+        antiAdd: false,
+        antiForward: false,
+        antiMedia: false,
+        antiSticker: false,
+        antiBot: false,
+        slowModeSeconds: 0,
+        mutedUsers: {},
         aiEnabled: false,
         welcome: false,
         goodbye: false,
@@ -506,6 +535,13 @@ export const vipStore = {
         typeof found.antiStatusMention === 'boolean'
           ? found.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      antiAdd: Boolean(found.antiAdd),
+      antiForward: Boolean(found.antiForward),
+      antiMedia: Boolean(found.antiMedia),
+      antiSticker: Boolean(found.antiSticker),
+      antiBot: Boolean(found.antiBot),
+      slowModeSeconds: Math.max(0, Number(found.slowModeSeconds || 0)),
+      mutedUsers: found.mutedUsers || {},
       aiEnabled: Boolean(found.aiEnabled),
       welcome: Boolean(found.welcome),
       goodbye: Boolean(found.goodbye),
@@ -523,6 +559,13 @@ export const vipStore = {
         typeof g.antiStatusMention === 'boolean'
           ? g.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      antiAdd: Boolean(g.antiAdd),
+      antiForward: Boolean(g.antiForward),
+      antiMedia: Boolean(g.antiMedia),
+      antiSticker: Boolean(g.antiSticker),
+      antiBot: Boolean(g.antiBot),
+      slowModeSeconds: Math.max(0, Number(g.slowModeSeconds || 0)),
+      mutedUsers: g.mutedUsers || {},
       aiEnabled: Boolean(g.aiEnabled),
       welcome: Boolean(g.welcome),
       goodbye: Boolean(g.goodbye),
@@ -553,6 +596,17 @@ export const vipStore = {
     if (typeof patch.antiScam === 'boolean') cleanPatch.antiScam = patch.antiScam;
     if (typeof patch.antiStatusMention === 'boolean') {
       cleanPatch.antiStatusMention = patch.antiStatusMention;
+    }
+    if (typeof patch.antiAdd === 'boolean') cleanPatch.antiAdd = patch.antiAdd;
+    if (typeof patch.antiForward === 'boolean') cleanPatch.antiForward = patch.antiForward;
+    if (typeof patch.antiMedia === 'boolean') cleanPatch.antiMedia = patch.antiMedia;
+    if (typeof patch.antiSticker === 'boolean') cleanPatch.antiSticker = patch.antiSticker;
+    if (typeof patch.antiBot === 'boolean') cleanPatch.antiBot = patch.antiBot;
+    if (typeof patch.slowModeSeconds === 'number' && Number.isFinite(patch.slowModeSeconds)) {
+      cleanPatch.slowModeSeconds = Math.max(0, Math.min(3600, Math.floor(patch.slowModeSeconds)));
+    }
+    if (patch.mutedUsers && typeof patch.mutedUsers === 'object') {
+      cleanPatch.mutedUsers = patch.mutedUsers;
     }
     if (typeof patch.aiEnabled === 'boolean') cleanPatch.aiEnabled = patch.aiEnabled;
     if (typeof patch.welcome === 'boolean') cleanPatch.welcome = patch.welcome;
@@ -661,5 +715,54 @@ export const vipStore = {
     delete protectedPostsCache[key];
     dbSetSync('protected_posts', protectedPostsCache);
     return entry;
+  },
+
+  setAfkUser(input: { number: string; jid: string; name: string; reason: string }): AfkUserEntry {
+    if (!afkUsersCache) {
+      afkUsersCache = dbGetSync<Record<string, AfkUserEntry>>('afk_users') || {};
+    }
+    const cleanNum = normalizePhone(input.number) || input.number;
+    const entry: AfkUserEntry = {
+      number: cleanNum,
+      jid: input.jid,
+      name: input.name || `+${cleanNum}`,
+      reason: input.reason.trim() || 'Busy right now',
+      since: Date.now(),
+    };
+    afkUsersCache[cleanNum] = entry;
+    dbSetSync('afk_users', afkUsersCache);
+    return entry;
+  },
+
+  clearAfkUser(numberOrJid: string): AfkUserEntry | null {
+    if (!afkUsersCache) {
+      afkUsersCache = dbGetSync<Record<string, AfkUserEntry>>('afk_users') || {};
+    }
+    const clean = normalizePhone(numberOrJid) || numberOrJid.split('@')[0].split(':')[0];
+    const existing = afkUsersCache[clean] || null;
+    if (!existing) {
+      const byJid = Object.values(afkUsersCache).find((a) => a.jid === numberOrJid);
+      if (!byJid) return null;
+      delete afkUsersCache[byJid.number];
+      dbSetSync('afk_users', afkUsersCache);
+      return byJid;
+    }
+    delete afkUsersCache[clean];
+    dbSetSync('afk_users', afkUsersCache);
+    return existing;
+  },
+
+  findAfkUser(candidates: string[]): AfkUserEntry | null {
+    if (!afkUsersCache) {
+      afkUsersCache = dbGetSync<Record<string, AfkUserEntry>>('afk_users') || {};
+    }
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const clean = normalizePhone(raw.split('@')[0].split(':')[0]);
+      if (clean && afkUsersCache[clean]) return afkUsersCache[clean];
+      const byJid = Object.values(afkUsersCache).find((a) => a.jid === raw);
+      if (byJid) return byJid;
+    }
+    return null;
   },
 };

@@ -18,8 +18,10 @@ import {
   getCachedGroupMetadata,
   hasValidMediaPayload,
   invalidateGroupMetadataCache,
+  isLidUser,
   isParticipantAdmin,
   jidUserPart,
+  normalizeBareJid,
   resolveGroupTargetJids,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
@@ -30,6 +32,7 @@ import {
   extractQuotedMessage,
 } from '../utils/mediaHelper.ts';
 import { commandRateLimiter } from '../utils/rateLimiter.ts';
+import { formatDurationHuman, parseDurationMs } from '../utils/reminderStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand, CommandContext } from './types.ts';
 
@@ -1212,37 +1215,6 @@ export const groupCommands: BotCommand[] = [
     },
   },
   {
-    name: 'resetwarn',
-    aliases: ['clearwarn'],
-    category: 'group',
-    description: 'Member ki group warnings reset kare',
-    usage: 'resetwarn @user',
-    groupOnly: true,
-    execute: async (ctx) => {
-      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
-      if (!check.ok) {
-        await ctx.reply(check.reason!);
-        return check.reason!;
-      }
-      const rawTargets = extractRawTargetCandidates(ctx.msg, ctx.args);
-      const targets = resolveGroupTargetJids(check.participants, rawTargets);
-      if (targets.length === 0) {
-        const msg = `Mention or reply to a member to reset warnings.`;
-        await ctx.reply(msg);
-        return msg;
-      }
-      const targetJid = targets[0];
-      const key = jidUserPart(targetJid);
-      const groupCfg = vipStore.getGroupConfig(ctx.chatId);
-      const warnings = { ...(groupCfg.warnings || {}) };
-      delete warnings[key];
-      vipStore.updateGroupConfig(ctx.chatId, { warnings });
-      const msg = `Cleared all warnings for @${key}.`;
-      await ctx.sock!.sendMessage(ctx.chatId, { text: msg, mentions: [targetJid] });
-      return msg;
-    },
-  },
-  {
     name: 'tagadmin',
     aliases: ['admins', 'adminlist'],
     category: 'group',
@@ -1503,58 +1475,33 @@ export const groupCommands: BotCommand[] = [
   },
   {
     name: 'approve',
-    aliases: ['approveall', 'acceptall'],
+    aliases: ['acceptall'],
     category: 'group',
     description: 'Current group ke tamam pending join requests ek sath approve kare',
     usage: 'approve',
     groupOnly: true,
     cooldownSeconds: 4,
-    execute: async (ctx) => {
-      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: true });
-      if (!check.ok) {
-        const errText = check.reason || 'Admin privileges required.';
-        await ctx.reply(errText);
-        return errText;
-      }
-      if (!ctx.sock || ctx.isSimulated) {
-        const msg = `[Simulated] Approved all pending join requests in ${ctx.chatId}.`;
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      try {
-        const pending = await ctx.sock.groupRequestParticipantsList(ctx.chatId);
-        const jids = pending
-          .map((p) => (typeof p === 'string' ? p : p.jid))
-          .filter((j): j is string => Boolean(j));
-
-        if (jids.length === 0) {
-          const msg = 'No pending join requests found in this group.';
-          await ctx.reply(msg);
-          return msg;
-        }
-
-        let approved = 0;
-        const BATCH = 15;
-        for (let i = 0; i < jids.length; i += BATCH) {
-          const chunk = jids.slice(i, i + BATCH);
-          await ctx.sock.groupRequestParticipantsUpdate(ctx.chatId, chunk, 'approve');
-          approved += chunk.length;
-          if (i + BATCH < jids.length) {
-            await new Promise((r) => setTimeout(r, 800));
-          }
-        }
-
-        invalidateGroupMetadataCache(ctx.chatId);
-        const msg = `✅ Approved *${approved}* pending join request(s) in this group.`;
-        await ctx.reply(msg);
-        return msg;
-      } catch (err) {
-        const msg = `Failed to approve pending requests: ${(err as Error).message}`;
-        await ctx.reply(msg);
-        return msg;
-      }
-    },
+    execute: async (ctx) => bulkHandlePendingRequests(ctx, 'approve'),
+  },
+  {
+    name: 'approveall',
+    aliases: ['acceptpending'],
+    category: 'group',
+    description: 'Group ke tamam pending join requests bulk mein approve kare',
+    usage: 'approveall',
+    groupOnly: true,
+    cooldownSeconds: 4,
+    execute: async (ctx) => bulkHandlePendingRequests(ctx, 'approve'),
+  },
+  {
+    name: 'rejectall',
+    aliases: ['denyall', 'declineall'],
+    category: 'group',
+    description: 'Group ke tamam pending join requests bulk mein reject kare',
+    usage: 'rejectall',
+    groupOnly: true,
+    cooldownSeconds: 4,
+    execute: async (ctx) => bulkHandlePendingRequests(ctx, 'reject'),
   },
   {
     name: 'kickall',
@@ -1727,4 +1674,556 @@ export const groupCommands: BotCommand[] = [
       return 'Message unpinned.';
     },
   },
+  {
+    name: 'antiadd',
+    aliases: ['noAdd'],
+    category: 'group',
+    description: 'Non-admin ke member add karne par naye user ko auto-remove aur warn kare',
+    usage: 'antiadd <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiAdd',
+        'Anti-Add Guard',
+        'Unauthorized member additions by non-admins will be automatically removed.'
+      ),
+  },
+  {
+    name: 'antiforward',
+    aliases: ['noforward'],
+    category: 'group',
+    description: 'Non-admins ke forwarded ya frequently forwarded messages auto-delete kare',
+    usage: 'antiforward <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiForward',
+        'Anti-Forward Guard',
+        'Forwarded messages from non-admins will be automatically deleted.'
+      ),
+  },
+  {
+    name: 'antimedia',
+    aliases: ['nomedia'],
+    category: 'group',
+    description: 'Non-admins ki photos, videos, voice/audio aur documents auto-delete kare',
+    usage: 'antimedia <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiMedia',
+        'Anti-Media Guard',
+        'Images, videos, audio/voice notes, and documents from non-admins will be deleted.'
+      ),
+  },
+  {
+    name: 'antisticker',
+    aliases: ['nosticker'],
+    category: 'group',
+    description: 'Non-admins ke stickers ko is group mein automatic delete kare',
+    usage: 'antisticker <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiSticker',
+        'Anti-Sticker Guard',
+        'Stickers from non-admins will be automatically deleted.'
+      ),
+  },
+  {
+    name: 'antibot',
+    aliases: ['nobot'],
+    category: 'group',
+    description: 'Unauthorized bot accounts aur automated joiners ko detect kar ke kick kare',
+    usage: 'antibot <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiBot',
+        'Anti-Bot Shield',
+        'Automated bot accounts and unauthorized bots will be kicked when bot is admin.'
+      ),
+  },
+  {
+    name: 'muteuser',
+    aliases: ['silence', 'timeout'],
+    category: 'group',
+    description: 'Target member ko muqarrar waqt ke liye mute kare (messages auto-delete honge)',
+    usage: 'muteuser <@user|reply> <duration> (e.g. 10m, 1h)',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: true });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+
+      const durToken = ctx.args.find(
+        (a) => !a.startsWith('@') && !/^\+?\d{7,15}$/.test(a) && parseDurationMs(a) !== null
+      );
+      const durationMs = durToken ? parseDurationMs(durToken) : null;
+      if (!durationMs) {
+        const msg = `Usage: \`${ctx.prefix}muteuser @user 10m\` (or reply to their message with \`${ctx.prefix}muteuser 10m\`).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Muted user for ${formatDurationHuman(durationMs)} in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const targetArgs = ctx.args.filter((a) => !parseDurationMs(a));
+      const rawTargets = extractRawTargetCandidates(ctx.msg, targetArgs);
+      const targets = resolveGroupTargetJids(check.participants, rawTargets);
+      if (targets.length === 0) {
+        const msg = `Mention \`@user\` or reply to their message: \`${ctx.prefix}muteuser @user ${durToken}\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const targetJid = targets[0];
+      const targetParticipant = findParticipant(check.participants, [targetJid]);
+      const cfg = loadConfig();
+      const ownerClean = normalizePhone(cfg.ownerNumber);
+      const botJids = await getBotJids(ctx.sock);
+      const targetKeys = Array.from(
+        new Set(
+          [
+            jidUserPart(targetJid),
+            jidUserPart(targetParticipant?.id),
+            jidUserPart(targetParticipant?.phoneNumber),
+          ].filter(Boolean)
+        )
+      );
+
+      if (botJids.some((b) => targetKeys.includes(jidUserPart(b)))) {
+        const msg = 'Cannot mute the bot itself.';
+        await ctx.reply(msg);
+        return msg;
+      }
+      if (ownerClean && targetKeys.some((k) => normalizePhone(k) === ownerClean)) {
+        const msg = 'Cannot mute the Bot Owner.';
+        await ctx.reply(msg);
+        return msg;
+      }
+      if (isParticipantAdmin(targetParticipant)) {
+        const msg = 'Cannot mute a Group Admin. Demote them first if needed.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+      const nextMuted = { ...(groupCfg.mutedUsers || {}) };
+      const expiresAt = Date.now() + durationMs;
+      for (const k of targetKeys) {
+        nextMuted[k] = { expiresAt, reason: `Muted by +${ctx.senderNumber}` };
+      }
+      vipStore.updateGroupConfig(ctx.chatId, { mutedUsers: nextMuted });
+
+      const display = jidUserPart(targetParticipant?.phoneNumber || targetJid);
+      await ctx.sock.sendMessage(ctx.chatId, {
+        text: `🔇 *@${display}* has been muted for *${formatDurationHuman(durationMs)}*.\n_Their messages in this group will be automatically deleted._`,
+        mentions: [targetJid],
+      });
+      return `Muted +${display} for ${formatDurationHuman(durationMs)}.`;
+    },
+  },
+  {
+    name: 'unmuteuser',
+    aliases: ['unsilence', 'untimeout'],
+    category: 'group',
+    description: 'Muted member ko foran unmute kare aur mute record hataye',
+    usage: 'unmuteuser <@user|reply>',
+    groupOnly: true,
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `[Simulated] Unmuted user in ${ctx.chatId}.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const rawTargets = extractRawTargetCandidates(ctx.msg, ctx.args);
+      const targets = resolveGroupTargetJids(check.participants, rawTargets);
+      if (targets.length === 0) {
+        const msg = `Mention \`@user\` or reply to their message with \`${ctx.prefix}unmuteuser\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const targetJid = targets[0];
+      const targetParticipant = findParticipant(check.participants, [targetJid]);
+      const keysToClear = Array.from(
+        new Set(
+          [
+            jidUserPart(targetJid),
+            jidUserPart(targetParticipant?.id),
+            jidUserPart(targetParticipant?.phoneNumber),
+          ].filter(Boolean)
+        )
+      );
+
+      const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+      const nextMuted = { ...(groupCfg.mutedUsers || {}) };
+      let removedAny = false;
+      for (const k of keysToClear) {
+        if (nextMuted[k]) {
+          delete nextMuted[k];
+          removedAny = true;
+        }
+      }
+      vipStore.updateGroupConfig(ctx.chatId, { mutedUsers: nextMuted });
+
+      const display = jidUserPart(targetParticipant?.phoneNumber || targetJid);
+      const replyText = removedAny
+        ? `🔊 *@${display}* has been unmuted and can chat again.`
+        : `🔊 *@${display}* was not actively muted (record ensured clear).`;
+      await ctx.sock.sendMessage(ctx.chatId, {
+        text: replyText,
+        mentions: [targetJid],
+      });
+      return `Unmuted +${display}.`;
+    },
+  },
+  {
+    name: 'clearwarn',
+    aliases: ['resetwarn', 'delwarn'],
+    category: 'group',
+    description: 'Group mein target member ki antilink aur anti-scam warnings reset kare',
+    usage: 'clearwarn <@user|reply>',
+    groupOnly: true,
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+
+      const rawTargets = extractRawTargetCandidates(ctx.msg, ctx.args);
+      const targets =
+        ctx.sock && !ctx.isSimulated
+          ? resolveGroupTargetJids(check.participants, rawTargets)
+          : rawTargets.map((t) => normalizeBareJid(t)).filter(Boolean);
+
+      if (targets.length === 0) {
+        const msg = `Mention \`@user\`, pass a phone number, or reply to a message with \`${ctx.prefix}clearwarn\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const targetJid = targets[0];
+      const targetParticipant = findParticipant(check.participants, [targetJid]);
+      const candidateParts = new Set(
+        [
+          targetJid,
+          jidUserPart(targetJid),
+          targetParticipant?.id,
+          jidUserPart(targetParticipant?.id),
+          targetParticipant?.phoneNumber,
+          jidUserPart(targetParticipant?.phoneNumber),
+        ]
+          .filter(Boolean)
+          .map((s) => String(s))
+      );
+
+      const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+      const warnings = { ...(groupCfg.warnings || {}) };
+      const antiScamWarnings = { ...(groupCfg.antiScamWarnings || {}) };
+      let clearedCount = 0;
+
+      for (const map of [warnings, antiScamWarnings]) {
+        for (const key of Object.keys(map)) {
+          if (candidateParts.has(key) || candidateParts.has(jidUserPart(key))) {
+            clearedCount += Number(map[key] || 0);
+            delete map[key];
+          }
+        }
+      }
+
+      vipStore.updateGroupConfig(ctx.chatId, { warnings, antiScamWarnings });
+      const display = jidUserPart(targetParticipant?.phoneNumber || targetJid);
+      const text = `🧽 Cleared warnings (*${clearedCount}* total) for *@${display}* in this group.`;
+
+      if (ctx.sock && !ctx.isSimulated) {
+        await ctx.sock.sendMessage(ctx.chatId, { text, mentions: [targetJid] });
+      } else {
+        await ctx.reply(text);
+      }
+      return text;
+    },
+  },
+  {
+    name: 'slowmode',
+    aliases: ['slow'],
+    category: 'group',
+    description: 'Group mein non-admins ke liye message cooldown interval set ya band kare',
+    usage: 'slowmode <seconds|off> (e.g. 10, 30, off)',
+    groupOnly: true,
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+      if (!check.ok) {
+        const errText = check.reason || 'Admin privileges required.';
+        await ctx.reply(errText);
+        return errText;
+      }
+
+      const arg = ctx.args[0]?.toLowerCase() || '';
+      const groupCfg = vipStore.getGroupConfig(ctx.chatId);
+      if (!arg) {
+        const cur = Number(groupCfg.slowModeSeconds || 0);
+        const msg = `🐢 Group Slow Mode is currently *${cur > 0 ? `${cur}s` : 'OFF'}*.\nUsage: \`${ctx.prefix}slowmode 10\` or \`${ctx.prefix}slowmode off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (arg === 'off' || arg === '0') {
+        vipStore.updateGroupConfig(ctx.chatId, { slowModeSeconds: 0 });
+        const msg = '🐢 *Slow Mode turned OFF* for this group.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let seconds = /^\d+$/.test(arg) ? Number(arg) : NaN;
+      if (!Number.isFinite(seconds)) {
+        const parsedMs = parseDurationMs(arg);
+        if (parsedMs) seconds = Math.round(parsedMs / 1000);
+      }
+
+      if (!Number.isFinite(seconds) || seconds < 1 || seconds > 3600) {
+        const msg = `Provide a valid cooldown between \`1\` and \`3600\` seconds, or \`off\`. Example: \`${ctx.prefix}slowmode 15\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const cleanSec = Math.round(seconds);
+      vipStore.updateGroupConfig(ctx.chatId, { slowModeSeconds: cleanSec });
+      const msg = `🐢 *Slow Mode set to ${cleanSec}s* — non-admins sending faster than once per ${cleanSec}s will have excess messages removed.`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'giveaway',
+    aliases: ['raffle', 'pickwinner'],
+    category: 'group',
+    description: 'Group members mein se random winner(s) select kare',
+    usage: 'giveaway [winner_count]',
+    groupOnly: true,
+    cooldownSeconds: 5,
+    execute: async (ctx) => {
+      const requestedCount = ctx.args[0] ? Number(ctx.args[0]) : 1;
+      const winnerCount =
+        Number.isFinite(requestedCount) && requestedCount >= 1
+          ? Math.min(10, Math.floor(requestedCount))
+          : 1;
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `🎁 *Giveaway Winner(s) (${winnerCount})*\n1. +${ctx.senderNumber} (Simulated Sample)`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const meta = await getCachedGroupMetadata(ctx.sock, ctx.chatId, true);
+      const botJids = await getBotJids(ctx.sock);
+      const botSet = new Set(botJids.map((j) => jidUserPart(j)));
+
+      const pool = meta.participants.filter((p) => {
+        const u1 = jidUserPart(p.id);
+        const u2 = jidUserPart(p.phoneNumber || p.id);
+        return !botSet.has(u1) && !botSet.has(u2);
+      });
+
+      if (pool.length === 0) {
+        const msg = 'No eligible group participants found for giveaway.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const shuffled = [...pool];
+      for (let i = shuffled.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+
+      const chosen = shuffled.slice(0, Math.min(winnerCount, shuffled.length));
+      const mentions = chosen.map((p) => p.id);
+      const winnerLines = chosen.map(
+        (p, idx) => `${idx + 1}. 🏆 @${jidUserPart(p.phoneNumber || p.id)}`
+      );
+
+      const text = [
+        `🎁 *GROUP GIVEAWAY RESULTS*`,
+        `• Group: *${meta.subject || 'WhatsApp Group'}*`,
+        `• Eligible Members: ${pool.length}`,
+        '',
+        ...winnerLines,
+      ].join('\n');
+
+      await ctx.sock.sendMessage(ctx.chatId, { text, mentions }, { quoted: ctx.msg ?? undefined });
+      return `Selected ${chosen.length} giveaway winner(s).`;
+    },
+  },
+  {
+    name: 'pollcreate',
+    aliases: ['newpoll', 'createpoll'],
+    category: 'group',
+    description: 'Group mein multi-option WhatsApp poll create kare (Question | Opt1 | Opt2)',
+    usage: 'pollcreate Question? | Option 1 | Option 2 | Option 3',
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      const segments = ctx.text
+        .split('|')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (segments.length < 3) {
+        const msg = `Provide a question and at least 2 options separated by \`|\`.\nExample: \`${ctx.prefix}pollcreate Best time for meeting? | 6 PM | 8 PM | 10 PM\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const question = segments[0].slice(0, 255);
+      const uniqueOptions = Array.from(new Set(segments.slice(1))).slice(0, 12);
+      if (uniqueOptions.length < 2) {
+        const msg = 'A poll requires at least 2 distinct options.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `🗳️ *[Simulated Poll]* ${question}\n${uniqueOptions.map((o, i) => `${i + 1}. ${o}`).join('\n')}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      await ctx.sock.sendMessage(
+        ctx.chatId,
+        {
+          poll: {
+            name: question,
+            values: uniqueOptions,
+            selectableCount: 1,
+          },
+        },
+        { quoted: ctx.msg ?? undefined }
+      );
+      return `Created poll "${question}" with ${uniqueOptions.length} options.`;
+    },
+  },
 ];
+
+async function bulkHandlePendingRequests(
+  ctx: CommandContext,
+  action: 'approve' | 'reject'
+): Promise<string> {
+  const check = await verifyGroupAdmins(ctx, { requireBotAdmin: true });
+  if (!check.ok) {
+    const errText = check.reason || 'Admin privileges required.';
+    await ctx.reply(errText);
+    return errText;
+  }
+  const verbPast = action === 'approve' ? 'Approved' : 'Rejected';
+  if (!ctx.sock || ctx.isSimulated) {
+    const msg = `[Simulated] ${verbPast} all pending join requests in ${ctx.chatId}.`;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  try {
+    const pending = await ctx.sock.groupRequestParticipantsList(ctx.chatId);
+    const jids = pending
+      .map((p) => (typeof p === 'string' ? p : p.jid))
+      .filter((j): j is string => Boolean(j));
+
+    if (jids.length === 0) {
+      const msg = 'No pending join requests found in this group.';
+      await ctx.reply(msg);
+      return msg;
+    }
+
+    let handled = 0;
+    const BATCH = 15;
+    for (let i = 0; i < jids.length; i += BATCH) {
+      const chunk = jids.slice(i, i + BATCH);
+      await ctx.sock.groupRequestParticipantsUpdate(ctx.chatId, chunk, action);
+      handled += chunk.length;
+      if (i + BATCH < jids.length) {
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+
+    invalidateGroupMetadataCache(ctx.chatId);
+    const emoji = action === 'approve' ? '✅' : '❌';
+    const msg = `${emoji} ${verbPast} *${handled}* pending join request(s) in this group.`;
+    await ctx.reply(msg);
+    return msg;
+  } catch (err) {
+    const msg = `Failed to ${action} pending requests: ${(err as Error).message}`;
+    await ctx.reply(msg);
+    return msg;
+  }
+}
+
+async function togglePerGroupProtection(
+  ctx: CommandContext,
+  field: 'antiAdd' | 'antiForward' | 'antiMedia' | 'antiSticker' | 'antiBot',
+  label: string,
+  activeSummary: string
+): Promise<string> {
+  const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+  if (!check.ok) {
+    const errText = check.reason || 'Group Admin privileges required.';
+    await ctx.reply(errText);
+    return errText;
+  }
+
+  const arg = ctx.args[0]?.toLowerCase();
+  const current = Boolean(vipStore.getGroupConfig(ctx.chatId)[field]);
+  if (arg !== 'on' && arg !== 'off') {
+    const msg = `${label} is currently *${current ? 'ON' : 'OFF'}* in this group.\nUsage: \`${ctx.prefix}${ctx.commandName} on\` or \`${ctx.prefix}${ctx.commandName} off\``;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  const enabled = arg === 'on';
+  vipStore.updateGroupConfig(ctx.chatId, { [field]: enabled });
+
+  let adminHint = '';
+  if (enabled && ctx.sock && !ctx.isSimulated) {
+    const botJids = await getBotJids(ctx.sock);
+    const botParticipant = findParticipant(check.participants, botJids);
+    if (!isParticipantAdmin(botParticipant)) {
+      adminHint = '\n_Note: Make the bot a Group Admin so it can automatically enforce this rule._';
+    }
+  }
+
+  const msg = enabled
+    ? `🛡️ *${label} turned ON* for this group.\n${activeSummary}${adminHint}`
+    : `⚪ *${label} turned OFF* for this group.`;
+  await ctx.reply(msg);
+  return msg;
+}
