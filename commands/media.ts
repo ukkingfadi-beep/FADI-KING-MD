@@ -15,6 +15,7 @@ import {
   participantMatchesAny,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
+import { logger } from '../utils/logger.ts';
 import {
   applyBassBoostEffect,
   clearSocketPlaceholderCacheEntry,
@@ -23,17 +24,20 @@ import {
   convertStickerToPng,
   detectMediaType,
   downloadMessageMedia,
+  extractBinaryBuffer,
   extractQuotedMessage,
   getCachedViewOnceMedia,
   getCachedViewOnceMeta,
   getUnavailableViewOnceRecord,
   inspectWebpStickerBuffer,
   isFfmpegAvailable,
+  sendImmediateViewOncePdo,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
   waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
 import {
+  extractStatusMediaPayload,
   findStatusesForUser,
   getOrDownloadStatusBuffer,
   getStatusById,
@@ -415,11 +419,12 @@ export const mediaCommands: BotCommand[] = [
         }
       }
 
-      // 3. On-demand PDO placeholder resend request across PN/LID key variants
+      // 3. On-demand instant PDO placeholder resend request across PN/LID key variants
       if (
         stanzaId &&
         (!inner || !hasValidMediaPayload(unwrapViewOnce(inner) || unwrapMessage(inner) || inner)) &&
-        typeof ctx.sock.requestPlaceholderResend === 'function'
+        (typeof ctx.sock.sendPeerDataOperationMessage === 'function' ||
+          typeof ctx.sock.requestPlaceholderResend === 'function')
       ) {
         const pdoCandidates: WAMessageKey[] = [];
         const seenPdo = new Set<string>();
@@ -453,27 +458,29 @@ export const mediaCommands: BotCommand[] = [
                 : {}),
           });
         }
-        if (!ctx.isGroup && !unavailRecord && !quotedParticipant) {
+        if (!ctx.isGroup) {
           pushPdoKey({
-            remoteJid: remoteJidAlt || ctx.chatId,
+            remoteJid: ctx.chatId,
             fromMe: !quotedFromBot,
             id: stanzaId,
           });
-        }
-
-        const primaryKey = pdoCandidates[0];
-        if (primaryKey) {
-          await clearSocketPlaceholderCacheEntry(ctx.sock, stanzaId);
-          try {
-            await ctx.sock.requestPlaceholderResend(primaryKey);
-          } catch {
-            // Ignore PDO request error
+          if (remoteJidAlt) {
+            pushPdoKey({
+              remoteJid: remoteJidAlt,
+              fromMe: !quotedFromBot,
+              id: stanzaId,
+            });
           }
         }
 
-        let triedAlt = false;
+        if (pdoCandidates.length > 0) {
+          await clearSocketPlaceholderCacheEntry(ctx.sock, stanzaId);
+          await sendImmediateViewOncePdo(ctx.sock, pdoCandidates);
+        }
+
+        let triedBackupPdo = false;
         for (let attempt = 0; attempt < 22; attempt += 1) {
-          await new Promise((r) => setTimeout(r, 380));
+          await new Promise((r) => setTimeout(r, 250));
           await waitForViewOnceInflight(stanzaId);
           const preCachedAfterPdo = getCachedViewOnceMedia(ctx.chatId, stanzaId);
           if (preCachedAfterPdo && preCachedAfterPdo.buffer.length > 0) {
@@ -486,14 +493,17 @@ export const mediaCommands: BotCommand[] = [
             sourceKey = hit.key;
             break;
           }
-          // Halfway through, if primary key did not resolve and an alternate PN/LID key exists, retry with it
-          if (!triedAlt && attempt === 10 && pdoCandidates[1]) {
-            triedAlt = true;
+          if (!triedBackupPdo && attempt === 8 && pdoCandidates.length > 0) {
+            triedBackupPdo = true;
             await clearSocketPlaceholderCacheEntry(ctx.sock, stanzaId);
-            try {
-              await ctx.sock.requestPlaceholderResend(pdoCandidates[1]);
-            } catch {
-              // Ignore PDO retry error
+            if (typeof ctx.sock.requestPlaceholderResend === 'function') {
+              try {
+                await ctx.sock.requestPlaceholderResend(pdoCandidates[0]);
+              } catch {
+                // Ignore PDO fallback error
+              }
+            } else {
+              await sendImmediateViewOncePdo(ctx.sock, pdoCandidates);
             }
           }
         }
@@ -514,8 +524,24 @@ export const mediaCommands: BotCommand[] = [
       }
 
       if (!hasValidMediaPayload(unwrappedInner)) {
+        const thumbBuf = extractBinaryBuffer(
+          unwrappedInner.imageMessage?.jpegThumbnail ||
+            unwrappedInner.videoMessage?.jpegThumbnail ||
+            unwrappedInner.ptvMessage?.jpegThumbnail
+        );
+        if (thumbBuf && thumbBuf.length >= 150) {
+          await sendRecoveredMedia({
+            type: 'image',
+            buffer: thumbBuf,
+            mimetype: 'image/jpeg',
+            caption:
+              '⚠️ View-Once preview recovered (WhatsApp withheld the full HD decryption key from linked Web sessions).',
+          });
+          return 'View-Once preview recovered.';
+        }
+
         const msg = unavailRecord
-          ? 'WhatsApp blocked this View-Once photo/media key from linked Web sessions (`view_once_unavailable_fanout`) and the primary phone did not resend it.'
+          ? 'WhatsApp withheld this View-Once photo/media key from linked Web sessions (`view_once_unavailable_fanout`) and the primary phone did not resend it.'
           : 'This View-Once media key was stripped or expired before arrival (not recoverable on linked Web sessions).';
         await ctx.reply(msg);
         return msg;
@@ -687,13 +713,13 @@ export const mediaCommands: BotCommand[] = [
     aliases: ['statusdl', 'getstatus'],
     category: 'media',
     description:
-      'Kisi ko bhi mention/number/reply karke uska WhatsApp Status isi chat aur aapke inbox (IB) dono mein save kare',
+      'Kisi ko bhi mention/number/reply karke uska WhatsApp Status media (photo/video/audio) isi chat aur aapke inbox (IB) mein save kare',
     usage: 'savestatus [@user | number | reply] [all]',
     cooldownSeconds: 2,
     execute: async (ctx) => {
       if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
         const msg =
-          'Mention `@user`, pass a phone number, or reply to a WhatsApp Status/message with `.savestatus` to save their status in both this chat and your IB.';
+          'Mention `@user`, pass a phone number, or reply to a WhatsApp Status/message with `.savestatus` to save their status media in both this chat and your IB.';
         await ctx.reply(msg);
         return msg;
       }
@@ -717,29 +743,55 @@ export const mediaCommands: BotCommand[] = [
         (normalizeBareJid(targetDm) === normalizeBareJid(ctx.chatId) ||
           (Boolean(jidUserPart(targetDm)) && jidUserPart(targetDm) === jidUserPart(ctx.chatId)));
 
+      const resolveVerifiedPhone = async (jids: string[], fallbackPhone: string): Promise<string> => {
+        if (isValidPhone(fallbackPhone)) return fallbackPhone;
+        for (const jid of jids) {
+          if (jid.endsWith('@s.whatsapp.net')) {
+            const p = normalizePhone(jidUserPart(jid));
+            if (isValidPhone(p)) return p;
+          }
+        }
+        for (const jid of jids) {
+          if (isLidUser(jid) && sock.signalRepository?.lidMapping?.getPNForLID) {
+            try {
+              const pn = await sock.signalRepository.lidMapping.getPNForLID(normalizeBareJid(jid));
+              const p = normalizePhone(jidUserPart(pn));
+              if (isValidPhone(p)) return p;
+            } catch {
+              // Ignore LID mapping miss
+            }
+          }
+        }
+        if (ctx.isGroup && jids.length > 0) {
+          try {
+            const meta = await getCachedGroupMetadata(sock, ctx.chatId);
+            for (const participant of meta.participants) {
+              if (participantMatchesAny(participant, jids)) {
+                const candidate = participant.phoneNumber || (participant.id?.endsWith('@s.whatsapp.net') ? participant.id : '');
+                const p = normalizePhone(jidUserPart(candidate));
+                if (isValidPhone(p)) return p;
+              }
+            }
+          } catch {
+            // Ignore group metadata lookup error
+          }
+        }
+        return '';
+      };
+
       const deliverStatusToBoth = async (
         entry: CachedStatusEntry,
         footerNote?: string
       ): Promise<void> => {
-        const posterTag = entry.senderPhone ? `+${entry.senderPhone}` : entry.pushName;
-        const header = `*Saved Status* (${entry.pushName}${entry.senderPhone && !entry.pushName.includes(entry.senderPhone) ? ` • ${posterTag}` : ''})`;
-        const noteSuffix = footerNote ? `\n_${footerNote}_` : '';
-
-        if (entry.mediaType === 'text') {
-          const textPayload = `${header}\n\n${entry.text || ''}${noteSuffix}`.trim();
-          await sock.sendMessage(ctx.chatId, { text: textPayload }, { quoted: incomingMsg });
-          if (!sameAsCurrentChat && targetDm) {
-            await sock.sendMessage(targetDm, { text: textPayload });
-          }
-          return;
-        }
-
         const buf = await getOrDownloadStatusBuffer(sock, entry);
         if (!buf || buf.length === 0) {
-          throw new Error('Status media payload expired or could not be downloaded.');
+          throw new Error('Status media download or decryption failed (payload may have expired).');
         }
 
-        const caption = [header, entry.text ? `\n${entry.text}` : '', noteSuffix]
+        const verifiedPhone = await resolveVerifiedPhone(entry.senderJids, entry.senderPhone);
+        const header = `*Saved Status* (${entry.pushName}${verifiedPhone && !entry.pushName.includes(verifiedPhone) ? ` • +${verifiedPhone}` : ''})`;
+        const noteSuffix = footerNote ? `\n_${footerNote}_` : '';
+        const caption = [header, entry.caption ? `\n${entry.caption}` : '', noteSuffix]
           .filter(Boolean)
           .join('')
           .trim();
@@ -776,22 +828,34 @@ export const mediaCommands: BotCommand[] = [
           return;
         }
 
-        // Audio / voice status
+        // Audio / voice status: always send the downloaded audio buffer + sender/caption details
         await sock.sendMessage(
           ctx.chatId,
-          { audio: buf, mimetype: entry.mimetype || 'audio/mp4' },
+          {
+            audio: buf,
+            mimetype: entry.mimetype || 'audio/mp4',
+            ptt: entry.ptt ?? false,
+            seconds: entry.seconds,
+          },
           { quoted: incomingMsg }
         );
+        if (caption) {
+          await sock.sendMessage(ctx.chatId, { text: caption }, { quoted: incomingMsg });
+        }
         if (!sameAsCurrentChat && targetDm) {
           await sock.sendMessage(targetDm, {
             audio: buf,
             mimetype: entry.mimetype || 'audio/mp4',
+            ptt: entry.ptt ?? false,
+            seconds: entry.seconds,
           });
-          await sock.sendMessage(targetDm, { text: `${header}${noteSuffix}` });
+          if (caption) {
+            await sock.sendMessage(targetDm, { text: caption });
+          }
         }
       };
 
-      // Mode A: Direct reply to a status@broadcast message
+      // Mode A: Direct reply to a status@broadcast message (or cached status ID)
       const isDirectStatusReply = Boolean(
         stanzaId &&
           (ctxInfo?.remoteJid === 'status@broadcast' ||
@@ -805,8 +869,8 @@ export const mediaCommands: BotCommand[] = [
           try {
             await deliverStatusToBoth(storeHit);
             return sameAsCurrentChat
-              ? 'Status saved in this chat.'
-              : 'Status saved in this chat and sent to your IB.';
+              ? 'Status media saved in this chat.'
+              : 'Status media saved in this chat and sent to your IB.';
           } catch (err) {
             const msg = `Save status failed: ${(err as Error).message}`;
             await ctx.reply(msg);
@@ -815,55 +879,62 @@ export const mediaCommands: BotCommand[] = [
         }
 
         const cachedBroadcast = ctx.getCachedMessage?.('status@broadcast', stanzaId);
-        const rawInner =
-          (cachedBroadcast?.message
-            ? unwrapViewOnce(cachedBroadcast.message) || unwrapMessage(cachedBroadcast.message)
-            : null) ||
-          unwrapViewOnce(quoted) ||
-          unwrapMessage(quoted) ||
-          quoted;
+        const sourceMsg = cachedBroadcast?.message || quoted || ctxInfo?.quotedMessage;
+        const extracted = extractStatusMediaPayload(sourceMsg);
 
-        if (rawInner) {
-          const mediaType = detectMediaType(rawInner);
-          const bodyText = extractBodyText(rawInner).trim();
-          const syntheticEntry: CachedStatusEntry = {
-            id: stanzaId,
-            msg: cachedBroadcast || { key: incomingMsg.key, message: rawInner },
-            inner: rawInner,
-            mediaType:
-              mediaType === 'image' || mediaType === 'video' || mediaType === 'audio'
-                ? mediaType
-                : 'text',
-            text:
-              mediaType === 'image'
-                ? rawInner.imageMessage?.caption || bodyText || undefined
-                : mediaType === 'video'
-                  ? rawInner.videoMessage?.caption || bodyText || undefined
-                  : bodyText || undefined,
-            mimetype:
-              rawInner.imageMessage?.mimetype ||
-              rawInner.videoMessage?.mimetype ||
-              rawInner.audioMessage?.mimetype ||
-              undefined,
-            senderJids: ctxInfo?.participant ? [normalizeBareJid(ctxInfo.participant)] : [],
-            senderPhone: normalizePhone(jidUserPart(ctxInfo?.participant)),
-            pushName:
-              lookupKnownUserName(ctxInfo?.participant) ||
-              (ctxInfo?.participant ? `+${jidUserPart(ctxInfo.participant)}` : 'Contact'),
-            timestampMs: Date.now(),
-          };
-          if (syntheticEntry.mediaType !== 'text' || syntheticEntry.text) {
-            try {
-              await deliverStatusToBoth(syntheticEntry);
-              return sameAsCurrentChat
-                ? 'Status saved in this chat.'
-                : 'Status saved in this chat and sent to your IB.';
-            } catch (err) {
-              const msg = `Save status failed: ${(err as Error).message}`;
-              await ctx.reply(msg);
-              return msg;
-            }
-          }
+        if (!extracted) {
+          logger.info('savestatus', `Ignored text-only or non-media status reply (${stanzaId}).`);
+          const msg =
+            'Text-only statuses are ignored — only WhatsApp status photos, videos, and audio statuses can be downloaded.';
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        if (!hasValidMediaPayload(extracted.inner)) {
+          logger.info(
+            'savestatus',
+            `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${stanzaId}).`
+          );
+          const msg = extracted.isViewOnce
+            ? 'Unsupported View-Once status media cannot be decrypted from this reply.'
+            : 'Status media key is missing or expired. Ask the contact to repost or view the status while the bot is online.';
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        const participantBare = ctxInfo?.participant ? normalizeBareJid(ctxInfo.participant) : '';
+        const senderJids = participantBare ? [participantBare] : [];
+        const verifiedPhone = await resolveVerifiedPhone(senderJids, '');
+        const pushName =
+          lookupKnownUserName(ctxInfo?.participant) ||
+          (verifiedPhone ? `+${verifiedPhone}` : 'Contact');
+
+        const syntheticEntry: CachedStatusEntry = {
+          id: stanzaId,
+          msg: cachedBroadcast
+            ? { key: cachedBroadcast.key, message: extracted.inner }
+            : { key: incomingMsg.key, message: extracted.inner },
+          inner: extracted.inner,
+          mediaType: extracted.mediaType,
+          caption: extracted.caption,
+          mimetype: extracted.mimetype,
+          ptt: extracted.ptt,
+          seconds: extracted.seconds,
+          senderJids,
+          senderPhone: verifiedPhone,
+          pushName,
+          timestampMs: Date.now(),
+        };
+
+        try {
+          await deliverStatusToBoth(syntheticEntry);
+          return sameAsCurrentChat
+            ? 'Status media saved in this chat.'
+            : 'Status media saved in this chat and sent to your IB.';
+        } catch (err) {
+          const msg = `Save status failed: ${(err as Error).message}`;
+          await ctx.reply(msg);
+          return msg;
         }
       }
 
@@ -881,8 +952,12 @@ export const mediaCommands: BotCommand[] = [
         const posters = listActiveStatusPosters(5);
         const activeHint =
           posters.length > 0
-            ? `\n\n*Recent cached status posters:*\n${posters
-                .map((p) => `• ${p.pushName} (+${p.phone}) — ${p.count} status(es)`)
+            ? `\n\n*Recent cached media status posters:*\n${posters
+                .map((p) =>
+                  p.phone
+                    ? `• ${p.pushName} (+${p.phone}) — ${p.count} status(es)`
+                    : `• ${p.pushName} — ${p.count} status(es)`
+                )
                 .join('\n')}`
             : '';
         const msg = `Mention someone, pass a phone number, or reply to a status/message.\nUsage: \`${ctx.prefix}savestatus @user\` or \`${ctx.prefix}savestatus 923001234567\`${activeHint}`;
@@ -930,10 +1005,12 @@ export const mediaCommands: BotCommand[] = [
       const candidateList = Array.from(resolvedCandidates);
       const userStatuses = findStatusesForUser(candidateList);
       if (userStatuses.length === 0) {
+        const verifiedPn = candidateList.find((c) => c.endsWith('@s.whatsapp.net'));
+        const verifiedDigits = verifiedPn ? normalizePhone(jidUserPart(verifiedPn)) : '';
         const displayTarget =
           candidateList.map((c) => lookupKnownUserName(c)).find(Boolean) ||
-          `+${jidUserPart(candidateList.find((c) => c.endsWith('@s.whatsapp.net')) || candidateList[0])}`;
-        const msg = `No cached WhatsApp status found for *${displayTarget}* yet.\n• Ask them to post/refresh a status while the bot is online, or reply directly to their status with \`${ctx.prefix}savestatus\`.`;
+          (isValidPhone(verifiedDigits) ? `+${verifiedDigits}` : 'this contact');
+        const msg = `No cached photo/video/audio status found for *${displayTarget}* yet.\n• Text-only statuses are ignored. Ask them to post a photo/video/audio status while the bot is online, or reply directly to their status with \`${ctx.prefix}savestatus\`.`;
         await ctx.reply(msg);
         return msg;
       }
@@ -943,13 +1020,13 @@ export const mediaCommands: BotCommand[] = [
         for (let i = 0; i < toSend.length; i += 1) {
           const note =
             !wantAll && userStatuses.length > 1
-              ? `1 of ${userStatuses.length} cached statuses — send ${ctx.prefix}savestatus @user all to get all`
+              ? `1 of ${userStatuses.length} cached media statuses — send ${ctx.prefix}savestatus @user all to get all`
               : wantAll && toSend.length > 1
                 ? `Status ${i + 1} of ${toSend.length}`
                 : undefined;
           await deliverStatusToBoth(toSend[i], note);
         }
-        return `Delivered ${toSend.length} status update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
+        return `Delivered ${toSend.length} status media update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
       } catch (err) {
         const msg = `Save status failed: ${(err as Error).message}`;
         await ctx.reply(msg);
@@ -1011,7 +1088,51 @@ export const mediaCommands: BotCommand[] = [
       }
 
       const quoted = extractQuotedMessage(ctx.msg);
-      let inner = unwrapViewOnce(quoted) || unwrapMessage(quoted) || quoted;
+      const statusHit = stanzaId ? getStatusById(stanzaId) : undefined;
+      if (statusHit) {
+        try {
+          const buf = await getOrDownloadStatusBuffer(ctx.sock, statusHit);
+          if (!buf || buf.length === 0) {
+            throw new Error('Status media payload expired or could not be downloaded.');
+          }
+          const senderTag = statusHit.senderPhone
+            ? `${statusHit.pushName} (+${statusHit.senderPhone})`
+            : statusHit.pushName;
+          const caption = `*Saved Status* (${senderTag})${statusHit.caption ? `\n${statusHit.caption}` : ''}`;
+          if (statusHit.mediaType === 'image') {
+            await ctx.sock.sendMessage(targetDm, {
+              image: buf,
+              mimetype: statusHit.mimetype || 'image/jpeg',
+              caption,
+            });
+          } else if (statusHit.mediaType === 'video') {
+            await ctx.sock.sendMessage(targetDm, {
+              video: buf,
+              mimetype: statusHit.mimetype || 'video/mp4',
+              caption,
+            });
+          } else {
+            await ctx.sock.sendMessage(targetDm, {
+              audio: buf,
+              mimetype: statusHit.mimetype || 'audio/mp4',
+              ptt: statusHit.ptt ?? false,
+              seconds: statusHit.seconds,
+            });
+            await ctx.sock.sendMessage(targetDm, { text: caption });
+          }
+          if (targetDm !== ctx.chatId) {
+            await ctx.reply(`Saved ${statusHit.mediaType} status to your inbox.`);
+          }
+          return `Saved ${statusHit.mediaType} status to inbox.`;
+        } catch (err) {
+          const msg = `Save failed: ${(err as Error).message}`;
+          await ctx.reply(msg);
+          return msg;
+        }
+      }
+
+      const extractedQuotedStatus = extractStatusMediaPayload(quoted || ctxInfo?.quotedMessage);
+      let inner = extractedQuotedStatus?.inner || unwrapViewOnce(quoted) || unwrapMessage(quoted) || quoted;
       let origKey = ctx.msg.key;
 
       // Check chat cache, status@broadcast cache, and disk metadata if WhatsApp stripped directPath/url
@@ -1025,8 +1146,11 @@ export const mediaCommands: BotCommand[] = [
           : [];
         for (const cachedOrig of cacheLookups) {
           if (cachedOrig?.message) {
+            const cachedStatusMedia = extractStatusMediaPayload(cachedOrig.message);
             const cachedInner =
-              unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
+              cachedStatusMedia?.inner ||
+              unwrapViewOnce(cachedOrig.message) ||
+              unwrapMessage(cachedOrig.message);
             if (cachedInner && (hasValidMediaPayload(cachedInner) || !inner)) {
               inner = cachedInner;
               origKey = cachedOrig.key || origKey;
@@ -1051,22 +1175,16 @@ export const mediaCommands: BotCommand[] = [
 
       const type = detectMediaType(inner);
       if (type !== 'image' && type !== 'video' && type !== 'audio') {
-        const textStatus = extractBodyText(inner).trim();
-        if (textStatus) {
-          await ctx.sock.sendMessage(targetDm, { text: `*Saved Status Text:*\n\n${textStatus}` });
-          if (targetDm !== ctx.chatId) {
-            await ctx.reply('Status text saved to your inbox.');
-          }
-          return 'Status text saved to inbox.';
-        }
-        const msg = `Reply to a status photo/video/audio or View-Once media with \`${ctx.prefix}save\`.`;
+        logger.info('save', `Ignored text-only or non-media target (${stanzaId || 'no-id'}).`);
+        const msg = `Text-only messages/statuses are ignored. Reply to a status photo/video/audio or View-Once media with \`${ctx.prefix}save\`.`;
         await ctx.reply(msg);
         return msg;
       }
 
       if (!hasValidMediaPayload(inner)) {
+        logger.info('save', `Ignored unsupported/unavailable media payload (${stanzaId || 'no-id'}).`);
         const msg =
-          'Media payload expired or unavailable in cache. Open/view the status again and reply with `.save`.';
+          'Media payload expired or unavailable in cache (unsupported View-Once or stripped media key).';
         await ctx.reply(msg);
         return msg;
       }

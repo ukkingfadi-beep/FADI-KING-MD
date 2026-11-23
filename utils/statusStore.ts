@@ -10,16 +10,23 @@ import {
   rememberUserName,
   unwrapMessage,
 } from './jidHelper.ts';
-import { detectMediaType, downloadMessageMedia, unwrapViewOnce } from './mediaHelper.ts';
+import {
+  detectMediaType,
+  downloadMessageMedia,
+  isViewOnceMediaMessage,
+  unwrapViewOnce,
+} from './mediaHelper.ts';
 import { logger } from './logger.ts';
 
 export interface CachedStatusEntry {
   id: string;
   msg: WAMessage;
   inner: proto.IMessage;
-  mediaType: 'image' | 'video' | 'audio' | 'text';
-  text?: string;
+  mediaType: 'image' | 'video' | 'audio';
+  caption?: string;
   mimetype?: string;
+  ptt?: boolean;
+  seconds?: number;
   senderJids: string[];
   senderPhone: string;
   pushName: string;
@@ -27,11 +34,21 @@ export interface CachedStatusEntry {
   cachedBuffer?: Buffer;
 }
 
+export interface ExtractedStatusMedia {
+  mediaType: 'image' | 'video' | 'audio';
+  inner: proto.IMessage;
+  caption?: string;
+  mimetype?: string;
+  ptt?: boolean;
+  seconds?: number;
+  isViewOnce: boolean;
+}
+
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_STATUS_ENTRIES = 250;
-const MAX_BUFFER_CACHE_ITEMS = 24;
-const MAX_SINGLE_BUFFER_BYTES = 14 * 1024 * 1024;
-const MAX_TOTAL_BUFFER_BYTES = 28 * 1024 * 1024;
+const MAX_BUFFER_CACHE_ITEMS = 28;
+const MAX_SINGLE_BUFFER_BYTES = 16 * 1024 * 1024;
+const MAX_TOTAL_BUFFER_BYTES = 36 * 1024 * 1024;
 
 const statusesById = new Map<string, CachedStatusEntry>();
 const statusIdsByUserKey = new Map<string, string[]>();
@@ -48,16 +65,35 @@ function buildUserKeys(rawList: Array<string | undefined | null>): string[] {
   for (const raw of rawList) {
     if (!raw) continue;
     const bare = normalizeBareJid(raw);
-    if (bare) keys.add(bare);
-    const user = jidUserPart(bare || raw);
+    if (!bare) continue;
+    keys.add(bare);
+    const user = jidUserPart(bare);
     if (user) keys.add(user);
-    const phone = normalizePhone(user || raw);
-    if (isValidPhone(phone)) {
-      keys.add(phone);
-      keys.add(`${phone}@s.whatsapp.net`);
+    if (!isLidUser(bare)) {
+      const phone = normalizePhone(user || raw);
+      if (isValidPhone(phone)) {
+        keys.add(phone);
+        keys.add(`${phone}@s.whatsapp.net`);
+      }
     }
   }
   return Array.from(keys);
+}
+
+function removeStatusById(id: string): void {
+  const existing = statusesById.get(id);
+  if (!existing) return;
+  statusesById.delete(id);
+  for (const key of buildUserKeys([...existing.senderJids, existing.senderPhone])) {
+    const arr = statusIdsByUserKey.get(key);
+    if (!arr) continue;
+    const filtered = arr.filter((item) => item !== id);
+    if (filtered.length === 0) {
+      statusIdsByUserKey.delete(key);
+    } else {
+      statusIdsByUserKey.set(key, filtered);
+    }
+  }
 }
 
 function pruneExpiredStatuses(now = Date.now()): void {
@@ -89,20 +125,100 @@ function enforceBufferBudget(): void {
   }
 }
 
-function removeStatusById(id: string): void {
-  const existing = statusesById.get(id);
-  if (!existing) return;
-  statusesById.delete(id);
-  for (const key of buildUserKeys([...existing.senderJids, existing.senderPhone])) {
-    const arr = statusIdsByUserKey.get(key);
-    if (!arr) continue;
-    const filtered = arr.filter((item) => item !== id);
-    if (filtered.length === 0) {
-      statusIdsByUserKey.delete(key);
-    } else {
-      statusIdsByUserKey.set(key, filtered);
+/**
+ * Recursively locates an image, video (including ptv), or audio payload inside
+ * WhatsApp Status / Group Status wrappers. Returns null for text-only statuses.
+ */
+export function extractStatusMediaPayload(
+  message: proto.IMessage | null | undefined,
+  depth = 0,
+  visited = new Set<object>()
+): ExtractedStatusMedia | null {
+  if (!message || typeof message !== 'object' || depth > 8 || visited.has(message)) {
+    return null;
+  }
+  visited.add(message);
+
+  const isViewOnce = isViewOnceMediaMessage(message);
+
+  if (message.imageMessage) {
+    return {
+      mediaType: 'image',
+      inner: { imageMessage: message.imageMessage },
+      caption: message.imageMessage.caption || undefined,
+      mimetype: message.imageMessage.mimetype || 'image/jpeg',
+      isViewOnce: isViewOnce || Boolean(message.imageMessage.viewOnce),
+    };
+  }
+  if (message.videoMessage || message.ptvMessage) {
+    const vid = message.videoMessage || message.ptvMessage;
+    return {
+      mediaType: 'video',
+      inner: message.videoMessage
+        ? { videoMessage: message.videoMessage }
+        : { ptvMessage: message.ptvMessage! },
+      caption: message.videoMessage?.caption || undefined,
+      mimetype: vid?.mimetype || 'video/mp4',
+      seconds: vid?.seconds ?? undefined,
+      isViewOnce: isViewOnce || Boolean(vid?.viewOnce),
+    };
+  }
+  if (message.audioMessage) {
+    return {
+      mediaType: 'audio',
+      inner: { audioMessage: message.audioMessage },
+      mimetype: message.audioMessage.mimetype || 'audio/mp4',
+      ptt: message.audioMessage.ptt ?? undefined,
+      seconds: message.audioMessage.seconds ?? undefined,
+      isViewOnce: isViewOnce || Boolean(message.audioMessage.viewOnce),
+    };
+  }
+
+  const candidateWrappers: Array<proto.IMessage | null | undefined> = [
+    unwrapViewOnce(message),
+    unwrapMessage(message),
+    message.groupStatusMessage?.message,
+    message.groupStatusMessageV2?.message,
+    message.groupStatusMentionMessage?.message,
+    message.statusMentionMessage?.message,
+    message.associatedChildMessage?.message,
+    message.ephemeralMessage?.message,
+    message.documentWithCaptionMessage?.message,
+    message.deviceSentMessage?.message,
+    message.botInvokeMessage?.message,
+    message.editedMessage?.message?.protocolMessage?.editedMessage,
+  ];
+
+  for (const child of candidateWrappers) {
+    if (child && child !== message) {
+      const hit = extractStatusMediaPayload(child, depth + 1, visited);
+      if (hit) {
+        return {
+          ...hit,
+          isViewOnce: hit.isViewOnce || isViewOnce,
+        };
+      }
     }
   }
+
+  // Fallback check across unwrapped top-level content types
+  const unwrapped = unwrapMessage(message);
+  if (unwrapped && unwrapped !== message) {
+    const detected = detectMediaType(unwrapped);
+    if (detected === 'image' || detected === 'video' || detected === 'audio') {
+      return extractStatusMediaPayload(unwrapped, depth + 1, visited);
+    }
+  }
+
+  return null;
+}
+
+export function hasGroupStatusMedia(message: proto.IMessage | null | undefined): boolean {
+  if (!message) return false;
+  return Boolean(
+    message.groupStatusMessage?.message ||
+      message.groupStatusMessageV2?.message
+  );
 }
 
 export async function recordBroadcastStatus(
@@ -110,26 +226,49 @@ export async function recordBroadcastStatus(
   msg: WAMessage
 ): Promise<CachedStatusEntry | null> {
   try {
-    if (!msg.key || msg.key.remoteJid !== 'status@broadcast' || !msg.key.id || !msg.message) {
+    if (!msg.key?.id) return null;
+    const isBroadcastStatus = msg.key.remoteJid === 'status@broadcast';
+    const isGroupStatus =
+      Boolean(msg.key.remoteJid?.endsWith('@g.us')) && hasGroupStatusMedia(msg.message);
+
+    if (!isBroadcastStatus && !isGroupStatus) {
       return null;
     }
 
     // Handle revoked/deleted status updates cleanly
-    if (msg.message.protocolMessage?.type === 0 && msg.message.protocolMessage.key?.id) {
+    if (msg.message?.protocolMessage?.type === 0 && msg.message.protocolMessage.key?.id) {
       removeStatusById(msg.message.protocolMessage.key.id);
       return null;
     }
 
-    const unwrapped = unwrapViewOnce(msg.message) || unwrapMessage(msg.message) || msg.message;
-    const detected = detectMediaType(unwrapped);
-    const bodyText = extractBodyText(unwrapped).trim();
+    // 4. Ignore unavailable view-once status stubs or empty payloads without crashing
+    if (!msg.message) {
+      if (msg.key.isViewOnce || msg.messageStubParameters?.length) {
+        logger.info('statusStore', `Ignored unavailable/view-once status (${msg.key.id}).`);
+      }
+      return null;
+    }
 
-    let mediaType: CachedStatusEntry['mediaType'];
-    if (detected === 'image' || detected === 'video' || detected === 'audio') {
-      mediaType = detected;
-    } else if (bodyText) {
-      mediaType = 'text';
-    } else {
+    // 1. Check strictly for image, video, or audio media payloads
+    const extracted = extractStatusMediaPayload(msg.message);
+    if (!extracted) {
+      const textPreview = extractBodyText(msg.message).trim();
+      if (textPreview) {
+        logger.info(
+          'statusStore',
+          `Ignored text-only status (${msg.key.id}): "${textPreview.slice(0, 60)}"`
+        );
+      } else {
+        logger.info('statusStore', `Ignored non-media status update (${msg.key.id}).`);
+      }
+      return null;
+    }
+
+    if (!hasValidMediaPayload(extracted.inner)) {
+      logger.info(
+        'statusStore',
+        `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${msg.key.id}).`
+      );
       return null;
     }
 
@@ -137,7 +276,9 @@ export async function recordBroadcastStatus(
     const addRaw = (val?: string | null) => {
       if (!val) return;
       const bare = normalizeBareJid(val);
-      if (bare && bare !== 'status@broadcast') rawSenders.add(bare);
+      if (bare && bare !== 'status@broadcast' && !bare.endsWith('@g.us')) {
+        rawSenders.add(bare);
+      }
     };
 
     addRaw(msg.key.participant);
@@ -151,9 +292,8 @@ export async function recordBroadcastStatus(
       addRaw(sock.authState?.creds?.me?.lid);
     }
 
-    // Resolve LID <-> PN bi-directionally so @mention or PN always finds the status
-    const currentSnapshot = Array.from(rawSenders);
-    for (const jid of currentSnapshot) {
+    // Resolve LID <-> PN bi-directionally so @mention or PN lookup always matches
+    for (const jid of Array.from(rawSenders)) {
       if (isLidUser(jid) && sock.signalRepository?.lidMapping?.getPNForLID) {
         try {
           const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
@@ -174,13 +314,15 @@ export async function recordBroadcastStatus(
     const senderJids = Array.from(rawSenders);
     if (senderJids.length === 0) return null;
 
-    const pnJid = senderJids.find((j) => j.endsWith('@s.whatsapp.net')) || senderJids[0];
-    const senderPhone = normalizePhone(jidUserPart(pnJid));
+    // Only extract senderPhone from verified @s.whatsapp.net JIDs (never format @lid as a phone number!)
+    const pnJid = senderJids.find((j) => j.endsWith('@s.whatsapp.net')) || '';
+    const candidatePhone = pnJid ? normalizePhone(jidUserPart(pnJid)) : '';
+    const senderPhone = isValidPhone(candidatePhone) ? candidatePhone : '';
 
     const cleanPush =
       (msg.pushName || '').trim() ||
       senderJids.map((j) => lookupKnownUserName(j)).find(Boolean) ||
-      (senderPhone ? `+${senderPhone}` : jidUserPart(pnJid));
+      (senderPhone ? `+${senderPhone}` : 'WhatsApp Contact');
 
     if (msg.pushName) {
       for (const j of senderJids) {
@@ -189,26 +331,15 @@ export async function recordBroadcastStatus(
       if (senderPhone) rememberUserName(senderPhone, msg.pushName);
     }
 
-    const caption =
-      mediaType === 'image'
-        ? unwrapped.imageMessage?.caption || bodyText
-        : mediaType === 'video'
-          ? unwrapped.videoMessage?.caption || bodyText
-          : bodyText;
-
-    const mimetype =
-      unwrapped.imageMessage?.mimetype ||
-      unwrapped.videoMessage?.mimetype ||
-      unwrapped.audioMessage?.mimetype ||
-      undefined;
-
     const entry: CachedStatusEntry = {
       id: msg.key.id,
-      msg,
-      inner: unwrapped,
-      mediaType,
-      text: caption || undefined,
-      mimetype: mimetype || undefined,
+      msg: { key: msg.key, message: extracted.inner },
+      inner: extracted.inner,
+      mediaType: extracted.mediaType,
+      caption: extracted.caption || undefined,
+      mimetype: extracted.mimetype,
+      ptt: extracted.ptt,
+      seconds: extracted.seconds,
       senderJids,
       senderPhone,
       pushName: cleanPush,
@@ -228,16 +359,22 @@ export async function recordBroadcastStatus(
       if (!list.includes(entry.id)) {
         list.push(entry.id);
       }
-      // Keep newest IDs bounded per key
-      list.sort((a, b) => (statusesById.get(b)?.timestampMs || 0) - (statusesById.get(a)?.timestampMs || 0));
+      list.sort(
+        (a, b) => (statusesById.get(b)?.timestampMs || 0) - (statusesById.get(a)?.timestampMs || 0)
+      );
       statusIdsByUserKey.set(key, list.slice(0, 15));
     }
 
     pruneExpiredStatuses();
 
-    // Warm small/medium media status buffer in background so expired CDN URLs don't break .savestatus
-    if (mediaType !== 'text' && !entry.cachedBuffer && hasValidMediaPayload(unwrapped)) {
-      void getOrDownloadStatusBuffer(sock, entry).catch(() => {});
+    // 2. Pre-download status media buffer using socket media downloader with safe error handling
+    if (!entry.cachedBuffer) {
+      void getOrDownloadStatusBuffer(sock, entry).catch((dlErr) => {
+        logger.warn(
+          'statusStore',
+          `Status media buffer pre-download failed (${entry.id}): ${(dlErr as Error).message}`
+        );
+      });
     }
 
     return entry;
@@ -251,7 +388,6 @@ export async function getOrDownloadStatusBuffer(
   sock: WASocket,
   entry: CachedStatusEntry
 ): Promise<Buffer | null> {
-  if (entry.mediaType === 'text') return null;
   if (entry.cachedBuffer && entry.cachedBuffer.length > 0) {
     return entry.cachedBuffer;
   }
@@ -273,7 +409,11 @@ export async function getOrDownloadStatusBuffer(
         return buf;
       }
       return null;
-    } catch {
+    } catch (err) {
+      logger.warn(
+        'statusStore',
+        `Media download/decryption failed for status ${entry.id}: ${(err as Error).message}`
+      );
       return null;
     } finally {
       statusInflight.delete(entry.id);
@@ -324,7 +464,7 @@ export function listActiveStatusPosters(limit = 8): Array<{
     const prev = byPoster.get(posterKey);
     if (!prev) {
       byPoster.set(posterKey, {
-        phone: entry.senderPhone || posterKey,
+        phone: entry.senderPhone,
         pushName: entry.pushName,
         count: 1,
         latestAt: entry.timestampMs,

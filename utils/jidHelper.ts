@@ -346,6 +346,8 @@ export function unwrapMessage(
       current.botInvokeMessage?.message ||
       current.groupStatusMessage?.message ||
       current.groupStatusMessageV2?.message ||
+      current.groupStatusMentionMessage?.message ||
+      current.statusMentionMessage?.message ||
       current.editedMessage?.message?.protocolMessage?.editedMessage ||
       current.associatedChildMessage?.message;
     if (!next) break;

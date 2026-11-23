@@ -36,14 +36,15 @@ import {
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import {
+  getUnavailableViewOnceRecord,
   precacheViewOnceMedia,
   recordUnavailableViewOnceKey,
   registerSocketPlaceholderCache,
-  sanitizeMessageKeyForPdo,
+  sendImmediateViewOncePdo,
 } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { startReminderScheduler } from '../utils/reminderStore.ts';
-import { recordBroadcastStatus } from '../utils/statusStore.ts';
+import { hasGroupStatusMedia, recordBroadcastStatus } from '../utils/statusStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
 import { handleIncomingMessage } from './message.ts';
@@ -860,21 +861,22 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
       for (const msg of messages) {
+        if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
+          void recordBroadcastStatus(sock, msg);
+        }
         if (
           msg.key?.id &&
           msg.key?.remoteJid &&
+          msg.key.remoteJid !== 'status@broadcast' &&
           !msg.message &&
           (msg.key.isViewOnce ||
             msg.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
         ) {
           recordUnavailableViewOnceKey(msg.key);
-          const cleanKey = sanitizeMessageKeyForPdo(msg.key);
-          if (cleanKey && typeof sock.requestPlaceholderResend === 'function') {
-            void sock.requestPlaceholderResend(cleanKey).catch(() => {});
+          const unavail = getUnavailableViewOnceRecord(msg.key.id);
+          if (unavail) {
+            void sendImmediateViewOncePdo(sock, [unavail.cleanKey, ...unavail.altKeys]);
           }
-        }
-        if (msg.key?.remoteJid === 'status@broadcast' && msg.message) {
-          void recordBroadcastStatus(sock, msg);
         }
         cacheMessage(msg);
         void precacheViewOnceMedia(sock, msg);
@@ -888,7 +890,7 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       for (const upd of updates) {
         if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
           const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
-          if (upd.key.remoteJid === 'status@broadcast') {
+          if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
             void recordBroadcastStatus(sock, synthetic);
           }
           cacheMessage(synthetic);
@@ -899,7 +901,7 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
 
     sock.ev.on('messaging-history.set', ({ messages }) => {
       for (const msg of messages || []) {
-        if (msg.key?.remoteJid === 'status@broadcast' && msg.message) {
+        if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
           void recordBroadcastStatus(sock, msg);
         }
         cacheMessage(msg);
@@ -1196,21 +1198,22 @@ async function connectSubSession(params: {
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     for (const m of messages) {
+      if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
+        void recordBroadcastStatus(sock, m);
+      }
       if (
         m.key?.id &&
         m.key?.remoteJid &&
+        m.key.remoteJid !== 'status@broadcast' &&
         !m.message &&
         (m.key.isViewOnce ||
           m.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
       ) {
         recordUnavailableViewOnceKey(m.key);
-        const cleanKey = sanitizeMessageKeyForPdo(m.key);
-        if (cleanKey && typeof sock.requestPlaceholderResend === 'function') {
-          void sock.requestPlaceholderResend(cleanKey).catch(() => {});
+        const unavail = getUnavailableViewOnceRecord(m.key.id);
+        if (unavail) {
+          void sendImmediateViewOncePdo(sock, [unavail.cleanKey, ...unavail.altKeys]);
         }
-      }
-      if (m.key?.remoteJid === 'status@broadcast' && m.message) {
-        void recordBroadcastStatus(sock, m);
       }
       cacheMessage(m);
       void precacheViewOnceMedia(sock, m);
@@ -1224,7 +1227,7 @@ async function connectSubSession(params: {
     for (const upd of updates) {
       if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
         const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
-        if (upd.key.remoteJid === 'status@broadcast') {
+        if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
           void recordBroadcastStatus(sock, synthetic);
         }
         cacheMessage(synthetic);
@@ -1235,7 +1238,7 @@ async function connectSubSession(params: {
 
   sock.ev.on('messaging-history.set', ({ messages }) => {
     for (const m of messages || []) {
-      if (m.key?.remoteJid === 'status@broadcast' && m.message) {
+      if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
         void recordBroadcastStatus(sock, m);
       }
       cacheMessage(m);

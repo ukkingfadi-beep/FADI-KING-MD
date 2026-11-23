@@ -98,6 +98,8 @@ export function unwrapViewOnce(message: proto.IMessage | null | undefined): prot
       current.botInvokeMessage?.message ||
       current.groupStatusMessage?.message ||
       current.groupStatusMessageV2?.message ||
+      current.groupStatusMentionMessage?.message ||
+      current.statusMentionMessage?.message ||
       current.associatedChildMessage?.message;
     if (!next) break;
     current = next;
@@ -112,6 +114,11 @@ export function unwrapViewOnce(message: proto.IMessage | null | undefined): prot
     return unwrapped;
   }
   return null;
+}
+
+export function extractBinaryBuffer(val: unknown): Buffer | undefined {
+  const bytes = toBinaryBuffer(val);
+  return bytes && bytes.length > 0 ? Buffer.from(bytes) : undefined;
 }
 
 function toBinaryBuffer(val: unknown): Uint8Array | undefined {
@@ -320,6 +327,43 @@ export function getUnavailableViewOnceKey(msgId: string): WAMessage['key'] | und
 export function getUnavailableViewOnceRecord(msgId: string): UnavailableViewOnceEntry | undefined {
   if (!msgId) return undefined;
   return unavailableViewOnceKeys.get(msgId);
+}
+
+export async function sendImmediateViewOncePdo(
+  sock: WASocket,
+  candidates: WAMessageKey[]
+): Promise<boolean> {
+  const unique: WAMessageKey[] = [];
+  const seen = new Set<string>();
+  for (const k of candidates) {
+    const clean = sanitizeMessageKeyForPdo(k);
+    if (!clean?.id || !clean?.remoteJid) continue;
+    const sig = `${clean.remoteJid}|${Boolean(clean.fromMe)}|${clean.participant || ''}|${clean.id}`;
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    unique.push(clean);
+  }
+  if (unique.length === 0) return false;
+
+  if (typeof sock.sendPeerDataOperationMessage === 'function') {
+    try {
+      await sock.sendPeerDataOperationMessage({
+        placeholderMessageResendRequest: unique.map((messageKey) => ({ messageKey })),
+        peerDataOperationRequestType:
+          proto.Message.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND,
+      });
+      return true;
+    } catch {
+      // Fall back to standard Baileys requestPlaceholderResend
+    }
+  }
+
+  if (typeof sock.requestPlaceholderResend === 'function') {
+    await sock.requestPlaceholderResend(unique[0]).catch(() => {});
+    return true;
+  }
+
+  return false;
 }
 
 function getViewOnceDiskDir(): string {
@@ -658,6 +702,10 @@ export async function convertStickerToPng(webpBuffer: Buffer): Promise<Buffer> {
 
 export function detectMediaType(message: proto.IMessage | null | undefined): 'image' | 'video' | 'sticker' | 'audio' | 'unknown' {
   if (!message) return 'unknown';
+  if (message.imageMessage) return 'image';
+  if (message.videoMessage || message.ptvMessage) return 'video';
+  if (message.audioMessage) return 'audio';
+  if (message.stickerMessage) return 'sticker';
   const type = getContentType(message);
   if (type === 'imageMessage') return 'image';
   if (type === 'videoMessage' || type === 'ptvMessage') return 'video';
