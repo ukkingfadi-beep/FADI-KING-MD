@@ -35,9 +35,15 @@ import {
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
-import { precacheViewOnceMedia, recordUnavailableViewOnceKey } from '../utils/mediaHelper.ts';
+import {
+  precacheViewOnceMedia,
+  recordUnavailableViewOnceKey,
+  registerSocketPlaceholderCache,
+  sanitizeMessageKeyForPdo,
+} from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { startReminderScheduler } from '../utils/reminderStore.ts';
+import { recordBroadcastStatus } from '../utils/statusStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
 import { handleIncomingMessage } from './message.ts';
@@ -137,6 +143,7 @@ function createBoundedCacheStore(maxEntries = 3000, ttlMs = 10 * 60_000): CacheS
 
 // Shared bounded cache across sockets avoids spawning hundreds of NodeCache timers
 const sharedMsgRetryCache = createBoundedCacheStore(4000, 5 * 60_000);
+const sharedPlaceholderResendCache = createBoundedCacheStore(2000, 45_000);
 
 function cacheMessage(msg: WAMessage): void {
   const jid = msg.key?.remoteJid;
@@ -693,12 +700,14 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       retryRequestDelayMs: 300,
       maxMsgRetryCount: 2,
       msgRetryCounterCache: sharedMsgRetryCache,
+      placeholderResendCache: sharedPlaceholderResendCache,
       generateHighQualityLinkPreview: false,
       getMessage: getBaileysMessage,
       cachedGroupMetadata: getGroupMetadataFromCacheOnly,
     });
 
     mainSock = sock;
+    registerSocketPlaceholderCache(sock, sharedPlaceholderResendCache);
     sock.ev.on('creds.update', async () => {
       await saveCreds();
       scheduleAuthBackup('main', authDir);
@@ -859,9 +868,13 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
             msg.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
         ) {
           recordUnavailableViewOnceKey(msg.key);
-          if (typeof sock.requestPlaceholderResend === 'function') {
-            void sock.requestPlaceholderResend(msg.key).catch(() => {});
+          const cleanKey = sanitizeMessageKeyForPdo(msg.key);
+          if (cleanKey && typeof sock.requestPlaceholderResend === 'function') {
+            void sock.requestPlaceholderResend(cleanKey).catch(() => {});
           }
+        }
+        if (msg.key?.remoteJid === 'status@broadcast' && msg.message) {
+          void recordBroadcastStatus(sock, msg);
         }
         cacheMessage(msg);
         void precacheViewOnceMedia(sock, msg);
@@ -875,6 +888,9 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       for (const upd of updates) {
         if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
           const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
+          if (upd.key.remoteJid === 'status@broadcast') {
+            void recordBroadcastStatus(sock, synthetic);
+          }
           cacheMessage(synthetic);
           void precacheViewOnceMedia(sock, synthetic);
         }
@@ -883,6 +899,9 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
 
     sock.ev.on('messaging-history.set', ({ messages }) => {
       for (const msg of messages || []) {
+        if (msg.key?.remoteJid === 'status@broadcast' && msg.message) {
+          void recordBroadcastStatus(sock, msg);
+        }
         cacheMessage(msg);
         void precacheViewOnceMedia(sock, msg);
       }
@@ -1012,10 +1031,13 @@ async function connectSubSession(params: {
     retryRequestDelayMs: 300,
     maxMsgRetryCount: 2,
     msgRetryCounterCache: sharedMsgRetryCache,
+    placeholderResendCache: sharedPlaceholderResendCache,
     generateHighQualityLinkPreview: false,
     getMessage: getBaileysMessage,
     cachedGroupMetadata: getGroupMetadataFromCacheOnly,
   });
+
+  registerSocketPlaceholderCache(sock, sharedPlaceholderResendCache);
 
   const sessionInfo: ActiveSessionInfo = params.existingInfo || {
     sessionId,
@@ -1182,9 +1204,13 @@ async function connectSubSession(params: {
           m.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
       ) {
         recordUnavailableViewOnceKey(m.key);
-        if (typeof sock.requestPlaceholderResend === 'function') {
-          void sock.requestPlaceholderResend(m.key).catch(() => {});
+        const cleanKey = sanitizeMessageKeyForPdo(m.key);
+        if (cleanKey && typeof sock.requestPlaceholderResend === 'function') {
+          void sock.requestPlaceholderResend(cleanKey).catch(() => {});
         }
+      }
+      if (m.key?.remoteJid === 'status@broadcast' && m.message) {
+        void recordBroadcastStatus(sock, m);
       }
       cacheMessage(m);
       void precacheViewOnceMedia(sock, m);
@@ -1198,6 +1224,9 @@ async function connectSubSession(params: {
     for (const upd of updates) {
       if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
         const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
+        if (upd.key.remoteJid === 'status@broadcast') {
+          void recordBroadcastStatus(sock, synthetic);
+        }
         cacheMessage(synthetic);
         void precacheViewOnceMedia(sock, synthetic);
       }
@@ -1206,6 +1235,9 @@ async function connectSubSession(params: {
 
   sock.ev.on('messaging-history.set', ({ messages }) => {
     for (const m of messages || []) {
+      if (m.key?.remoteJid === 'status@broadcast' && m.message) {
+        void recordBroadcastStatus(sock, m);
+      }
       cacheMessage(m);
       void precacheViewOnceMedia(sock, m);
     }

@@ -9,8 +9,10 @@ import {
   downloadMediaMessage,
   getContentType,
   proto,
+  type CacheStore,
   type MediaType,
   type WAMessage,
+  type WAMessageKey,
   type WASocket,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
@@ -239,19 +241,83 @@ const MAX_VIEW_ONCE_CACHE_ITEMS = 45;
 const MAX_VIEW_ONCE_CACHE_BYTES = 25 * 1024 * 1024;
 const viewOnceMediaCache = new Map<string, CachedViewOnceEntry>();
 const viewOnceInflight = new Map<string, Promise<void>>();
-const unavailableViewOnceKeys = new Map<string, WAMessage['key']>();
+
+export interface UnavailableViewOnceEntry {
+  cleanKey: WAMessageKey;
+  altKeys: WAMessageKey[];
+  recordedAt: number;
+}
+
+const unavailableViewOnceKeys = new Map<string, UnavailableViewOnceEntry>();
+const socketPlaceholderCaches = new WeakMap<WASocket, CacheStore>();
+
+export function registerSocketPlaceholderCache(sock: WASocket, cache: CacheStore): void {
+  socketPlaceholderCaches.set(sock, cache);
+}
+
+export async function clearSocketPlaceholderCacheEntry(sock: WASocket, msgId: string): Promise<void> {
+  const cache = socketPlaceholderCaches.get(sock);
+  if (!cache || !msgId) return;
+  try {
+    await cache.del(msgId);
+  } catch {
+    // Ignore cache delete errors
+  }
+}
+
+export function sanitizeMessageKeyForPdo(key: WAMessage['key'] | null | undefined): WAMessageKey | undefined {
+  if (!key?.id || !key?.remoteJid) return undefined;
+  return {
+    remoteJid: key.remoteJid,
+    fromMe: Boolean(key.fromMe),
+    id: key.id,
+    ...(key.participant ? { participant: key.participant } : {}),
+  };
+}
 
 export function recordUnavailableViewOnceKey(key: WAMessage['key'] | null | undefined): void {
   const id = key?.id;
-  if (!id) return;
-  unavailableViewOnceKeys.set(id, key);
-  if (unavailableViewOnceKeys.size > 200) {
+  const cleanKey = sanitizeMessageKeyForPdo(key);
+  if (!id || !cleanKey) return;
+
+  const altKeys: WAMessageKey[] = [];
+  if (key?.remoteJidAlt && key.remoteJidAlt !== key.remoteJid) {
+    altKeys.push({
+      remoteJid: key.remoteJidAlt,
+      fromMe: Boolean(key.fromMe),
+      id,
+      ...(key.participantAlt
+        ? { participant: key.participantAlt }
+        : key.participant
+          ? { participant: key.participant }
+          : {}),
+    });
+  } else if (key?.participantAlt && key.participantAlt !== key.participant) {
+    altKeys.push({
+      remoteJid: cleanKey.remoteJid,
+      fromMe: Boolean(key.fromMe),
+      id,
+      participant: key.participantAlt,
+    });
+  }
+
+  unavailableViewOnceKeys.set(id, {
+    cleanKey,
+    altKeys,
+    recordedAt: Date.now(),
+  });
+  if (unavailableViewOnceKeys.size > 250) {
     const oldest = unavailableViewOnceKeys.keys().next().value;
     if (oldest) unavailableViewOnceKeys.delete(oldest);
   }
 }
 
 export function getUnavailableViewOnceKey(msgId: string): WAMessage['key'] | undefined {
+  if (!msgId) return undefined;
+  return unavailableViewOnceKeys.get(msgId)?.cleanKey;
+}
+
+export function getUnavailableViewOnceRecord(msgId: string): UnavailableViewOnceEntry | undefined {
   if (!msgId) return undefined;
   return unavailableViewOnceKeys.get(msgId);
 }
@@ -434,13 +500,16 @@ export async function precacheViewOnceMedia(
   const chatId = msg.key?.remoteJid;
   const msgId = msg.key?.id;
   if (!chatId || !msgId || !msg.message) return;
-  if (!isViewOnceMediaMessage(msg.message)) return;
+  const isKnownViewOnce = isViewOnceMediaMessage(msg.message) || unavailableViewOnceKeys.has(msgId);
+  if (!isKnownViewOnce) return;
 
   const bareChat = normalizeBareJid(chatId);
   const idKey = `id:${msgId}`;
   if (viewOnceMediaCache.has(idKey) || viewOnceInflight.has(msgId)) return;
 
-  const inner = unwrapViewOnce(msg.message);
+  const inner =
+    unwrapViewOnce(msg.message) ||
+    (unavailableViewOnceKeys.has(msgId) ? unwrapMessage(msg.message) || msg.message : null);
   if (!inner || !hasValidMediaPayload(inner)) return;
 
   const mediaType = detectMediaType(inner);

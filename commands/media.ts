@@ -1,20 +1,23 @@
 import QRCode from 'qrcode';
-import type { WAMessage } from '@whiskeysockets/baileys';
+import type { WAMessage, WAMessageKey } from '@whiskeysockets/baileys';
 import { isValidPhone, loadConfig, normalizePhone } from '../config/bot.config.ts';
 import {
   extractBodyText,
   extractContextInfo,
   extractRawTargetCandidates,
   getBotJids,
+  getCachedGroupMetadata,
   hasValidMediaPayload,
   isLidUser,
   jidUserPart,
   lookupKnownUserName,
   normalizeBareJid,
+  participantMatchesAny,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import {
   applyBassBoostEffect,
+  clearSocketPlaceholderCacheEntry,
   convertAudioPartsToWhatsAppVoice,
   convertMediaToWebpSticker,
   convertStickerToPng,
@@ -23,13 +26,20 @@ import {
   extractQuotedMessage,
   getCachedViewOnceMedia,
   getCachedViewOnceMeta,
-  getUnavailableViewOnceKey,
+  getUnavailableViewOnceRecord,
   inspectWebpStickerBuffer,
   isFfmpegAvailable,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
   waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
+import {
+  findStatusesForUser,
+  getOrDownloadStatusBuffer,
+  getStatusById,
+  listActiveStatusPosters,
+  type CachedStatusEntry,
+} from '../utils/statusStore.ts';
 import { getRecentChatMessages } from '../utils/chatHistoryStore.ts';
 import {
   generateBioOptionsReply,
@@ -241,12 +251,16 @@ export const mediaCommands: BotCommand[] = [
         ptt?: boolean;
         seconds?: number;
       }) => {
+        if (!params.buffer || params.buffer.length === 0) {
+          throw new Error('Recovered View-Once media buffer was empty.');
+        }
         const cfg = loadConfig();
         if (params.type === 'image') {
           await ctx.sock!.sendMessage(
             ctx.chatId,
             {
               image: params.buffer,
+              mimetype: params.mimetype || 'image/jpeg',
               caption: params.caption || `👁️ View-Once Photo extracted by ${cfg.botName}`,
             },
             { quoted: ctx.msg! }
@@ -258,6 +272,7 @@ export const mediaCommands: BotCommand[] = [
             ctx.chatId,
             {
               video: params.buffer,
+              mimetype: params.mimetype || 'video/mp4',
               caption: params.caption || `👁️ View-Once Video extracted by ${cfg.botName}`,
             },
             { quoted: ctx.msg! }
@@ -265,7 +280,6 @@ export const mediaCommands: BotCommand[] = [
           return;
         }
 
-        // Audio / Voice Note recovery: convert non-ogg payloads cleanly to playable OGG/Opus PTT when ffmpeg is available
         const mime = (params.mimetype || '').toLowerCase();
         const isOggOpus = mime.includes('ogg') || mime.includes('opus');
         if (!isOggOpus && (await isFfmpegAvailable())) {
@@ -302,12 +316,13 @@ export const mediaCommands: BotCommand[] = [
 
       const ctxInfo = extractContextInfo(ctx.msg.message);
       const stanzaId = ctxInfo?.stanzaId || '';
+      const cacheLookupId = stanzaId || ctx.msg.key?.id || '';
 
       // 1. Check pre-cached View-Once media buffer first (RAM + disk cache, survives restarts)
-      if (stanzaId) {
-        await waitForViewOnceInflight(stanzaId);
-        const preCached = getCachedViewOnceMedia(ctx.chatId, stanzaId);
-        if (preCached) {
+      if (cacheLookupId) {
+        await waitForViewOnceInflight(cacheLookupId);
+        const preCached = getCachedViewOnceMedia(ctx.chatId, cacheLookupId);
+        if (preCached && preCached.buffer.length > 0) {
           await sendRecoveredMedia(preCached);
           return 'View-Once media unwrapped.';
         }
@@ -323,17 +338,45 @@ export const mediaCommands: BotCommand[] = [
         rawQuoted;
 
       const botJids = await getBotJids(ctx.sock);
-      const quotedParticipant = ctxInfo?.participant || undefined;
+      const botUserParts = new Set(botJids.map((b) => jidUserPart(b)).filter(Boolean));
+      let quotedParticipant = ctxInfo?.participant || undefined;
+
+      // Resolve quotedParticipant LID -> PN too for accurate fromMe detection
+      let quotedParticipantAlt: string | undefined;
+      if (
+        quotedParticipant &&
+        isLidUser(quotedParticipant) &&
+        ctx.sock.signalRepository?.lidMapping?.getPNForLID
+      ) {
+        try {
+          const pn = await ctx.sock.signalRepository.lidMapping.getPNForLID(
+            normalizeBareJid(quotedParticipant)
+          );
+          if (pn) quotedParticipantAlt = normalizeBareJid(pn);
+        } catch {
+          // Ignore LID lookup errors
+        }
+      }
+
+      const unavailRecord = stanzaId ? getUnavailableViewOnceRecord(stanzaId) : undefined;
+      const isSelfChat =
+        !ctx.isGroup &&
+        (botUserParts.has(jidUserPart(ctx.chatId)) ||
+          Boolean(ctx.msg.key?.remoteJidAlt && botUserParts.has(jidUserPart(ctx.msg.key.remoteJidAlt))));
+
       const quotedFromBot = Boolean(
-        quotedParticipant && botJids.some((b) => jidUserPart(b) === jidUserPart(quotedParticipant))
+        unavailRecord?.cleanKey.fromMe ||
+          (quotedParticipant && botUserParts.has(jidUserPart(quotedParticipant))) ||
+          (quotedParticipantAlt && botUserParts.has(jidUserPart(quotedParticipantAlt))) ||
+          (!quotedParticipant && isSelfChat && ctx.msg.key?.fromMe)
       );
 
-      let sourceKey = stanzaId
-        ? {
+      let sourceKey: WAMessageKey = stanzaId
+        ? unavailRecord?.cleanKey || {
             remoteJid: ctx.chatId,
             fromMe: quotedFromBot,
             id: stanzaId,
-            participant: quotedParticipant,
+            ...(quotedParticipant ? { participant: quotedParticipant } : {}),
           }
         : ctx.msg.key;
 
@@ -372,24 +415,68 @@ export const mediaCommands: BotCommand[] = [
         }
       }
 
-      // 3. On-demand PDO placeholder resend request to primary mobile phone when View-Once payload was withheld
-      const unavailKey = stanzaId ? getUnavailableViewOnceKey(stanzaId) : undefined;
+      // 3. On-demand PDO placeholder resend request across PN/LID key variants
       if (
         stanzaId &&
         (!inner || !hasValidMediaPayload(unwrapViewOnce(inner) || unwrapMessage(inner) || inner)) &&
         typeof ctx.sock.requestPlaceholderResend === 'function'
       ) {
-        const resendKey = unavailKey || sourceKey;
-        try {
-          await ctx.sock.requestPlaceholderResend(resendKey);
-        } catch {
-          // Ignore PDO request error if already inflight
+        const pdoCandidates: WAMessageKey[] = [];
+        const seenPdo = new Set<string>();
+        const pushPdoKey = (k: WAMessageKey | undefined) => {
+          if (!k?.id || !k?.remoteJid) return;
+          const sig = `${k.remoteJid}|${Boolean(k.fromMe)}|${k.participant || ''}`;
+          if (seenPdo.has(sig)) return;
+          seenPdo.add(sig);
+          pdoCandidates.push(k);
+        };
+
+        pushPdoKey(unavailRecord?.cleanKey);
+        for (const alt of unavailRecord?.altKeys || []) {
+          pushPdoKey(alt);
         }
-        for (let attempt = 0; attempt < 11; attempt += 1) {
-          await new Promise((r) => setTimeout(r, 450));
+        pushPdoKey({
+          remoteJid: ctx.chatId,
+          fromMe: quotedFromBot,
+          id: stanzaId,
+          ...(quotedParticipant ? { participant: quotedParticipant } : {}),
+        });
+        if (remoteJidAlt) {
+          pushPdoKey({
+            remoteJid: remoteJidAlt,
+            fromMe: quotedFromBot,
+            id: stanzaId,
+            ...(quotedParticipantAlt
+              ? { participant: quotedParticipantAlt }
+              : quotedParticipant
+                ? { participant: quotedParticipant }
+                : {}),
+          });
+        }
+        if (!ctx.isGroup && !unavailRecord && !quotedParticipant) {
+          pushPdoKey({
+            remoteJid: remoteJidAlt || ctx.chatId,
+            fromMe: !quotedFromBot,
+            id: stanzaId,
+          });
+        }
+
+        const primaryKey = pdoCandidates[0];
+        if (primaryKey) {
+          await clearSocketPlaceholderCacheEntry(ctx.sock, stanzaId);
+          try {
+            await ctx.sock.requestPlaceholderResend(primaryKey);
+          } catch {
+            // Ignore PDO request error
+          }
+        }
+
+        let triedAlt = false;
+        for (let attempt = 0; attempt < 22; attempt += 1) {
+          await new Promise((r) => setTimeout(r, 380));
           await waitForViewOnceInflight(stanzaId);
           const preCachedAfterPdo = getCachedViewOnceMedia(ctx.chatId, stanzaId);
-          if (preCachedAfterPdo) {
+          if (preCachedAfterPdo && preCachedAfterPdo.buffer.length > 0) {
             await sendRecoveredMedia(preCachedAfterPdo);
             return 'View-Once media unwrapped.';
           }
@@ -398,6 +485,16 @@ export const mediaCommands: BotCommand[] = [
             inner = hit.inner;
             sourceKey = hit.key;
             break;
+          }
+          // Halfway through, if primary key did not resolve and an alternate PN/LID key exists, retry with it
+          if (!triedAlt && attempt === 10 && pdoCandidates[1]) {
+            triedAlt = true;
+            await clearSocketPlaceholderCacheEntry(ctx.sock, stanzaId);
+            try {
+              await ctx.sock.requestPlaceholderResend(pdoCandidates[1]);
+            } catch {
+              // Ignore PDO retry error
+            }
           }
         }
       }
@@ -417,9 +514,9 @@ export const mediaCommands: BotCommand[] = [
       }
 
       if (!hasValidMediaPayload(unwrappedInner)) {
-        const msg = unavailKey
-          ? 'WhatsApp withheld this View-Once media key from linked Web sessions (`view_once_unavailable_fanout`) and your primary phone did not resend it.'
-          : 'This View-Once media has no decryption key (WhatsApp blocked View-Once fanout to linked Web sessions or it was already opened/expired before arrival).';
+        const msg = unavailRecord
+          ? 'WhatsApp blocked this View-Once photo/media key from linked Web sessions (`view_once_unavailable_fanout`) and the primary phone did not resend it.'
+          : 'This View-Once media key was stripped or expired before arrival (not recoverable on linked Web sessions).';
         await ctx.reply(msg);
         return msg;
       }
@@ -586,10 +683,285 @@ export const mediaCommands: BotCommand[] = [
     },
   },
   {
-    name: 'save',
-    aliases: ['vv2', 'grab', 'savestatus', 'statusdl', 'send'],
+    name: 'savestatus',
+    aliases: ['statusdl', 'getstatus'],
     category: 'media',
-    description: 'Kisi ka WhatsApp status, media, ya View-Once download karke aapke inbox (DM) mein bheje',
+    description:
+      'Kisi ko bhi mention/number/reply karke uska WhatsApp Status isi chat aur aapke inbox (IB) dono mein save kare',
+    usage: 'savestatus [@user | number | reply] [all]',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg =
+          'Mention `@user`, pass a phone number, or reply to a WhatsApp Status/message with `.savestatus` to save their status in both this chat and your IB.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const sock = ctx.sock;
+      const incomingMsg = ctx.msg;
+      const ctxInfo = extractContextInfo(incomingMsg.message);
+      const stanzaId = ctxInfo?.stanzaId || '';
+      const quoted = extractQuotedMessage(incomingMsg);
+
+      const ownBotPhone = normalizePhone(jidUserPart(sock.user?.id));
+      const targetDm =
+        incomingMsg.key?.fromMe && ownBotPhone
+          ? `${ownBotPhone}@s.whatsapp.net`
+          : isValidPhone(ctx.senderNumber)
+            ? `${ctx.senderNumber}@s.whatsapp.net`
+            : normalizeBareJid(ctx.senderJid);
+
+      const sameAsCurrentChat =
+        Boolean(targetDm) &&
+        (normalizeBareJid(targetDm) === normalizeBareJid(ctx.chatId) ||
+          (Boolean(jidUserPart(targetDm)) && jidUserPart(targetDm) === jidUserPart(ctx.chatId)));
+
+      const deliverStatusToBoth = async (
+        entry: CachedStatusEntry,
+        footerNote?: string
+      ): Promise<void> => {
+        const posterTag = entry.senderPhone ? `+${entry.senderPhone}` : entry.pushName;
+        const header = `*Saved Status* (${entry.pushName}${entry.senderPhone && !entry.pushName.includes(entry.senderPhone) ? ` • ${posterTag}` : ''})`;
+        const noteSuffix = footerNote ? `\n_${footerNote}_` : '';
+
+        if (entry.mediaType === 'text') {
+          const textPayload = `${header}\n\n${entry.text || ''}${noteSuffix}`.trim();
+          await sock.sendMessage(ctx.chatId, { text: textPayload }, { quoted: incomingMsg });
+          if (!sameAsCurrentChat && targetDm) {
+            await sock.sendMessage(targetDm, { text: textPayload });
+          }
+          return;
+        }
+
+        const buf = await getOrDownloadStatusBuffer(sock, entry);
+        if (!buf || buf.length === 0) {
+          throw new Error('Status media payload expired or could not be downloaded.');
+        }
+
+        const caption = [header, entry.text ? `\n${entry.text}` : '', noteSuffix]
+          .filter(Boolean)
+          .join('')
+          .trim();
+
+        if (entry.mediaType === 'image') {
+          await sock.sendMessage(
+            ctx.chatId,
+            { image: buf, mimetype: entry.mimetype || 'image/jpeg', caption },
+            { quoted: incomingMsg }
+          );
+          if (!sameAsCurrentChat && targetDm) {
+            await sock.sendMessage(targetDm, {
+              image: buf,
+              mimetype: entry.mimetype || 'image/jpeg',
+              caption,
+            });
+          }
+          return;
+        }
+
+        if (entry.mediaType === 'video') {
+          await sock.sendMessage(
+            ctx.chatId,
+            { video: buf, mimetype: entry.mimetype || 'video/mp4', caption },
+            { quoted: incomingMsg }
+          );
+          if (!sameAsCurrentChat && targetDm) {
+            await sock.sendMessage(targetDm, {
+              video: buf,
+              mimetype: entry.mimetype || 'video/mp4',
+              caption,
+            });
+          }
+          return;
+        }
+
+        // Audio / voice status
+        await sock.sendMessage(
+          ctx.chatId,
+          { audio: buf, mimetype: entry.mimetype || 'audio/mp4' },
+          { quoted: incomingMsg }
+        );
+        if (!sameAsCurrentChat && targetDm) {
+          await sock.sendMessage(targetDm, {
+            audio: buf,
+            mimetype: entry.mimetype || 'audio/mp4',
+          });
+          await sock.sendMessage(targetDm, { text: `${header}${noteSuffix}` });
+        }
+      };
+
+      // Mode A: Direct reply to a status@broadcast message
+      const isDirectStatusReply = Boolean(
+        stanzaId &&
+          (ctxInfo?.remoteJid === 'status@broadcast' ||
+            getStatusById(stanzaId) ||
+            ctx.getCachedMessage?.('status@broadcast', stanzaId))
+      );
+
+      if (isDirectStatusReply) {
+        const storeHit = getStatusById(stanzaId);
+        if (storeHit) {
+          try {
+            await deliverStatusToBoth(storeHit);
+            return sameAsCurrentChat
+              ? 'Status saved in this chat.'
+              : 'Status saved in this chat and sent to your IB.';
+          } catch (err) {
+            const msg = `Save status failed: ${(err as Error).message}`;
+            await ctx.reply(msg);
+            return msg;
+          }
+        }
+
+        const cachedBroadcast = ctx.getCachedMessage?.('status@broadcast', stanzaId);
+        const rawInner =
+          (cachedBroadcast?.message
+            ? unwrapViewOnce(cachedBroadcast.message) || unwrapMessage(cachedBroadcast.message)
+            : null) ||
+          unwrapViewOnce(quoted) ||
+          unwrapMessage(quoted) ||
+          quoted;
+
+        if (rawInner) {
+          const mediaType = detectMediaType(rawInner);
+          const bodyText = extractBodyText(rawInner).trim();
+          const syntheticEntry: CachedStatusEntry = {
+            id: stanzaId,
+            msg: cachedBroadcast || { key: incomingMsg.key, message: rawInner },
+            inner: rawInner,
+            mediaType:
+              mediaType === 'image' || mediaType === 'video' || mediaType === 'audio'
+                ? mediaType
+                : 'text',
+            text:
+              mediaType === 'image'
+                ? rawInner.imageMessage?.caption || bodyText || undefined
+                : mediaType === 'video'
+                  ? rawInner.videoMessage?.caption || bodyText || undefined
+                  : bodyText || undefined,
+            mimetype:
+              rawInner.imageMessage?.mimetype ||
+              rawInner.videoMessage?.mimetype ||
+              rawInner.audioMessage?.mimetype ||
+              undefined,
+            senderJids: ctxInfo?.participant ? [normalizeBareJid(ctxInfo.participant)] : [],
+            senderPhone: normalizePhone(jidUserPart(ctxInfo?.participant)),
+            pushName:
+              lookupKnownUserName(ctxInfo?.participant) ||
+              (ctxInfo?.participant ? `+${jidUserPart(ctxInfo.participant)}` : 'Contact'),
+            timestampMs: Date.now(),
+          };
+          if (syntheticEntry.mediaType !== 'text' || syntheticEntry.text) {
+            try {
+              await deliverStatusToBoth(syntheticEntry);
+              return sameAsCurrentChat
+                ? 'Status saved in this chat.'
+                : 'Status saved in this chat and sent to your IB.';
+            } catch (err) {
+              const msg = `Save status failed: ${(err as Error).message}`;
+              await ctx.reply(msg);
+              return msg;
+            }
+          }
+        }
+      }
+
+      // Mode B: Target user via @mention, phone number, replied message's sender, or 1-on-1 DM peer
+      const wantAll = ctx.args.some((a) => a.toLowerCase() === 'all');
+      const cleanedArgs = ctx.args.filter((a) => a.toLowerCase() !== 'all');
+      const rawTargets = extractRawTargetCandidates(incomingMsg, cleanedArgs);
+
+      if (rawTargets.length === 0 && !ctx.isGroup) {
+        const peer = incomingMsg.key?.remoteJidAlt || ctx.chatId;
+        if (peer) rawTargets.push(normalizeBareJid(peer));
+      }
+
+      if (rawTargets.length === 0) {
+        const posters = listActiveStatusPosters(5);
+        const activeHint =
+          posters.length > 0
+            ? `\n\n*Recent cached status posters:*\n${posters
+                .map((p) => `• ${p.pushName} (+${p.phone}) — ${p.count} status(es)`)
+                .join('\n')}`
+            : '';
+        const msg = `Mention someone, pass a phone number, or reply to a status/message.\nUsage: \`${ctx.prefix}savestatus @user\` or \`${ctx.prefix}savestatus 923001234567\`${activeHint}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const resolvedCandidates = new Set<string>(rawTargets);
+      for (const raw of rawTargets) {
+        const bare = normalizeBareJid(raw);
+        if (!bare) continue;
+        resolvedCandidates.add(bare);
+        if (isLidUser(bare) && sock.signalRepository?.lidMapping?.getPNForLID) {
+          try {
+            const pn = await sock.signalRepository.lidMapping.getPNForLID(bare);
+            if (pn) resolvedCandidates.add(normalizeBareJid(pn));
+          } catch {
+            // Ignore LID mapping error
+          }
+        } else if (bare.endsWith('@s.whatsapp.net') && sock.signalRepository?.lidMapping?.getLIDForPN) {
+          try {
+            const lid = await sock.signalRepository.lidMapping.getLIDForPN(bare);
+            if (lid) resolvedCandidates.add(normalizeBareJid(lid));
+          } catch {
+            // Ignore PN mapping error
+          }
+        }
+      }
+
+      if (ctx.isGroup) {
+        try {
+          const meta = await getCachedGroupMetadata(sock, ctx.chatId);
+          for (const p of meta.participants) {
+            if (participantMatchesAny(p, Array.from(resolvedCandidates))) {
+              if (p.id) resolvedCandidates.add(normalizeBareJid(p.id));
+              if (p.lid) resolvedCandidates.add(normalizeBareJid(p.lid));
+              if (p.phoneNumber) resolvedCandidates.add(normalizeBareJid(p.phoneNumber));
+            }
+          }
+        } catch {
+          // Ignore group metadata lookup failure
+        }
+      }
+
+      const candidateList = Array.from(resolvedCandidates);
+      const userStatuses = findStatusesForUser(candidateList);
+      if (userStatuses.length === 0) {
+        const displayTarget =
+          candidateList.map((c) => lookupKnownUserName(c)).find(Boolean) ||
+          `+${jidUserPart(candidateList.find((c) => c.endsWith('@s.whatsapp.net')) || candidateList[0])}`;
+        const msg = `No cached WhatsApp status found for *${displayTarget}* yet.\n• Ask them to post/refresh a status while the bot is online, or reply directly to their status with \`${ctx.prefix}savestatus\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const toSend = wantAll ? userStatuses.slice(0, 5) : [userStatuses[0]];
+      try {
+        for (let i = 0; i < toSend.length; i += 1) {
+          const note =
+            !wantAll && userStatuses.length > 1
+              ? `1 of ${userStatuses.length} cached statuses — send ${ctx.prefix}savestatus @user all to get all`
+              : wantAll && toSend.length > 1
+                ? `Status ${i + 1} of ${toSend.length}`
+                : undefined;
+          await deliverStatusToBoth(toSend[i], note);
+        }
+        return `Delivered ${toSend.length} status update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
+      } catch (err) {
+        const msg = `Save status failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'save',
+    aliases: ['vv2', 'grab', 'send'],
+    category: 'media',
+    description: 'Replied status, photo, video, audio ya View-Once ko aapke inbox (DM) mein bheje',
     usage: 'save (reply to status/media/view-once)',
     cooldownSeconds: 2,
     execute: async (ctx) => {
@@ -600,43 +972,85 @@ export const mediaCommands: BotCommand[] = [
         return msg;
       }
       const ctxInfo = extractContextInfo(ctx.msg.message);
-      const quoted = extractQuotedMessage(ctx.msg);
-      let inner = unwrapViewOnce(quoted) || unwrapMessage(quoted) || quoted;
-
-      // Check both chat cache AND status@broadcast cache if WhatsApp stripped directPath/url
-      if ((!inner || !hasValidMediaPayload(inner)) && ctxInfo?.stanzaId && ctx.getCachedMessage) {
-        const cacheLookups = [
-          ctx.getCachedMessage(ctx.chatId, ctxInfo.stanzaId),
-          ctx.getCachedMessage('status@broadcast', ctxInfo.stanzaId),
-          ctxInfo.remoteJid ? ctx.getCachedMessage(ctxInfo.remoteJid, ctxInfo.stanzaId) : undefined,
-        ];
-        for (const cachedOrig of cacheLookups) {
-          if (cachedOrig?.message) {
-            const cachedInner =
-              unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
-            if (cachedInner && (hasValidMediaPayload(cachedInner) || !inner)) {
-              inner = cachedInner;
-              if (hasValidMediaPayload(cachedInner)) break;
-            }
-          }
-        }
-      }
-
+      const stanzaId = ctxInfo?.stanzaId || '';
       const ownBotPhone = normalizePhone(jidUserPart(ctx.sock.user?.id));
       const targetDm =
         ctx.msg.key?.fromMe && ownBotPhone
           ? `${ownBotPhone}@s.whatsapp.net`
           : `${ctx.senderNumber}@s.whatsapp.net`;
 
+      if (stanzaId) {
+        await waitForViewOnceInflight(stanzaId);
+        const preCached = getCachedViewOnceMedia(ctx.chatId, stanzaId);
+        if (preCached && preCached.buffer.length > 0) {
+          if (preCached.type === 'image') {
+            await ctx.sock.sendMessage(targetDm, {
+              image: preCached.buffer,
+              mimetype: preCached.mimetype || 'image/jpeg',
+              caption: preCached.caption,
+            });
+          } else if (preCached.type === 'video') {
+            await ctx.sock.sendMessage(targetDm, {
+              video: preCached.buffer,
+              mimetype: preCached.mimetype || 'video/mp4',
+              caption: preCached.caption,
+            });
+          } else {
+            await ctx.sock.sendMessage(targetDm, {
+              audio: preCached.buffer,
+              mimetype: preCached.mimetype || 'audio/ogg; codecs=opus',
+              ptt: preCached.ptt ?? true,
+              seconds: preCached.seconds,
+            });
+          }
+          if (targetDm !== ctx.chatId) {
+            await ctx.reply(`Saved ${preCached.type} to your inbox.`);
+          }
+          return `Saved ${preCached.type} to inbox.`;
+        }
+      }
+
+      const quoted = extractQuotedMessage(ctx.msg);
+      let inner = unwrapViewOnce(quoted) || unwrapMessage(quoted) || quoted;
+      let origKey = ctx.msg.key;
+
+      // Check chat cache, status@broadcast cache, and disk metadata if WhatsApp stripped directPath/url
+      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
+        const cacheLookups = ctx.getCachedMessage
+          ? [
+              ctx.getCachedMessage(ctx.chatId, stanzaId),
+              ctx.getCachedMessage('status@broadcast', stanzaId),
+              ctxInfo?.remoteJid ? ctx.getCachedMessage(ctxInfo.remoteJid, stanzaId) : undefined,
+            ]
+          : [];
+        for (const cachedOrig of cacheLookups) {
+          if (cachedOrig?.message) {
+            const cachedInner =
+              unwrapViewOnce(cachedOrig.message) || unwrapMessage(cachedOrig.message);
+            if (cachedInner && (hasValidMediaPayload(cachedInner) || !inner)) {
+              inner = cachedInner;
+              origKey = cachedOrig.key || origKey;
+              if (hasValidMediaPayload(cachedInner)) break;
+            }
+          }
+        }
+        if (!inner || !hasValidMediaPayload(inner)) {
+          const diskMeta = getCachedViewOnceMeta(stanzaId);
+          if (diskMeta?.message && hasValidMediaPayload(diskMeta.message)) {
+            inner = diskMeta.message;
+            origKey = diskMeta.key || origKey;
+          }
+        }
+      }
+
       if (!inner) {
-        const msg = `Reply to a WhatsApp Status, photo, video, audio, or View-Once with \`${ctx.prefix}save\`.`;
+        const msg = `Reply to a WhatsApp Status, photo, video, audio, or View-Once with \`${ctx.prefix}save\` (or use \`${ctx.prefix}savestatus @user\`).`;
         await ctx.reply(msg);
         return msg;
       }
 
       const type = detectMediaType(inner);
       if (type !== 'image' && type !== 'video' && type !== 'audio') {
-        // Support saving text-only WhatsApp Statuses too
         const textStatus = extractBodyText(inner).trim();
         if (textStatus) {
           await ctx.sock.sendMessage(targetDm, { text: `*Saved Status Text:*\n\n${textStatus}` });
@@ -658,7 +1072,7 @@ export const mediaCommands: BotCommand[] = [
       }
 
       try {
-        const buf = await downloadMessageMedia(ctx.sock, { key: ctx.msg.key, message: inner } as WAMessage);
+        const buf = await downloadMessageMedia(ctx.sock, { key: origKey, message: inner } as WAMessage);
         const caption =
           type === 'image'
             ? inner.imageMessage?.caption || undefined
