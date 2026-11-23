@@ -14,6 +14,7 @@ import {
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import {
+  applyBassBoostEffect,
   convertAudioPartsToWhatsAppVoice,
   convertMediaToWebpSticker,
   convertStickerToPng,
@@ -23,6 +24,7 @@ import {
   getCachedViewOnceMedia,
   getCachedViewOnceMeta,
   getUnavailableViewOnceKey,
+  inspectWebpStickerBuffer,
   isFfmpegAvailable,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
@@ -30,10 +32,12 @@ import {
 } from '../utils/mediaHelper.ts';
 import { getRecentChatMessages } from '../utils/chatHistoryStore.ts';
 import {
+  generateBioOptionsReply,
   generateFactCheckReply,
   generateGrammarCorrection,
   generateGroupSummary,
   generatePlayfulRoast,
+  generatePoetryReply,
   isGeminiConfigured,
 } from '../utils/geminiService.ts';
 import {
@@ -1304,8 +1308,475 @@ export const mediaCommands: BotCommand[] = [
       return report;
     },
   },
+  {
+    name: 'bassboost',
+    aliases: ['bass', 'bb'],
+    category: 'media',
+    description: 'Replied audio, voice note, ya short video/audio clip par heavy bass boost effect lagaye',
+    usage: 'bassboost (reply to audio, voice note, or short video)',
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg = 'Reply to an audio file, voice note, or short video clip with `.bassboost`.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const quoted = extractQuotedMessage(ctx.msg);
+      const direct = unwrapMessage(ctx.msg.message);
+      const targetContent =
+        quoted && (detectMediaType(quoted) === 'audio' || detectMediaType(quoted) === 'video')
+          ? quoted
+          : direct && (detectMediaType(direct) === 'audio' || detectMediaType(direct) === 'video')
+            ? direct
+            : null;
+
+      if (!targetContent) {
+        const msg = `Reply to an audio file, voice note, or short video clip with \`${ctx.prefix}bassboost\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!hasValidMediaPayload(targetContent)) {
+        const msg = 'Audio/video payload unavailable or expired. Resend it and reply with `.bassboost`.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const mediaType = detectMediaType(targetContent);
+      const durationSec = Number(
+        targetContent.audioMessage?.seconds ||
+          targetContent.videoMessage?.seconds ||
+          targetContent.ptvMessage?.seconds ||
+          0
+      );
+      if (durationSec > 480) {
+        const msg = 'Clip is too long for bass boosting (maximum 8 minutes). Send or reply to a shorter clip.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const rawBuf = await downloadMessageMedia(ctx.sock, {
+          key: ctx.msg.key,
+          message: targetContent,
+        } as WAMessage);
+
+        if (rawBuf.length > 22 * 1024 * 1024) {
+          const msg = 'Media file exceeds 22 MB limit for bass boost processing.';
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        const boostedBuf = await applyBassBoostEffect(rawBuf, mediaType === 'video');
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          {
+            audio: boostedBuf,
+            mimetype: 'audio/mpeg',
+            ptt: false,
+            fileName: 'FADI_KING_MD_BassBoosted.mp3',
+          },
+          { quoted: ctx.msg }
+        );
+        return 'Sent bass-boosted audio.';
+      } catch (err) {
+        const errText = (err as Error).message || 'Processing failed';
+        const friendly = /no audio|does not contain any stream/i.test(errText)
+          ? 'The replied video has no audio track to bass boost.'
+          : `Bass boost failed: ${errText}`;
+        await ctx.reply(friendly);
+        return friendly;
+      }
+    },
+  },
+  {
+    name: 'stickerinfo',
+    aliases: ['sinfo', 'stickerdata', 'stinfo'],
+    category: 'media',
+    description: 'Replied sticker ka pack name, author/publisher, animated/static type aur dimensions inspect kare',
+    usage: 'stickerinfo (reply to a sticker)',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+        const msg = 'Reply to any WhatsApp sticker with `.stickerinfo` to inspect its pack name, author, type, and dimensions.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const quoted = extractQuotedMessage(ctx.msg);
+      const stickerMsg = quoted?.stickerMessage;
+      if (!stickerMsg) {
+        const msg = `Reply to a WhatsApp sticker using \`${ctx.prefix}stickerinfo\`.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      let inspected: ReturnType<typeof inspectWebpStickerBuffer> | null = null;
+      if (hasValidMediaPayload(quoted)) {
+        try {
+          const buf = await downloadMessageMedia(ctx.sock, {
+            key: ctx.msg.key,
+            message: quoted,
+          } as WAMessage);
+          inspected = inspectWebpStickerBuffer(buf);
+        } catch {
+          // Proceed with protobuf metadata if download fails
+        }
+      }
+
+      const isAnimated = Boolean(stickerMsg.isAnimated || inspected?.isAnimated);
+      const isLottie = Boolean(stickerMsg.isLottie);
+      const kindLabel = isLottie
+        ? 'Animated (Lottie)'
+        : isAnimated
+          ? 'Animated (WebP)'
+          : 'Static (WebP)';
+
+      const width = inspected?.width || Number(stickerMsg.width || 0) || undefined;
+      const height = inspected?.height || Number(stickerMsg.height || 0) || undefined;
+      const sizeBytes = inspected?.fileSizeBytes || Number(stickerMsg.fileLength || 0) || 0;
+      const sizeLabel =
+        sizeBytes > 0
+          ? sizeBytes >= 1024 * 1024
+            ? `${(sizeBytes / (1024 * 1024)).toFixed(2)} MB`
+            : `${(sizeBytes / 1024).toFixed(1)} KB`
+          : 'Unknown';
+
+      const emojisText =
+        inspected?.emojis && inspected.emojis.length > 0 ? inspected.emojis.join(' ') : '';
+
+      const lines = [
+        `🏷️ *Sticker Metadata Inspector*`,
+        `• Pack Name: *${inspected?.packName || 'Not embedded'}*`,
+        `• Author / Publisher: *${inspected?.packPublisher || 'Not embedded'}*`,
+        `• Type: *${kindLabel}*`,
+        `• Dimensions: *${width && height ? `${width} × ${height} px` : 'Unknown'}*`,
+        `• File Size: *${sizeLabel}*`,
+        ...(inspected?.packId ? [`• Pack ID: \`${inspected.packId}\``] : []),
+        ...(emojisText ? [`• Emojis: ${emojisText}`] : []),
+        ...(stickerMsg.accessibilityLabel ? [`• Label: ${stickerMsg.accessibilityLabel}`] : []),
+      ];
+
+      const output = lines.join('\n');
+      await ctx.reply(output);
+      return output;
+    },
+  },
+  {
+    name: 'poetry',
+    aliases: ['poem', 'nazm', 'ghazal'],
+    category: 'media',
+    description: 'Topic, mood ya language ke mutabiq Urdu/Roman Urdu ya English poetry aur shayari generate kare',
+    usage: 'poetry [topic / mood / language] (e.g. .poetry friendship Roman Urdu)',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const topic = ctx.text.trim() || quotedText || 'Heartfelt motivational & emotional Urdu shayari';
+
+      try {
+        const verse = await generatePoetryReply(topic);
+        const output = `✍️ *Poetry & Shayari*\n\n${verse}`;
+        await ctx.reply(output);
+        return output;
+      } catch (err) {
+        const msg = `Poetry generation failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'bio',
+    aliases: ['biogen', 'instabio', 'wabio'],
+    category: 'media',
+    description: 'Keywords ya personality vibe se WhatsApp, Instagram aur TikTok ke liye stylish bios generate kare',
+    usage: 'bio <keywords / vibe / role> (e.g. .bio Gamer, Lahore, Minimalist)',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const keywords = ctx.text.trim() || quotedText;
+
+      if (!keywords) {
+        const msg = `Provide keywords, vibe, or role.\nExample: \`${ctx.prefix}bio Developer, Cricket lover, Minimalist\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const options = await generateBioOptionsReply(keywords);
+        const output = `✨ *Stylish Profile Bios (${keywords.slice(0, 40)})*\n\n${options}`;
+        await ctx.reply(output);
+        return output;
+      } catch (err) {
+        const msg = `Bio generation failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'cricket',
+    aliases: ['score', 'cric', 'livecricket'],
+    category: 'media',
+    description: 'Live cricket match scores, series updates aur current status fetch kare',
+    usage: 'cricket [team or series filter]',
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      try {
+        const summary = await fetchLiveCricketSummary(ctx.text.trim());
+        await ctx.reply(summary);
+        return summary;
+      } catch (err) {
+        const msg = `Cricket scores unavailable right now: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
   ...createSocialDownloaderCommands(),
 ];
+
+interface CricbuzzInningsScore {
+  inningsId?: number;
+  runs?: number;
+  wickets?: number;
+  overs?: number;
+  isDeclared?: boolean;
+}
+
+interface CricbuzzMatchEntry {
+  matchInfo?: {
+    matchId?: number;
+    seriesName?: string;
+    matchDesc?: string;
+    matchFormat?: string;
+    state?: string;
+    status?: string;
+    team1?: { teamName?: string; teamSName?: string };
+    team2?: { teamName?: string; teamSName?: string };
+    venueInfo?: { ground?: string; city?: string };
+  };
+  matchScore?: {
+    team1Score?: Record<string, CricbuzzInningsScore>;
+    team2Score?: Record<string, CricbuzzInningsScore>;
+  };
+}
+
+function formatTeamInningsScore(scoreObj?: Record<string, CricbuzzInningsScore>): string {
+  if (!scoreObj) return '';
+  const innings = Object.values(scoreObj)
+    .filter((i) => typeof i?.runs === 'number')
+    .sort((a, b) => Number(a.inningsId || 0) - Number(b.inningsId || 0));
+  if (innings.length === 0) return '';
+  return innings
+    .map((inng) => {
+      const wkts = typeof inng.wickets === 'number' ? `/${inng.wickets}` : '';
+      const ov = typeof inng.overs === 'number' ? ` (${inng.overs})` : '';
+      const dec = inng.isDeclared ? 'd' : '';
+      return `${inng.runs}${wkts}${dec}${ov}`;
+    })
+    .join(' & ');
+}
+
+function extractCricbuzzMatchesFromHtml(html: string): CricbuzzMatchEntry[] {
+  const unescaped = html.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  const seenIds = new Set<number>();
+  const matches: CricbuzzMatchEntry[] = [];
+  const marker = '{"matchInfo":{';
+  let cursor = 0;
+
+  while (cursor < unescaped.length) {
+    const start = unescaped.indexOf(marker, cursor);
+    if (start === -1) break;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+
+    for (let i = start; i < unescaped.length && i < start + 8000; i += 1) {
+      const ch = unescaped[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\' && inString) {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (!inString) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+    }
+
+    if (end > start) {
+      try {
+        const obj = JSON.parse(unescaped.slice(start, end)) as CricbuzzMatchEntry;
+        const id = Number(obj.matchInfo?.matchId || 0);
+        if (id && !seenIds.has(id) && obj.matchInfo?.team1 && obj.matchInfo?.team2) {
+          seenIds.add(id);
+          matches.push(obj);
+        }
+      } catch {
+        // Ignore partial chunk split objects
+      }
+      cursor = end;
+    } else {
+      cursor = start + marker.length;
+    }
+  }
+
+  return matches;
+}
+
+function decodeBasicXmlEntities(raw: string): string {
+  return raw
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+export async function fetchLiveCricketSummary(queryFilter?: string): Promise<string> {
+  const filter = (queryFilter || '').trim().toLowerCase();
+
+  // 1. Primary rich source: Cricbuzz live scores
+  try {
+    const res = await fetch('https://www.cricbuzz.com/cricket-match/live-scores', {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'text/html',
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (res.ok) {
+      const html = await res.text();
+      const parsed = extractCricbuzzMatchesFromHtml(html);
+
+      if (parsed.length > 0) {
+        const priority = (stateRaw?: string): number => {
+          const s = (stateRaw || '').toLowerCase();
+          if (s.includes('progress') || s.includes('live')) return 0;
+          if (s.includes('delay') || s.includes('break') || s.includes('stumps') || s.includes('rain')) return 1;
+          if (s.includes('complete')) return 2;
+          return 3;
+        };
+
+        const sorted = [...parsed].sort(
+          (a, b) => priority(a.matchInfo?.state) - priority(b.matchInfo?.state)
+        );
+
+        const filtered = filter
+          ? sorted.filter((m) => {
+              const hay = [
+                m.matchInfo?.seriesName,
+                m.matchInfo?.matchDesc,
+                m.matchInfo?.team1?.teamName,
+                m.matchInfo?.team1?.teamSName,
+                m.matchInfo?.team2?.teamName,
+                m.matchInfo?.team2?.teamSName,
+                m.matchInfo?.status,
+              ]
+                .filter(Boolean)
+                .join(' ')
+                .toLowerCase();
+              return hay.includes(filter);
+            })
+          : sorted;
+
+        const list = (filtered.length > 0 ? filtered : sorted).slice(0, 7);
+        const filterNote =
+          filter && filtered.length === 0
+            ? `_No exact match for "${queryFilter}" — showing top live matches:_\n\n`
+            : '';
+
+        const blocks = list.map((m, idx) => {
+          const info = m.matchInfo!;
+          const t1 = info.team1?.teamSName || info.team1?.teamName || 'Team 1';
+          const t2 = info.team2?.teamSName || info.team2?.teamName || 'Team 2';
+          const s1 = formatTeamInningsScore(m.matchScore?.team1Score);
+          const s2 = formatTeamInningsScore(m.matchScore?.team2Score);
+          const stateRaw = (info.state || '').toLowerCase();
+          const badge =
+            stateRaw.includes('progress') || stateRaw.includes('live')
+              ? '🔴 LIVE'
+              : stateRaw.includes('delay') || stateRaw.includes('break') || stateRaw.includes('stumps')
+                ? '🟡 ' + (info.state || 'Update')
+                : stateRaw.includes('complete')
+                  ? '✅ Result'
+                  : '🕒 ' + (info.state || 'Scheduled');
+
+          const scoreLines =
+            s1 || s2
+              ? [`   ${t1}: *${s1 || 'Yet to bat'}*`, `   ${t2}: *${s2 || 'Yet to bat'}*`]
+              : [];
+
+          return [
+            `${idx + 1}. *${info.team1?.teamName || t1} vs ${info.team2?.teamName || t2}* (${info.matchDesc || info.matchFormat || 'Match'})`,
+            ...(info.seriesName ? [`   _${info.seriesName}_`] : []),
+            ...scoreLines,
+            `   ${badge}: ${info.status || info.state || 'Live updates'}`,
+          ].join('\n');
+        });
+
+        return [
+          `🏏 *LIVE CRICKET SCORES*`,
+          '',
+          `${filterNote}${blocks.join('\n\n')}`,
+        ].join('\n');
+      }
+    }
+  } catch {
+    // Fall back to ESPNcricinfo RSS feed below
+  }
+
+  // 2. Fallback source: ESPNcricinfo live scores XML RSS
+  const rssRes = await fetch('https://static.cricinfo.com/rss/livescores.xml', {
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!rssRes.ok) {
+    throw new Error(`Cricket feed returned HTTP ${rssRes.status}`);
+  }
+  const xml = await rssRes.text();
+  const titles = Array.from(xml.matchAll(/<item>[\s\S]*?<title>([\s\S]*?)<\/title>/g))
+    .map((m) => decodeBasicXmlEntities(m[1]))
+    .filter(Boolean);
+
+  if (titles.length === 0) {
+    return '🏏 *Live Cricket Scores*\nNo active or recent matches found right now.';
+  }
+
+  const matched = filter ? titles.filter((t) => t.toLowerCase().includes(filter)) : titles;
+  const shown = (matched.length > 0 ? matched : titles).slice(0, 10);
+  const note =
+    filter && matched.length === 0
+      ? `_No exact match for "${queryFilter}" — showing current scoreboard:_\n\n`
+      : '';
+
+  return [
+    `🏏 *LIVE CRICKET SCORES*`,
+    '',
+    `${note}${shown.map((t, i) => `${i + 1}. *${t}*`).join('\n')}`,
+  ].join('\n');
+}
 
 function isPrivateOrLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase();

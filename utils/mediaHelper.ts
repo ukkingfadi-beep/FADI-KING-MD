@@ -830,3 +830,281 @@ export async function synthesizeTtsVoiceNote(
     lang: fallbackLang,
   };
 }
+
+export async function applyBassBoostEffect(
+  inputBuffer: Buffer,
+  isVideo: boolean
+): Promise<Buffer> {
+  const hasFfmpeg = await isFfmpegAvailable();
+  if (!hasFfmpeg) {
+    throw new Error('FFmpeg is not installed on this server. Audio bass boost requires ffmpeg.');
+  }
+
+  const bin = resolveFfmpegBin();
+  const tmpDir = os.tmpdir();
+  const id = `fkmd_bass_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const inPath = path.join(tmpDir, `${id}.${isVideo ? 'mp4' : 'dat'}`);
+  const outPath = path.join(tmpDir, `${id}_bass.mp3`);
+
+  try {
+    await fs.promises.writeFile(inPath, inputBuffer);
+    await execFileAsync(
+      bin,
+      [
+        '-y',
+        '-i', inPath,
+        '-vn',
+        '-af', 'bass=g=16:f=95:w=0.6,acompressor=threshold=-12dB:ratio=3:attack=5:release=50',
+        '-c:a', 'libmp3lame',
+        '-b:a', '192k',
+        '-ar', '44100',
+        outPath,
+      ],
+      { timeout: 35000 }
+    );
+    const outBuf = await fs.promises.readFile(outPath);
+    if (!outBuf.length) {
+      throw new Error('Bass-boosted output audio was empty.');
+    }
+    return outBuf;
+  } finally {
+    await fs.promises.unlink(inPath).catch(() => {});
+    await fs.promises.unlink(outPath).catch(() => {});
+  }
+}
+
+export interface WebpStickerInspection {
+  format: string;
+  width?: number;
+  height?: number;
+  isAnimated: boolean;
+  fileSizeBytes: number;
+  packId?: string;
+  packName?: string;
+  packPublisher?: string;
+  emojis?: string[];
+}
+
+export function inspectWebpStickerBuffer(buffer: Buffer): WebpStickerInspection {
+  const result: WebpStickerInspection = {
+    format: 'Unknown',
+    isAnimated: false,
+    fileSizeBytes: buffer.length,
+  };
+
+  if (
+    buffer.length < 12 ||
+    buffer.toString('ascii', 0, 4) !== 'RIFF' ||
+    buffer.toString('ascii', 8, 12) !== 'WEBP'
+  ) {
+    return result;
+  }
+
+  result.format = 'WEBP';
+  let offset = 12;
+
+  while (offset + 8 <= buffer.length) {
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkSize = buffer.readUInt32LE(offset + 4);
+    const dataStart = offset + 8;
+    const dataEnd = Math.min(buffer.length, dataStart + chunkSize);
+    const chunk = buffer.subarray(dataStart, dataEnd);
+
+    if (chunkId === 'VP8X' && chunk.length >= 10) {
+      const flags = chunk[0];
+      if ((flags & 0x02) !== 0) result.isAnimated = true;
+      result.width = (chunk.readUIntLE(4, 3) || 0) + 1;
+      result.height = (chunk.readUIntLE(7, 3) || 0) + 1;
+    } else if (chunkId === 'VP8 ' && chunk.length >= 10 && !result.width) {
+      if (chunk[3] === 0x9d && chunk[4] === 0x01 && chunk[5] === 0x2a) {
+        result.width = chunk.readUInt16LE(6) & 0x3fff;
+        result.height = chunk.readUInt16LE(8) & 0x3fff;
+      }
+    } else if (chunkId === 'VP8L' && chunk.length >= 5 && !result.width) {
+      if (chunk[0] === 0x2f) {
+        const b1 = chunk[1];
+        const b2 = chunk[2];
+        const b3 = chunk[3];
+        const b4 = chunk[4];
+        result.width = 1 + (((b2 & 0x3f) << 8) | b1);
+        result.height = 1 + (((b4 & 0x0f) << 10) | (b3 << 2) | ((b2 & 0xc0) >> 6));
+      }
+    } else if (chunkId === 'ANIM') {
+      result.isAnimated = true;
+    } else if (chunkId === 'EXIF' && chunk.length > 0) {
+      const utf8 = chunk.toString('utf8');
+      const jsonStart = utf8.indexOf('{');
+      const jsonEnd = utf8.lastIndexOf('}');
+      if (jsonStart >= 0 && jsonEnd > jsonStart) {
+        try {
+          const parsed = JSON.parse(utf8.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>;
+          if (typeof parsed['sticker-pack-id'] === 'string') {
+            result.packId = parsed['sticker-pack-id'].trim();
+          }
+          if (typeof parsed['sticker-pack-name'] === 'string') {
+            result.packName = parsed['sticker-pack-name'].trim();
+          }
+          if (typeof parsed['sticker-pack-publisher'] === 'string') {
+            result.packPublisher = parsed['sticker-pack-publisher'].trim();
+          }
+          if (Array.isArray(parsed.emojis)) {
+            result.emojis = parsed.emojis.map((e) => String(e)).filter(Boolean);
+          }
+        } catch {
+          // Ignore malformed EXIF JSON
+        }
+      }
+    }
+
+    offset = dataStart + chunkSize + (chunkSize % 2);
+  }
+
+  return result;
+}
+
+function escapeAssText(raw: string): string {
+  return raw
+    .replace(/\\/g, '/')
+    .replace(/\{/g, '(')
+    .replace(/\}/g, ')')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
+}
+
+function computeInitials(name: string, phone: string): string {
+  const words = name
+    .replace(/[^A-Za-z0-9\s]/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length >= 2) {
+    return `${words[0][0]}${words[1][0]}`.toUpperCase();
+  }
+  if (words.length === 1 && words[0].length >= 2) {
+    return words[0].slice(0, 2).toUpperCase();
+  }
+  if (words.length === 1) {
+    return words[0][0].toUpperCase();
+  }
+  const digits = phone.replace(/\D/g, '');
+  return digits.slice(-2) || 'FK';
+}
+
+export async function generateWelcomeImageCard(params: {
+  memberName: string;
+  memberNumber: string;
+  groupName: string;
+  memberCount: number;
+  avatarBuffer?: Buffer | null;
+  botName?: string;
+}): Promise<Buffer> {
+  const hasFfmpeg = await isFfmpegAvailable();
+  if (!hasFfmpeg) {
+    throw new Error('FFmpeg is required to generate welcome image cards.');
+  }
+
+  const bin = resolveFfmpegBin();
+  const tmpDir = os.tmpdir();
+  const id = `fkmd_wlc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const avatarPath = path.join(tmpDir, `${id}_av.jpg`);
+  const assPath = path.join(tmpDir, `${id}.ass`);
+  const outPath = path.join(tmpDir, `${id}.png`);
+
+  const safeMemberName = escapeAssText(params.memberName || 'New Member').slice(0, 28) || 'New Member';
+  const cleanDigits = params.memberNumber.replace(/\D/g, '');
+  const safeNumber = cleanDigits ? `+${cleanDigits}` : escapeAssText(params.memberNumber || '');
+  const safeGroup = escapeAssText(params.groupName || 'WhatsApp Group').slice(0, 34) || 'WhatsApp Group';
+  const safeBot = escapeAssText(params.botName || 'FADI KING MD').slice(0, 24) || 'FADI KING MD';
+  const countLine = escapeAssText(`Member #${Math.max(1, params.memberCount)}  •  ${safeBot}`);
+  const initials = escapeAssText(computeInitials(params.memberName, params.memberNumber));
+
+  const renderWithAvatar = async (useAvatarFile: boolean): Promise<Buffer> => {
+    const assEvents = [
+      `Dialogue: 0,0:00:00.00,0:00:05.00,Badge,,0,0,0,,{\\pos(355,75)}WELCOME TO THE GROUP`,
+      `Dialogue: 0,0:00:00.00,0:00:05.00,Name,,0,0,0,,{\\pos(355,155)}${safeMemberName}`,
+      `Dialogue: 0,0:00:00.00,0:00:05.00,Sub,,0,0,0,,{\\pos(355,222)}${safeNumber}`,
+      `Dialogue: 0,0:00:00.00,0:00:05.00,GroupLine,,0,0,0,,{\\pos(355,295)}Group: ${safeGroup}`,
+      `Dialogue: 0,0:00:00.00,0:00:05.00,Footer,,0,0,0,,{\\pos(355,355)}${countLine}`,
+      ...(!useAvatarFile
+        ? [`Dialogue: 0,0:00:00.00,0:00:05.00,Initials,,0,0,0,,{\\pos(185,230)}${initials}`]
+        : []),
+    ];
+
+    const assContent = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1000
+PlayResY: 460
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Badge,DejaVu Sans,24,&H0081B910,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,0,0,7,10,10,10,1
+Style: Name,DejaVu Sans,46,&H00FFFFFF,&H000000FF,&H000A1410,&H00000000,1,0,0,0,100,100,0,0,1,2,0,7,10,10,10,1
+Style: Sub,DejaVu Sans,28,&H000B9EF5,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,10,10,10,1
+Style: GroupLine,DejaVu Sans,26,&H00E2E8F0,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,10,10,10,1
+Style: Footer,DejaVu Sans,22,&H0094A3B8,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,10,10,10,1
+Style: Initials,DejaVu Sans,84,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${assEvents.join('\n')}
+`;
+    await fs.promises.writeFile(assPath, assContent, 'utf8');
+
+    const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+    const baseFilter =
+      `[0:v]drawbox=x=24:y=24:w=952:h=412:color=#0e201a@0.98:t=fill,` +
+      `drawbox=x=24:y=24:w=952:h=412:color=#10b981@0.65:t=3,` +
+      `drawbox=x=32:y=32:w=936:h=396:color=#f59e0b@0.32:t=1,` +
+      `drawbox=x=355:y=118:w=560:h=3:color=#10b981@0.85:t=fill[bg]`;
+
+    const avatarFilter = useAvatarFile
+      ? `[1:v]scale=240:240:force_original_aspect_ratio=increase,crop=240:240,format=rgba,` +
+        `geq=r='if(lte(hypot(X-120,Y-120),110),r(X,Y),16)':` +
+        `g='if(lte(hypot(X-120,Y-120),110),g(X,Y),185)':` +
+        `b='if(lte(hypot(X-120,Y-120),110),b(X,Y),129)':` +
+        `a='if(lte(hypot(X-120,Y-120),118),255,0)'[av]`
+      : `[1:v]format=rgba,` +
+        `geq=r='if(lte(hypot(X-120,Y-120),110),17,16)':` +
+        `g='if(lte(hypot(X-120,Y-120),110),62,185)':` +
+        `b='if(lte(hypot(X-120,Y-120),110),46,129)':` +
+        `a='if(lte(hypot(X-120,Y-120),118),255,0)'[av]`;
+
+    const filterComplex = `${baseFilter};${avatarFilter};[bg][av]overlay=65:110,ass='${escapedAss}'[out]`;
+
+    const args = [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=#07130f:s=1000x460:d=1',
+      ...(useAvatarFile
+        ? ['-i', avatarPath]
+        : ['-f', 'lavfi', '-i', 'color=c=#113e2e:s=240x240:d=1']),
+      '-filter_complex', filterComplex,
+      '-map', '[out]',
+      '-update', '1',
+      '-frames:v', '1',
+      outPath,
+    ];
+
+    await execFileAsync(bin, args, { timeout: 25000 });
+    return fs.promises.readFile(outPath);
+  };
+
+  try {
+    const hasAvatar = Boolean(params.avatarBuffer && params.avatarBuffer.length > 0);
+    if (hasAvatar) {
+      await fs.promises.writeFile(avatarPath, params.avatarBuffer!);
+      try {
+        return await renderWithAvatar(true);
+      } catch {
+        // Fallback to clean initials card if avatar buffer is malformed/unsupported
+      }
+    }
+    return await renderWithAvatar(false);
+  } finally {
+    await Promise.all([
+      fs.promises.unlink(avatarPath).catch(() => {}),
+      fs.promises.unlink(assPath).catch(() => {}),
+      fs.promises.unlink(outPath).catch(() => {}),
+    ]);
+  }
+}
+

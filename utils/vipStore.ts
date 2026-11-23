@@ -59,13 +59,24 @@ export interface GroupConfig {
   antiMedia?: boolean;
   antiSticker?: boolean;
   antiBot?: boolean;
+  antiAdmin?: boolean;
+  antiKickAll?: boolean;
   slowModeSeconds?: number;
   mutedUsers?: Record<string, MutedUserEntry>;
   aiEnabled?: boolean;
   welcome: boolean;
+  welcomeImg?: boolean;
   goodbye: boolean;
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
+}
+
+export interface BannedUserEntry {
+  number: string;
+  jid: string;
+  reason?: string;
+  bannedBy?: string;
+  bannedAt: string;
 }
 
 export interface ProtectedPostEntry {
@@ -102,6 +113,7 @@ let pairedUsersCache: PairedUserEntry[] | null = null;
 let groupsCache: Record<string, GroupConfig> | null = null;
 let pairingLogsCache: PairingAuditEntry[] | null = null;
 let bannedStickersCache: BannedStickerEntry[] | null = null;
+let bannedUsersCache: BannedUserEntry[] | null = null;
 let protectedPostsCache: Record<string, ProtectedPostEntry> | null = null;
 let afkUsersCache: Record<string, AfkUserEntry> | null = null;
 
@@ -111,6 +123,7 @@ registerDbHydrationHook(() => {
   groupsCache = null;
   pairingLogsCache = null;
   bannedStickersCache = null;
+  bannedUsersCache = null;
   protectedPostsCache = null;
   afkUsersCache = null;
 });
@@ -519,10 +532,13 @@ export const vipStore = {
         antiMedia: false,
         antiSticker: false,
         antiBot: false,
+        antiAdmin: false,
+        antiKickAll: false,
         slowModeSeconds: 0,
         mutedUsers: {},
         aiEnabled: false,
         welcome: false,
+        welcomeImg: false,
         goodbye: false,
       };
     }
@@ -540,10 +556,13 @@ export const vipStore = {
       antiMedia: Boolean(found.antiMedia),
       antiSticker: Boolean(found.antiSticker),
       antiBot: Boolean(found.antiBot),
+      antiAdmin: Boolean(found.antiAdmin),
+      antiKickAll: Boolean(found.antiKickAll),
       slowModeSeconds: Math.max(0, Number(found.slowModeSeconds || 0)),
       mutedUsers: found.mutedUsers || {},
       aiEnabled: Boolean(found.aiEnabled),
       welcome: Boolean(found.welcome),
+      welcomeImg: Boolean(found.welcomeImg),
       goodbye: Boolean(found.goodbye),
     };
   },
@@ -564,10 +583,13 @@ export const vipStore = {
       antiMedia: Boolean(g.antiMedia),
       antiSticker: Boolean(g.antiSticker),
       antiBot: Boolean(g.antiBot),
+      antiAdmin: Boolean(g.antiAdmin),
+      antiKickAll: Boolean(g.antiKickAll),
       slowModeSeconds: Math.max(0, Number(g.slowModeSeconds || 0)),
       mutedUsers: g.mutedUsers || {},
       aiEnabled: Boolean(g.aiEnabled),
       welcome: Boolean(g.welcome),
+      welcomeImg: Boolean(g.welcomeImg),
       goodbye: Boolean(g.goodbye),
     }));
   },
@@ -602,6 +624,8 @@ export const vipStore = {
     if (typeof patch.antiMedia === 'boolean') cleanPatch.antiMedia = patch.antiMedia;
     if (typeof patch.antiSticker === 'boolean') cleanPatch.antiSticker = patch.antiSticker;
     if (typeof patch.antiBot === 'boolean') cleanPatch.antiBot = patch.antiBot;
+    if (typeof patch.antiAdmin === 'boolean') cleanPatch.antiAdmin = patch.antiAdmin;
+    if (typeof patch.antiKickAll === 'boolean') cleanPatch.antiKickAll = patch.antiKickAll;
     if (typeof patch.slowModeSeconds === 'number' && Number.isFinite(patch.slowModeSeconds)) {
       cleanPatch.slowModeSeconds = Math.max(0, Math.min(3600, Math.floor(patch.slowModeSeconds)));
     }
@@ -610,6 +634,7 @@ export const vipStore = {
     }
     if (typeof patch.aiEnabled === 'boolean') cleanPatch.aiEnabled = patch.aiEnabled;
     if (typeof patch.welcome === 'boolean') cleanPatch.welcome = patch.welcome;
+    if (typeof patch.welcomeImg === 'boolean') cleanPatch.welcomeImg = patch.welcomeImg;
     if (typeof patch.goodbye === 'boolean') cleanPatch.goodbye = patch.goodbye;
     if (patch.warnings && typeof patch.warnings === 'object') cleanPatch.warnings = patch.warnings;
     if (patch.antiScamWarnings && typeof patch.antiScamWarnings === 'object') {
@@ -621,6 +646,38 @@ export const vipStore = {
     groupsCache = groups;
     dbSetSync('groups', groups);
     return updated;
+  },
+
+  resetGroupConfig(groupId: string): GroupConfig {
+    const groups = { ...readGroupsMap() };
+    const cfg = loadConfig();
+    const defaults: GroupConfig = {
+      groupId,
+      antilink: false,
+      antilinkMode: 'off',
+      antidelete: false,
+      antiScam: cfg.antiScamGlobal,
+      antiStatusMention: cfg.antiStatusMentionGlobal,
+      antiAdd: false,
+      antiForward: false,
+      antiMedia: false,
+      antiSticker: false,
+      antiBot: false,
+      antiAdmin: false,
+      antiKickAll: false,
+      slowModeSeconds: 0,
+      mutedUsers: {},
+      aiEnabled: false,
+      welcome: false,
+      welcomeImg: false,
+      goodbye: false,
+      warnings: {},
+      antiScamWarnings: {},
+    };
+    groups[groupId] = defaults;
+    groupsCache = groups;
+    dbSetSync('groups', groups);
+    return defaults;
   },
 
   listBannedStickers(): BannedStickerEntry[] {
@@ -764,5 +821,69 @@ export const vipStore = {
       if (byJid) return byJid;
     }
     return null;
+  },
+
+  listBannedUsers(): BannedUserEntry[] {
+    if (!bannedUsersCache) {
+      const fromDb = dbGetSync<BannedUserEntry[]>('banned_users') || [];
+      bannedUsersCache = Array.isArray(fromDb) ? fromDb : [];
+    }
+    return [...bannedUsersCache];
+  },
+
+  isUserBanned(candidates: string[]): BannedUserEntry | null {
+    const list = this.listBannedUsers();
+    if (list.length === 0) return null;
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const bare = raw.split('@')[0].split(':')[0];
+      const clean = normalizePhone(bare);
+      const hit = list.find(
+        (b) =>
+          (clean && b.number === clean) ||
+          b.number === bare ||
+          b.jid === raw ||
+          b.jid.split('@')[0].split(':')[0] === bare
+      );
+      if (hit) return hit;
+    }
+    return null;
+  },
+
+  banUser(input: {
+    number: string;
+    jid?: string;
+    reason?: string;
+    bannedBy?: string;
+  }): BannedUserEntry {
+    const bare = String(input.number || input.jid || '').split('@')[0].split(':')[0];
+    const cleanNum = normalizePhone(bare) || bare;
+    const jid = input.jid || (cleanNum ? `${cleanNum}@s.whatsapp.net` : bare);
+    const list = this.listBannedUsers().filter(
+      (b) => b.number !== cleanNum && b.jid !== jid
+    );
+    const entry: BannedUserEntry = {
+      number: cleanNum,
+      jid,
+      reason: input.reason?.trim() || undefined,
+      bannedBy: input.bannedBy?.trim() || undefined,
+      bannedAt: new Date().toISOString(),
+    };
+    list.unshift(entry);
+    if (list.length > 1000) list.length = 1000;
+    bannedUsersCache = list;
+    dbSetSync('banned_users', list);
+    return entry;
+  },
+
+  unbanUser(candidates: string[]): BannedUserEntry | null {
+    const match = this.isUserBanned(candidates);
+    if (!match) return null;
+    const list = this.listBannedUsers().filter(
+      (b) => b.number !== match.number && b.jid !== match.jid
+    );
+    bannedUsersCache = list;
+    dbSetSync('banned_users', list);
+    return match;
   },
 };

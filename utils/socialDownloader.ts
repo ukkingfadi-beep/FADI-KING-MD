@@ -18,13 +18,13 @@ export interface SocialDownloadResult {
 
 const MAX_MEDIA_BYTES = 58 * 1024 * 1024; // 58 MB cap prevents OOM crashes & WhatsApp send failures
 const REQUEST_TIMEOUT_MS = 24_000;
-const DOWNLOAD_TIMEOUT_MS = 45_000;
+const DOWNLOAD_TIMEOUT_MS = 75_000;
 
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const ANDROID_VR_UA =
-  'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+  'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
 
 // Global outbound rate-limiter per platform to avoid upstream IP bans
 const platformHits = new Map<SocialPlatform, number[]>();
@@ -917,7 +917,7 @@ async function downloadFacebook(url: string): Promise<SocialDownloadResult> {
 }
 
 // ============================================================================
-// 5. YOUTUBE (MP4 Video / Audio via Innertube ANDROID_VR + Optional Cobalt)
+// 5. YOUTUBE (Innertube + Gammacloud Proxy Converter + Optional Cobalt)
 // ============================================================================
 function extractYouTubeId(url: string): string | null {
   const patterns = [
@@ -972,7 +972,7 @@ async function queryYouTubeInnertube(videoId: string): Promise<{ data: Innertube
       context: {
         client: {
           clientName: 'ANDROID_VR',
-          clientVersion: '1.60.19',
+          clientVersion: '1.62.27',
           deviceModel: 'Quest 3',
           osName: 'Android',
           osVersion: '12L',
@@ -983,15 +983,19 @@ async function queryYouTubeInnertube(videoId: string): Promise<{ data: Innertube
       },
     },
     {
-      userAgent: BROWSER_UA,
+      userAgent:
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
       context: {
         client: {
-          clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-          clientVersion: '2.0',
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.60.19',
+          deviceModel: 'Quest 3',
+          osName: 'Android',
+          osVersion: '12L',
+          androidSdkVersion: 32,
           hl: 'en',
           gl: 'US',
         },
-        thirdParty: { embedUrl: 'https://www.youtube.com/' },
       },
     },
   ];
@@ -1037,6 +1041,262 @@ async function queryYouTubeInnertube(videoId: string): Promise<{ data: Innertube
   throw new Error(lastReason);
 }
 
+async function resolveYtmp3GlConfig(): Promise<{
+  apiKey: string;
+  apiHost: string;
+  internalBaseUrl: string;
+}> {
+  const hdrs = {
+    'User-Agent': BROWSER_UA,
+    Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+    Origin: 'https://ytmp3.gl',
+    Referer: 'https://ytmp3.gl/',
+  };
+
+  const homeRes = await fetch('https://ytmp3.gl/', {
+    headers: hdrs,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!homeRes.ok) {
+    throw new Error(`ytmp3.gl returned HTTP ${homeRes.status}`);
+  }
+  const html = await homeRes.text();
+  const keyMatch = html.match(/decodeKey\(\s*['"]([^'"]+)['"]\s*\)/);
+  if (!keyMatch?.[1]) {
+    throw new Error('Could not locate converter API key');
+  }
+  const apiKey = Buffer.from(keyMatch[1].split('').reverse().join(''), 'base64').toString('utf8');
+
+  let apiHost = 'gammacloud.net';
+  let internalBaseUrl = 'https://fancy-sea-5d3d.holy-breeze-fec5.workers.dev/?m=i';
+
+  const scriptMatch = html.match(/src=["'](\/js\/[^"']*ytmp3\.js[^"']*)["']/i);
+  if (scriptMatch?.[1]) {
+    try {
+      const jsRes = await fetch(`https://ytmp3.gl${scriptMatch[1]}`, {
+        headers: hdrs,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (jsRes.ok) {
+        const js = await jsRes.text();
+        const epMatch = js.match(/endpoint\s*=\s*atob\(\s*["']([^"']+)["']\s*\)/);
+        if (epMatch?.[1]) {
+          const decodedEp = Buffer.from(epMatch[1], 'base64').toString('utf8').trim();
+          if (decodedEp) apiHost = decodedEp;
+        }
+        const intMatch = js.match(/open\(\s*["']GET["']\s*,\s*atob\(\s*["']([^"']+)["']\s*\)/);
+        if (intMatch?.[1]) {
+          const decodedInt = Buffer.from(intMatch[1], 'base64').toString('utf8').trim();
+          if (decodedInt.startsWith('http')) internalBaseUrl = decodedInt;
+        }
+      }
+    } catch {
+      // Keep defaults
+    }
+  }
+
+  return { apiKey, apiHost, internalBaseUrl };
+}
+
+async function finishGammaCloudConversion(params: {
+  initial: {
+    status?: string;
+    error?: number | string;
+    progressURL?: string;
+    downloadURL?: string;
+    redirectURL?: string;
+    redirect?: number;
+    title?: string;
+  };
+  videoId: string;
+  format: 'mp3' | 'mp4';
+  headers: Record<string, string>;
+}): Promise<{ buffer: Buffer; mimetype: string; title?: string }> {
+  let state = params.initial;
+  let title = state.title || undefined;
+
+  if (state.redirect === 1 && state.redirectURL) {
+    const redirBase = state.redirectURL.split('&v=')[0];
+    const redirRes = await fetch(
+      `${redirBase}&v=${params.videoId}&f=${params.format}&_=${Date.now()}`,
+      { headers: params.headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+    );
+    if (!redirRes.ok) {
+      throw new Error(`Redirect convert returned HTTP ${redirRes.status}`);
+    }
+    state = (await redirRes.json()) as typeof state;
+    if (state.title) title = state.title;
+    if (Number(state.error) > 0) {
+      throw new Error(`Converter redirect error ${state.error}`);
+    }
+  }
+
+  if (state.progressURL) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const pRes = await fetch(`${state.progressURL}&_=${Date.now()}`, {
+        headers: params.headers,
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (pRes.status === 429) {
+        throw new Error('Converter rate limit hit (HTTP 429)');
+      }
+      if (!pRes.ok) {
+        throw new Error(`Converter progress returned HTTP ${pRes.status}`);
+      }
+      const prog = (await pRes.json()) as { progress?: number; error?: number; title?: string };
+      if (prog.title) title = prog.title;
+      if (Number(prog.error) > 0) {
+        throw new Error(`Converter failed with code ${prog.error}`);
+      }
+      if ((prog.progress || 0) >= 3) {
+        break;
+      }
+    }
+  } else if (state.status !== 'download' && state.downloadURL) {
+    // Allow brief conversion settle time when no progressURL is provided
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+
+  if (!state.downloadURL) {
+    throw new Error('Converter did not return a download link');
+  }
+
+  const finalUrl = `${state.downloadURL}&v=${params.videoId}&f=${params.format}&r=ytmp3.gl`;
+  const { buffer, contentType } = await fetchBufferWithLimit(finalUrl, params.headers);
+  const mimetype =
+    params.format === 'mp3'
+      ? 'audio/mpeg'
+      : contentType.startsWith('video/')
+        ? contentType
+        : 'video/mp4';
+  return { buffer, mimetype, title };
+}
+
+async function queryGammacloudYouTube(
+  videoId: string,
+  audioOnly: boolean
+): Promise<{ buffer: Buffer; mimetype: string; title?: string }> {
+  const format: 'mp3' | 'mp4' = audioOnly ? 'mp3' : 'mp4';
+  const hdrs: Record<string, string> = {
+    'User-Agent': BROWSER_UA,
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://ytmp3.gl',
+    Referer: 'https://ytmp3.gl/',
+  };
+
+  const { apiKey, apiHost, internalBaseUrl } = await resolveYtmp3GlConfig();
+
+  try {
+    const authRes = await fetch(
+      `https://gamma.${apiHost}/api/v1/auth?api_key=${encodeURIComponent(apiKey)}&_=${Date.now()}`,
+      { headers: hdrs, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+    );
+    if (!authRes.ok) throw new Error(`Auth HTTP ${authRes.status}`);
+    const authData = (await authRes.json()) as { key?: string; error?: number | string };
+    if (Number(authData.error) > 0 || !authData.key) {
+      throw new Error(`Auth error ${authData.error || 'missing token'}`);
+    }
+
+    const initRes = await fetch(`https://gamma.${apiHost}/api/v1/init?_=${Date.now()}`, {
+      headers: { ...hdrs, Authorization: `Bearer ${authData.key}` },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!initRes.ok) throw new Error(`Init HTTP ${initRes.status}`);
+    const initData = (await initRes.json()) as { convertURL?: string; error?: number | string };
+    if (Number(initData.error) > 0 || !initData.convertURL) {
+      throw new Error(`Init error ${initData.error || 'missing convertURL'}`);
+    }
+
+    const convertBase = initData.convertURL.split('&v=')[0];
+    const convRes = await fetch(`${convertBase}&v=${videoId}&f=${format}&_=${Date.now()}`, {
+      headers: hdrs,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!convRes.ok) throw new Error(`Convert HTTP ${convRes.status}`);
+    const convData = (await convRes.json()) as {
+      error?: number | string;
+      progressURL?: string;
+      downloadURL?: string;
+      redirectURL?: string;
+      redirect?: number;
+      title?: string;
+      status?: string;
+    };
+    if (Number(convData.error) > 0) {
+      throw new Error(`Convert error ${convData.error}`);
+    }
+
+    return await finishGammaCloudConversion({
+      initial: convData,
+      videoId,
+      format,
+      headers: hdrs,
+    });
+  } catch (primaryErr) {
+    // Fallback to ytmp3.gl's internal worker endpoint
+    const sep = internalBaseUrl.includes('?') ? '&' : '?';
+    const workerUrl = `${internalBaseUrl}${sep}k=${encodeURIComponent(apiKey)}&v=${videoId}&f=${format}&_=${Date.now()}`;
+    const wRes = await fetch(workerUrl, {
+      headers: hdrs,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!wRes.ok) {
+      throw primaryErr;
+    }
+    const wData = (await wRes.json()) as {
+      error?: number | string;
+      status?: string;
+      progressURL?: string;
+      downloadURL?: string;
+      redirectURL?: string;
+      redirect?: number;
+      title?: string;
+    };
+    if (Number(wData.error) > 0 || (!wData.downloadURL && !wData.progressURL && !wData.redirectURL)) {
+      throw primaryErr;
+    }
+    return await finishGammaCloudConversion({
+      initial: wData,
+      videoId,
+      format,
+      headers: hdrs,
+    });
+  }
+}
+
+async function queryDavidCyrilYouTube(
+  videoId: string,
+  audioOnly: boolean
+): Promise<{ buffer: Buffer; mimetype: string; title?: string }> {
+  const endpoint = audioOnly ? 'ytmp3' : 'ytmp4';
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const res = await fetch(
+    `https://apis.davidcyriltech.my.id/download/${endpoint}?url=${encodeURIComponent(watchUrl)}`,
+    {
+      headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`Extractor API HTTP ${res.status}`);
+  }
+  const json = (await res.json().catch(() => null)) as {
+    success?: boolean;
+    message?: string;
+    result?: { title?: string; download_url?: string };
+  } | null;
+  if (!json?.success || !json.result?.download_url) {
+    throw new Error(json?.message || 'No YouTube download link returned');
+  }
+  const { buffer, contentType } = await fetchBufferWithLimit(json.result.download_url);
+  return {
+    buffer,
+    mimetype: audioOnly ? 'audio/mpeg' : contentType.startsWith('video/') ? contentType : 'video/mp4',
+    title: json.result.title,
+  };
+}
+
 async function downloadYouTube(url: string, audioOnly: boolean): Promise<SocialDownloadResult> {
   let title = 'YouTube Media';
   let author: string | undefined;
@@ -1058,7 +1318,9 @@ async function downloadYouTube(url: string, audioOnly: boolean): Promise<SocialD
     }
   }
 
-  // Prefer custom Cobalt server only if explicitly configured
+  const errors: string[] = [];
+
+  // Tier 1: Custom Cobalt server if explicitly configured
   if (getCobaltEndpoints().length > 0) {
     try {
       const cobalt = await queryCobaltApi({
@@ -1085,7 +1347,9 @@ async function downloadYouTube(url: string, audioOnly: boolean): Promise<SocialD
         ],
       };
     } catch (err) {
-      logger.warn('downloader', `Custom Cobalt YouTube fallback failed: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      errors.push(`Cobalt: ${msg}`);
+      logger.warn('downloader', `Custom Cobalt YouTube fallback failed: ${msg}`);
     }
   }
 
@@ -1093,139 +1357,361 @@ async function downloadYouTube(url: string, audioOnly: boolean): Promise<SocialD
     throw new Error('Invalid YouTube URL. Provide a valid youtube.com or youtu.be link.');
   }
 
-  const { data: pData, userAgent } = await queryYouTubeInnertube(videoId);
-  if (pData.videoDetails?.title) title = pData.videoDetails.title;
-  if (pData.videoDetails?.author) author = pData.videoDetails.author;
+  // Tier 2: Direct YouTube Innertube (ANDROID_VR) when IP is not gated
+  try {
+    const { data: pData, userAgent } = await queryYouTubeInnertube(videoId);
+    if (pData.videoDetails?.title) title = pData.videoDetails.title;
+    if (pData.videoDetails?.author) author = pData.videoDetails.author;
 
-  const cdnHeaders = { 'User-Agent': userAgent };
+    const cdnHeaders = { 'User-Agent': userAgent };
 
-  if (audioOnly) {
-    const audioCandidates = (pData.streamingData?.adaptiveFormats || [])
-      .filter((f) => Boolean(f.url) && (f.mimeType?.startsWith('audio/mp4') || f.mimeType?.startsWith('audio/')))
-      .sort((a, b) => {
-        const aMp4 = a.mimeType?.startsWith('audio/mp4') ? 1 : 0;
-        const bMp4 = b.mimeType?.startsWith('audio/mp4') ? 1 : 0;
-        if (aMp4 !== bMp4) return bMp4 - aMp4;
-        return (b.bitrate || 0) - (a.bitrate || 0);
-      });
+    if (audioOnly) {
+      const audioCandidates = (pData.streamingData?.adaptiveFormats || [])
+        .filter((f) => Boolean(f.url) && (f.mimeType?.startsWith('audio/mp4') || f.mimeType?.startsWith('audio/')))
+        .sort((a, b) => {
+          const aMp4 = a.mimeType?.startsWith('audio/mp4') ? 1 : 0;
+          const bMp4 = b.mimeType?.startsWith('audio/mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (b.bitrate || 0) - (a.bitrate || 0);
+        });
 
-    for (const fmt of audioCandidates) {
-      if (!fmt.url) continue;
-      try {
-        const rangedUrl = withFullYouTubeRange(fmt.url, fmt.contentLength);
-        const { buffer, contentType } = await fetchBufferWithLimit(rangedUrl, cdnHeaders);
-        const isWebm = contentType.includes('webm') || fmt.mimeType?.includes('webm');
-        return {
-          platform: 'youtube',
-          title,
-          author,
-          items: [
-            {
-              kind: 'audio',
-              buffer,
-              mimetype: isWebm ? 'audio/webm' : 'audio/mp4',
-              filename: `${title}.${isWebm ? 'webm' : 'm4a'}`,
-            },
-          ],
-        };
-      } catch {
-        // Try next audio stream
+      for (const fmt of audioCandidates) {
+        if (!fmt.url) continue;
+        try {
+          const rangedUrl = withFullYouTubeRange(fmt.url, fmt.contentLength);
+          const { buffer, contentType } = await fetchBufferWithLimit(rangedUrl, cdnHeaders);
+          const isWebm = contentType.includes('webm') || fmt.mimeType?.includes('webm');
+          return {
+            platform: 'youtube',
+            title,
+            author,
+            items: [
+              {
+                kind: 'audio',
+                buffer,
+                mimetype: isWebm ? 'audio/webm' : 'audio/mp4',
+                filename: `${title}.${isWebm ? 'webm' : 'm4a'}`,
+              },
+            ],
+          };
+        } catch {
+          // Try next audio stream
+        }
+      }
+    } else {
+      const combined = (pData.streamingData?.formats || [])
+        .filter((f) => Boolean(f.url))
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+      const ordered = [
+        ...combined.filter((f) => (f.height || 0) <= 720),
+        ...combined.filter((f) => (f.height || 0) > 720),
+      ];
+
+      for (const fmt of ordered) {
+        if (!fmt.url) continue;
+        try {
+          const rangedUrl = withFullYouTubeRange(fmt.url, fmt.contentLength);
+          const { buffer } = await fetchBufferWithLimit(rangedUrl, cdnHeaders);
+          return {
+            platform: 'youtube',
+            title,
+            author,
+            items: [{ kind: 'video', buffer, mimetype: 'video/mp4', filename: `${title}.mp4` }],
+          };
+        } catch {
+          // Try next quality format
+        }
       }
     }
-    throw new Error('No playable YouTube audio stream found.');
+  } catch (err) {
+    errors.push(`Innertube: ${(err as Error).message}`);
   }
 
-  const combined = (pData.streamingData?.formats || [])
-    .filter((f) => Boolean(f.url))
-    .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-  const ordered = [
-    ...combined.filter((f) => (f.height || 0) <= 720),
-    ...combined.filter((f) => (f.height || 0) > 720),
-  ];
-
-  for (const fmt of ordered) {
-    if (!fmt.url) continue;
-    try {
-      const rangedUrl = withFullYouTubeRange(fmt.url, fmt.contentLength);
-      const { buffer } = await fetchBufferWithLimit(rangedUrl, cdnHeaders);
-      return {
-        platform: 'youtube',
-        title,
-        author,
-        items: [{ kind: 'video', buffer, mimetype: 'video/mp4', filename: `${title}.mp4` }],
-      };
-    } catch {
-      // Try next quality format (e.g. if 720p > 58MB cap, fall back to 360p)
-    }
+  // Tier 3: Proxied MP4/MP3 converter (works for Shorts & standard videos on cloud/datacenter IPs)
+  try {
+    const gamma = await queryGammacloudYouTube(videoId, audioOnly);
+    return {
+      platform: 'youtube',
+      title: gamma.title || title,
+      author,
+      items: [
+        {
+          kind: audioOnly ? 'audio' : 'video',
+          buffer: gamma.buffer,
+          mimetype: gamma.mimetype,
+          filename: `${gamma.title || title}.${audioOnly ? 'mp3' : 'mp4'}`,
+        },
+      ],
+    };
+  } catch (err) {
+    const msg = (err as Error).message;
+    errors.push(`Converter: ${msg}`);
+    logger.warn('downloader', `YouTube converter tier failed for ${videoId}: ${msg}`);
   }
 
-  throw new Error('Could not download a playable YouTube video stream within size limits.');
+  // Tier 4: Backup REST extractor (verifies stream is actually downloadable before succeeding)
+  try {
+    const dc = await queryDavidCyrilYouTube(videoId, audioOnly);
+    return {
+      platform: 'youtube',
+      title: dc.title || title,
+      author,
+      items: [
+        {
+          kind: audioOnly ? 'audio' : 'video',
+          buffer: dc.buffer,
+          mimetype: dc.mimetype,
+          filename: `${dc.title || title}.${audioOnly ? 'mp3' : 'mp4'}`,
+        },
+      ],
+    };
+  } catch (err) {
+    errors.push(`Fallback: ${(err as Error).message}`);
+  }
+
+  throw new Error(errors[errors.length - 1] || 'Could not download YouTube video or audio.');
 }
 
 // ============================================================================
 // 6. PINTEREST (HD Video & Original Images)
 // ============================================================================
+function cleanPinterestMediaUrl(rawUrl: string): string {
+  return unescapeHtmlEntities(rawUrl)
+    .trim()
+    .replace(/[),;'"\\]+$/, '');
+}
+
+function isJunkPinterestAsset(rawUrl: string): boolean {
+  const lower = rawUrl.toLowerCase();
+  if (!lower.startsWith('http')) return true;
+  // Filter out Pinterest UI icons, gradient button assets, favicons, avatars, tiny thumbnails
+  return (
+    lower.includes('d53b014d86a6b6761bf649a0ed813c2b') ||
+    lower.includes('/webapp/') ||
+    lower.includes('favicon') ||
+    lower.includes('apple-touch-icon') ||
+    lower.includes('sprite') ||
+    lower.includes('/assets/') ||
+    lower.includes('logo') ||
+    lower.includes('/75x75') ||
+    lower.includes('/140x140') ||
+    lower.includes('/avatars/')
+  );
+}
+
+function extractPinterestVideoCandidates(html: string): string[] {
+  const normalized = unescapeHtmlEntities(html);
+  const candidates: string[] = [];
+  const push = (u: string) => {
+    const cleaned = cleanPinterestMediaUrl(u);
+    if (cleaned.startsWith('http') && !isJunkPinterestAsset(cleaned) && !candidates.includes(cleaned)) {
+      candidates.push(cleaned);
+    }
+  };
+
+  // 1. Direct MP4 URLs ordered from highest to lowest quality
+  for (const rx of [
+    /https:\/\/v\d*\.pinimg\.com\/videos\/mc\/720p\/[a-f0-9/]+\.mp4/gi,
+    /https:\/\/v\d*\.pinimg\.com\/videos\/iht\/720p\/[a-f0-9/]+\.mp4/gi,
+    /https:\/\/v\d*\.pinimg\.com\/videos\/mc\/[^"'\s\\)]+\.mp4/gi,
+    /https:\/\/v\d*\.pinimg\.com\/videos\/iht\/expMp4\/[a-f0-9/]+(?:_t1)?\.mp4/gi,
+    /https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s\\)]+\.mp4/gi,
+  ]) {
+    for (const m of normalized.matchAll(rx)) {
+      push(m[0]);
+    }
+  }
+
+  const ogVideo =
+    normalized.match(/<meta[^>]+property=["']og:video(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+    normalized.match(/<video[^>]+src=["']([^"']+)["']/i)?.[1];
+  if (ogVideo) push(ogVideo);
+
+  // 2. Reconstruct 720p MP4 stream URLs from any HLS (.m3u8), expMp4, or video thumbnail hash
+  const hashRx =
+    /pinimg\.com\/videos\/(?:mc|iht|hls|thumbnails)\/(?:720p|480p|360p|expMp4|hls|originals)\/([a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]+)/gi;
+  for (const m of normalized.matchAll(hashRx)) {
+    const hash = m[1];
+    if (hash) {
+      push(`https://v1.pinimg.com/videos/mc/720p/${hash}.mp4`);
+      push(`https://v1.pinimg.com/videos/iht/720p/${hash}.mp4`);
+    }
+  }
+
+  return candidates;
+}
+
+function extractPinterestImageCandidates(html: string): string[] {
+  const normalized = unescapeHtmlEntities(html);
+  const candidates: string[] = [];
+  const push = (u: string) => {
+    const cleaned = cleanPinterestMediaUrl(u);
+    if (cleaned.startsWith('http') && !isJunkPinterestAsset(cleaned) && !candidates.includes(cleaned)) {
+      candidates.push(cleaned);
+    }
+  };
+
+  for (const rx of [
+    /["'](https:\/\/i\.pinimg\.com\/originals\/[a-f0-9/]+\.(?:jpg|jpeg|png|webp))["']/gi,
+    /https:\/\/i\.pinimg\.com\/originals\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]+\.(?:jpg|jpeg|png|webp)/gi,
+    /https:\/\/i\.pinimg\.com\/(?:1200x|736x|564x)\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]+\.(?:jpg|jpeg|png|webp)/gi,
+  ]) {
+    for (const m of normalized.matchAll(rx)) {
+      push(m[1] || m[0]);
+    }
+  }
+
+  const ogImg =
+    normalized.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+    normalized.match(/<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["']/i)?.[1];
+  if (ogImg) push(ogImg);
+
+  return candidates;
+}
+
+function extractPinterestTitle(html: string): string {
+  const ogTitle = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1]?.trim();
+  if (ogTitle && ogTitle.toLowerCase() !== 'pinterest') return ogTitle.slice(0, 200);
+  const tagTitle = html.match(/<title>([^<]+)<\/title>/i)?.[1]
+    ?.replace(/\s*[|\-–]\s*Pinterest.*$/i, '')
+    .trim();
+  if (tagTitle && tagTitle.toLowerCase() !== 'pinterest') return tagTitle.slice(0, 200);
+  return 'Pinterest Pin';
+}
+
 async function downloadPinterest(url: string): Promise<SocialDownloadResult> {
-  const resolvedUrl = await resolveFinalUrl(url);
-  const res = await fetch(resolvedUrl, {
+  // Fetch the submitted URL ONCE directly (avoid double-hitting pin.it -> /sent/ which can strip video metadata)
+  const primaryRes = await fetch(url, {
     redirect: 'follow',
     headers: {
       'User-Agent': BROWSER_UA,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
     },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (!res.ok) {
-    throw new Error(`Pinterest returned HTTP ${res.status}`);
-  }
-  const html = await res.text();
-
-  const titleMatch = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i);
-  const title = titleMatch?.[1]?.trim() || 'Pinterest Pin';
-
-  // Prefer MP4 video stream over thumbnail image
-  const videoUrls = Array.from(
-    html.matchAll(/https:\/\/v\d*\.pinimg\.com\/videos\/mc\/720p\/[^"'\s\\]+\.mp4/gi)
-  ).map((m) => m[0]);
-  const hqVideoFallback = Array.from(
-    html.matchAll(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s\\]+\.mp4/gi)
-  ).map((m) => m[0]);
-  const pickedVideo = videoUrls[0] || hqVideoFallback[0];
-
-  if (pickedVideo) {
-    const { buffer } = await fetchBufferWithLimit(pickedVideo);
-    return {
-      platform: 'pinterest',
-      title,
-      items: [{ kind: 'video', buffer, mimetype: 'video/mp4' }],
-    };
+  if (!primaryRes.ok) {
+    throw new Error(`Pinterest returned HTTP ${primaryRes.status}`);
   }
 
-  // Fallback to highest-res pinimg image
-  const origImgs = Array.from(
-    html.matchAll(/https:\/\/i\.pinimg\.com\/originals\/[^"'\s\\]+\.(?:jpg|jpeg|png|webp)/gi)
-  ).map((m) => m[0]);
-  const ogImg = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i)?.[1];
-  const imgUrl = origImgs[0] || ogImg;
+  const resolvedUrl = (primaryRes.url || url).split('#')[0];
+  const primaryHtml = await primaryRes.text();
+  let title = extractPinterestTitle(primaryHtml);
 
-  if (imgUrl) {
-    const { buffer, contentType } = await fetchBufferWithLimit(imgUrl);
-    return {
-      platform: 'pinterest',
-      title,
-      items: [
-        {
-          kind: 'image',
-          buffer,
-          mimetype: contentType.startsWith('image/') ? contentType : 'image/jpeg',
+  const pinIdMatch =
+    resolvedUrl.match(/\/pin\/(\d+)/i) ||
+    primaryHtml.match(/https:\/\/(?:www\.)?pinterest\.[^/"'\s]+\/pin\/(\d+)/i);
+  const cleanPinUrl = pinIdMatch?.[1] ? `https://www.pinterest.com/pin/${pinIdMatch[1]}/` : resolvedUrl;
+
+  const htmlSources: string[] = [primaryHtml];
+
+  // Try video candidates from primary HTML first
+  for (const videoUrl of extractPinterestVideoCandidates(primaryHtml)) {
+    try {
+      const { buffer, contentType } = await fetchBufferWithLimit(videoUrl);
+      if (contentType.startsWith('video/') || videoUrl.endsWith('.mp4')) {
+        return {
+          platform: 'pinterest',
+          title,
+          items: [{ kind: 'video', buffer, mimetype: 'video/mp4' }],
+        };
+      }
+    } catch {
+      // Try next video candidate
+    }
+  }
+
+  // Secondary fetch: clean Pin URL with crawler UA often exposes full og/video JSON even when /sent/ omits it
+  if (pinIdMatch?.[1]) {
+    try {
+      const botRes = await fetch(cleanPinUrl, {
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+          Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
         },
-      ],
-    };
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (botRes.ok) {
+        const botHtml = await botRes.text();
+        htmlSources.push(botHtml);
+        if (title === 'Pinterest Pin') title = extractPinterestTitle(botHtml);
+        for (const videoUrl of extractPinterestVideoCandidates(botHtml)) {
+          try {
+            const { buffer } = await fetchBufferWithLimit(videoUrl);
+            return {
+              platform: 'pinterest',
+              title,
+              items: [{ kind: 'video', buffer, mimetype: 'video/mp4' }],
+            };
+          } catch {
+            // Try next candidate
+          }
+        }
+      }
+    } catch {
+      // Proceed to SavePin fallback
+    }
+  }
+
+  // Tertiary fetch: SavePin extractor exposes video thumbnail hashes or direct MP4/image links
+  try {
+    const spRes = await fetch(
+      `https://www.savepin.app/download.php?url=${encodeURIComponent(cleanPinUrl)}&lang=en&type=redirect`,
+      {
+        headers: {
+          'User-Agent': BROWSER_UA,
+          Referer: 'https://www.savepin.app/',
+        },
+        signal: AbortSignal.timeout(15_000),
+      }
+    );
+    if (spRes.ok) {
+      const spHtml = await spRes.text();
+      htmlSources.push(spHtml);
+      for (const videoUrl of extractPinterestVideoCandidates(spHtml)) {
+        try {
+          const { buffer } = await fetchBufferWithLimit(videoUrl);
+          return {
+            platform: 'pinterest',
+            title,
+            items: [{ kind: 'video', buffer, mimetype: 'video/mp4' }],
+          };
+        } catch {
+          // Try next candidate
+        }
+      }
+    }
+  } catch {
+    // Proceed to high-res image extraction
+  }
+
+  // If no video exists, fall back to clean high-resolution Pin images (never UI icons!)
+  for (const html of htmlSources) {
+    for (const imgUrl of extractPinterestImageCandidates(html)) {
+      try {
+        const { buffer, contentType } = await fetchBufferWithLimit(imgUrl);
+        if (!contentType.startsWith('image/')) continue;
+        return {
+          platform: 'pinterest',
+          title,
+          items: [
+            {
+              kind: 'image',
+              buffer,
+              mimetype: contentType,
+            },
+          ],
+        };
+      } catch {
+        // Try next image candidate
+      }
+    }
   }
 
   if (getCobaltEndpoints().length > 0) {
-    const cobalt = await queryCobaltApi({ url: resolvedUrl, videoQuality: '1080' });
+    const cobalt = await queryCobaltApi({ url: cleanPinUrl, videoQuality: '1080' });
     const { buffer, contentType } = await fetchBufferWithLimit(cobalt.mediaUrl);
     return {
       platform: 'pinterest',

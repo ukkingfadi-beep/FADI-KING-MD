@@ -30,6 +30,7 @@ const AUTO_REACT_EMOJIS = ['❤️', '🔥', '👍', '😂', '😮', '✨', '�
 
 const processedMsgIds = new Set<string>();
 const afkNoticeCooldown = new Map<string, number>();
+const bannedNoticeCooldown = new Map<string, number>();
 
 async function notifyIfMentionedAfk(
   sock: WASocket,
@@ -162,6 +163,9 @@ export async function handleIncomingMessage(
     rememberUserName(senderNumber, msg.pushName);
     const isOwner = Boolean(msg.key.fromMe) || vipStore.isOwner(senderNumber);
     const isVip = isOwner || vipStore.isVip(senderNumber);
+    const bannedEntry = !isOwner
+      ? vipStore.isUserBanned([senderNumber, senderJid, ...senderCandidates])
+      : null;
 
     const body = extractBodyText(msg.message).trim();
 
@@ -262,7 +266,7 @@ export async function handleIncomingMessage(
       // AI Auto-Reply:
       // - In Groups: ONLY reply in groups where AI was explicitly turned ON (groupCfg.aiEnabled === true), and reply to every question/message!
       // - In Private DMs/IB: reply when global cfg.aiEnabled is ON.
-      if (!msg.key.fromMe && (cfg.mode !== 'self' || isOwner)) {
+      if (!msg.key.fromMe && !bannedEntry && (cfg.mode !== 'self' || isOwner)) {
         let shouldReplyWithAi = false;
         if (isGroup) {
           const groupCfg = vipStore.getGroupConfig(chatId);
@@ -296,6 +300,24 @@ export async function handleIncomingMessage(
 
     const command = findCommand(cmdName);
     if (!command) return;
+
+    if (bannedEntry) {
+      const banKey = bannedEntry.number || senderNumber;
+      const now = Date.now();
+      if (now - (bannedNoticeCooldown.get(banKey) || 0) >= 60_000) {
+        bannedNoticeCooldown.set(banKey, now);
+        await sock
+          .sendMessage(
+            chatId,
+            {
+              text: `🚫 *Bot Access Denied:* You are banned from using bot commands.${bannedEntry.reason ? `\n• Reason: ${bannedEntry.reason}` : ''}`,
+            },
+            { quoted: msg }
+          )
+          .catch(() => {});
+      }
+      return;
+    }
 
     // Permission checks
     if (command.ownerOnly && !isOwner) {
@@ -447,6 +469,14 @@ export async function executeConsoleCommand(
     const effectiveNumber = normalizePhone(senderNumber || cfg.ownerNumber);
     const isOwner = vipStore.isOwner(effectiveNumber);
     const isVip = isOwner || vipStore.isVip(effectiveNumber);
+
+    const consoleBanned = !isOwner ? vipStore.isUserBanned([effectiveNumber]) : null;
+    if (consoleBanned) {
+      return {
+        ok: false,
+        output: `Access Denied: User +${effectiveNumber} is banned from using bot commands.${consoleBanned.reason ? ` Reason: ${consoleBanned.reason}` : ''}`,
+      };
+    }
 
     if (command.ownerOnly && !isOwner) {
       return { ok: false, output: `Access Denied: ${command.name} requires Owner privileges.` };

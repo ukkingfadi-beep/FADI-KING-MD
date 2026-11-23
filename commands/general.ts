@@ -29,25 +29,178 @@ function formatUptime(seconds: number): string {
   return parts.join(' ');
 }
 
-function toMathBold(text: string): string {
-  return Array.from(text)
-    .map((ch) => {
-      const code = ch.charCodeAt(0);
-      if (code >= 65 && code <= 90) return String.fromCodePoint(0x1d400 + (code - 65));
-      if (code >= 97 && code <= 122) return String.fromCodePoint(0x1d41a + (code - 97));
-      if (code >= 48 && code <= 57) return String.fromCodePoint(0x1d7ce + (code - 48));
-      return ch;
-    })
-    .join('');
+interface MenuSectionSpec {
+  id: string;
+  categories: CommandCategory[];
+  banner: string;
+  commands: string[];
 }
 
-const categoryBannerTitles: Record<CommandCategory, { emoji: string; label: string }> = {
-  general: { emoji: '⚡', label: 'CORE' },
-  vip: { emoji: '💎', label: 'VIP ACCESS' },
-  group: { emoji: '🛡️', label: 'GROUP' },
-  media: { emoji: '🎧', label: 'MEDIA & VOICE' },
-  owner: { emoji: '👑', label: 'OWNER' },
-};
+const MENU_SECTIONS: MenuSectionSpec[] = [
+  {
+    id: 'core',
+    categories: ['general'],
+    banner: '┌──「 ✨ CORE ✨ 」',
+    commands: [
+      'menu',
+      'ping',
+      'alive',
+      'owner',
+      'jid',
+      'botlink',
+      'botinfo',
+      'reminder',
+      'afkon',
+      'afkoff',
+    ],
+  },
+  {
+    id: 'vip',
+    categories: ['vip'],
+    banner: '┌──「 💎 VIP ACCESS 💎 」',
+    commands: ['pair', 'addvip', 'delvip', 'viplist', 'checkvip'],
+  },
+  {
+    id: 'security',
+    categories: ['group'],
+    banner: '┌──「 🛡️ GROUP SECURITY 🛡️ 」',
+    commands: [
+      'antiadmin',
+      'antikickall',
+      'antilink',
+      'antiadd',
+      'antiforward',
+      'antimedia',
+      'antisticker',
+      'antibot',
+      'antidelete',
+      'antiscam',
+      'antimention',
+      'bansticker',
+    ],
+  },
+  {
+    id: 'group',
+    categories: ['group'],
+    banner: '┌──「 👥 GROUP & ADMIN 👥 」',
+    commands: [
+      'kick',
+      'add',
+      'kickall',
+      'welcomeimg',
+      'welcome',
+      'goodbye',
+      'group',
+      'mute',
+      'unmute',
+      'link',
+      'revoke',
+      'setname',
+      'setdesc',
+      'promote',
+      'demote',
+      'warn',
+      'clearwarn',
+      'slowmode',
+      'tagadmin',
+      'tagall',
+      'hidetag',
+      'groupinfo',
+      'setpp',
+      'groupdp',
+      'poll',
+      'pollcreate',
+      'approve',
+      'approveall',
+      'rejectall',
+      'pin',
+      'unpin',
+      'muteuser',
+      'unmuteuser',
+      'giveaway',
+      'gclist',
+      'gcstatus',
+      'resetgroup',
+      'left',
+    ],
+  },
+  {
+    id: 'media',
+    categories: ['media'],
+    banner: '┌──「 🎨 MEDIA & VOICE 🎨 」',
+    commands: [
+      's',
+      'toimg',
+      'vv',
+      'info',
+      'del',
+      'tts',
+      'save',
+      'qr',
+      'calc',
+      'say',
+      'quote',
+      'tr',
+      'weather',
+      'wa',
+      'savedp',
+      'react',
+      'fakereact',
+      'contactsave',
+      'bassboost',
+      'stickerinfo',
+    ],
+  },
+  {
+    id: 'ai_tools',
+    categories: ['media', 'owner'],
+    banner: '┌──「 🤖 AI & SMART TOOLS 🤖 」',
+    commands: [
+      'ai',
+      'roast',
+      'factcheck',
+      'summarize',
+      'grammar',
+      'checklink',
+      'poetry',
+      'bio',
+      'cricket',
+    ],
+  },
+  {
+    id: 'downloaders',
+    categories: ['media'],
+    banner: '┌──「 📥 DOWNLOADERS 📥 」',
+    commands: ['yt', 'fb', 'twitter', 'pinterest', 'tiktok', 'ig'],
+  },
+  {
+    id: 'owner',
+    categories: ['owner'],
+    banner: '┌──「 👑 OWNER 👑 」',
+    commands: [
+      'mode',
+      'setprefix',
+      'block',
+      'unblock',
+      'ban',
+      'unban',
+      'anticall',
+      'broadcast',
+      'autoread',
+      'autostatus',
+      'autotyping',
+      'autorecord',
+      'opengc',
+      'ibpost',
+      'autoreact',
+      'singletick',
+      'restart',
+      'alwaysonline',
+      'clearchat',
+      'blocklist',
+    ],
+  },
+];
 
 const commandEmojiMap: Record<string, string> = {
   menu: '📜',
@@ -55,88 +208,121 @@ const commandEmojiMap: Record<string, string> = {
   alive: '💠',
   owner: '👑',
   jid: '🆔',
+  botlink: '🌐',
+  botinfo: '📊',
+  reminder: '⏰',
+  afkon: '🌙',
+  afkoff: '☀️',
   pair: '🔗',
-  vip: '💎',
   addvip: '➕',
   delvip: '➖',
-  listvip: '📋',
+  viplist: '📋',
+  checkvip: '✅',
+  antiadmin: '🛡️',
+  antikickall: '🛑',
   antilink: '🚫',
-  antiscam: '🛡️',
-  antistatus: '🔕',
-  welcome: '🎉',
-  goodbye: '👋',
+  antiadd: '🚷',
+  antiforward: '⏭️',
+  antimedia: '📵',
+  antisticker: '🎭',
+  antibot: '🤖',
+  antidelete: '👁️',
+  antiscam: '🔰',
+  antimention: '🔕',
+  bansticker: '🚯',
   kick: '🥾',
   add: '📲',
+  kickall: '💥',
+  welcomeimg: '🖼️',
+  welcome: '🎉',
+  goodbye: '🚪',
+  group: '👥',
+  mute: '🔇',
+  unmute: '🔊',
+  link: '🔗',
+  revoke: '♻️',
+  setname: '✏️',
+  setdesc: '📝',
   promote: '⬆️',
   demote: '⬇️',
+  warn: '⚠️',
+  clearwarn: '🧽',
+  slowmode: '🐢',
+  tagadmin: '🔔',
   tagall: '📢',
   hidetag: '👻',
-  mute: '🔒',
-  unmute: '🔓',
+  groupinfo: 'ℹ️',
+  setpp: '🖼️',
+  groupdp: '📸',
   poll: '📊',
-  fakepoll: '🗳️',
-  autoreact: '💖',
-  fakereact: '✨',
-  react: '😍',
-  s: '🎨',
-  sticker: '🎨',
-  vv: '👁️',
-  tts: '🗣️',
-  voice: '🎙️',
-  ai: '🤖',
-  savedp: '🖼️',
-  dpsave: '🖼️',
-  getpp: '🖼️',
-  singletick: '☑️',
-  anticall: '📵',
-  status: '🟢',
-  broadcast: '📡',
-  bc: '📡',
-  ib: '📨',
-  mode: '⚙️',
-  botlink: '🌐',
-  groupdp: '🖼️',
-  gdp: '🖼️',
+  pollcreate: '🗳️',
   approve: '✅',
-  kickall: '💥',
+  approveall: '☑️',
+  rejectall: '❌',
   pin: '📌',
   unpin: '📍',
-  contactsave: '📱',
-  tiktok: '🎵',
-  ig: '📸',
+  muteuser: '🤐',
+  unmuteuser: '🗣️',
+  giveaway: '🎁',
+  gclist: '📂',
+  gcstatus: '📣',
+  resetgroup: '🔄',
+  left: '👋',
+  s: '🎨',
+  toimg: '🖼️',
+  vv: '👁️',
+  info: 'ℹ️',
+  del: '🗑️',
+  tts: '🗣️',
+  save: '💾',
+  qr: '📷',
+  calc: '🧮',
+  say: '💬',
+  quote: '💭',
+  tr: '🌐',
+  weather: '🌦️',
+  wa: '📱',
+  savedp: '🖼️',
+  react: '😍',
+  fakereact: '🤩',
+  contactsave: '📇',
+  bassboost: '🔊',
+  stickerinfo: '🏷️',
+  ai: '🤖',
+  roast: '🔥',
+  factcheck: '🧐',
+  summarize: '📝',
+  grammar: '✍️',
+  checklink: '🔎',
+  poetry: '🖋️',
+  bio: '✨',
+  cricket: '🏏',
   yt: '▶️',
   fb: '📘',
   twitter: '🐦',
   pinterest: '📌',
-  toimg: '🖼️',
-  info: 'ℹ️',
-  calc: '🧮',
-  qr: '📷',
-  rejectall: '❌',
-  approveall: '✅',
-  antiadd: '🚷',
-  antiforward: '⛔',
-  antimedia: '📵',
-  antisticker: '🚫',
+  tiktok: '🎵',
+  ig: '📸',
+  mode: '⚙️',
+  setprefix: '🎛️',
+  block: '🚫',
+  unblock: '✅',
+  ban: '🔨',
+  unban: '🔓',
+  anticall: '📵',
+  broadcast: '📢',
+  autoread: '👀',
+  autostatus: '🟢',
+  autotyping: '⌨️',
+  autorecord: '🎙️',
+  opengc: '📤',
+  ibpost: '📨',
+  autoreact: '💖',
+  singletick: '☑️',
+  restart: '🔄',
   alwaysonline: '🟢',
   clearchat: '🧹',
   blocklist: '📛',
-  roast: '🔥',
-  botinfo: '📊',
-  antibot: '🤖',
-  muteuser: '🔇',
-  unmuteuser: '🔊',
-  factcheck: '🧐',
-  summarize: '📝',
-  grammar: '✍️',
-  reminder: '⏰',
-  giveaway: '🎁',
-  afkon: '💤',
-  afkoff: '⚡',
-  clearwarn: '🧽',
-  slowmode: '🐢',
-  checklink: '🔎',
-  pollcreate: '🗳️',
 };
 
 export async function resolveMenuImageBuffer(configuredUrl: string): Promise<Buffer | null> {
@@ -299,9 +485,8 @@ export function buildStylishMenuCaption(
   filterCat?: CommandCategory
 ): string {
   const cmds = getAllCommands();
-  const categories: CommandCategory[] = ['general', 'vip', 'group', 'media', 'owner'];
-  const targetCategories =
-    filterCat && categories.includes(filterCat) ? [filterCat] : categories;
+  const cmdSet = new Set(cmds.map((c) => c.name.toLowerCase()));
+  const assigned = new Set<string>();
 
   const uptime = formatUptime(process.uptime());
   const safeBotName = String(cfg.botName || 'FADI KING MD').trim() || 'FADI KING MD';
@@ -310,29 +495,58 @@ export function buildStylishMenuCaption(
   const safeMode = cfg.mode === 'self' ? 'PRIVATE' : 'PUBLIC';
 
   const lines: string[] = [
-    `╭──✦ 🤖 「 *${toMathBold('BOT INFO')}* 」 ✦`,
-    `│ ◈ 👑 *${toMathBold(safeBotName.toUpperCase())}*`,
-    `│ ◈ 🔱 *${toMathBold('OWNER')}:* *${toMathBold(safeOwnerName.toUpperCase())}*`,
-    `│ ◈ 📜 *${toMathBold('COMMANDS')}:* *${cmds.length}*`,
-    `│ ◈ ⏱️ *${toMathBold('RUNTIME')}:* *${uptime}*`,
-    `│ ◈ 📦 *${toMathBold('PREFIX')}:* *${safePrefix}*`,
-    `│ ◈ ⚙️ *${toMathBold('MODE')}:* *${toMathBold(safeMode)}*`,
-    `╰─────────────✦`,
+    `┌──「 👑 *${safeBotName.toUpperCase()}* 👑 」`,
+    `│🤖 *BOT:* ${safeBotName.toUpperCase()}`,
+    `│🔱 *OWNER:* ${safeOwnerName.toUpperCase()}`,
+    `│📊 *COMMANDS:* ${cmds.length}`,
+    `│⏱️ *RUNTIME:* ${uptime}`,
+    `│📦 *PREFIX:* ${safePrefix}`,
+    `│⚙️ *MODE:* ${safeMode}`,
+    `└───────────────`,
     '',
   ];
 
-  for (const cat of targetCategories) {
-    const list = cmds.filter((c) => c.category === cat);
-    const meta = categoryBannerTitles[cat];
-    lines.push(`╭──✦ ${meta.emoji} 「 *${toMathBold(meta.label)}* 」 ✦`);
-    for (const cmd of list) {
-      const cmdRaw = String(cmd.name || '').trim();
-      if (!cmdRaw) continue;
-      const icon = commandEmojiMap[cmdRaw.toLowerCase()] || '◈';
-      const cmdLabel = toMathBold(cmdRaw.toUpperCase());
-      lines.push(`│ ${icon} *${safePrefix}${cmdLabel}*`);
+  const targetSections = filterCat
+    ? MENU_SECTIONS.filter((s) => s.categories.includes(filterCat))
+    : MENU_SECTIONS;
+
+  for (const section of targetSections) {
+    const items = section.commands.filter((name) => {
+      if (!cmdSet.has(name) || assigned.has(name)) return false;
+      assigned.add(name);
+      return true;
+    });
+
+    // Include any newly added commands belonging to this section's default category
+    if (!filterCat || section.categories.includes(filterCat)) {
+      const defaultCategoryBucket: Record<CommandCategory, string> = {
+        general: 'core',
+        vip: 'vip',
+        group: 'group',
+        media: 'media',
+        owner: 'owner',
+      };
+      for (const cmd of cmds) {
+        const lower = cmd.name.toLowerCase();
+        if (assigned.has(lower)) continue;
+        if (
+          defaultCategoryBucket[cmd.category] === section.id &&
+          !MENU_SECTIONS.some((other) => other.commands.includes(lower))
+        ) {
+          assigned.add(lower);
+          items.push(lower);
+        }
+      }
     }
-    lines.push(`╰─────────────✦`);
+
+    if (items.length === 0) continue;
+
+    lines.push(section.banner);
+    for (const cmdName of items) {
+      const icon = commandEmojiMap[cmdName] || '🔹';
+      lines.push(`│${icon} ${safePrefix}${cmdName.toUpperCase()}`);
+    }
+    lines.push('└───────────────');
     lines.push('');
   }
 

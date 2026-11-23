@@ -137,3 +137,18 @@ export async function generatePlayfulRoast(targetName: string): Promise<string> 
     `Roast "${targetName}" playfully.`
   );
 }
+
+export async function generatePoetryReply(topicOrMood: string): Promise<string> {
+  return runGeminiTextTask(
+    'You are an eloquent poet fluent in Urdu shayari (both Urdu script and Roman Urdu) and English poetry. If the user writes in English or requests English poetry, write evocative English verse; otherwise write heartfelt, rhythmic Roman Urdu or Urdu shayari (4-6 lines) with a poetic title line. Format cleanly for WhatsApp without meta commentary.',
+    `Write poetry/shayari matching this theme, mood, or request:\n${topicOrMood}`
+  );
+}
+
+export async function generateBioOptionsReply(keywordsOrRole: string): Promise<string> {
+  return runGeminiTextTask(
+    'You craft stylish, concise, memorable profile bios for WhatsApp, Instagram, and TikTok. Return 4 distinct numbered bio options (1-2 short lines each) with tasteful emojis matching the user’s keywords/vibe (e.g., Clean/Minimal, Attitude, Creative, Aesthetic). Keep each bio under 140 characters and skip extra chatter.',
+    `Generate 4 stylish social profile bios for these keywords/profile details:\n${keywordsOrRole}`
+  );
+}
+

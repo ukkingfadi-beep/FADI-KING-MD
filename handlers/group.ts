@@ -1,5 +1,5 @@
 import { getUrlInfo, type BaileysEventMap, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
-import { loadConfig } from '../config/bot.config.ts';
+import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import {
   extractBodyText,
   extractContextInfo,
@@ -16,6 +16,7 @@ import {
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { generateWelcomeImageCard } from '../utils/mediaHelper.ts';
 import { vipStore } from '../utils/vipStore.ts';
 
 const LINK_REGEX =
@@ -32,6 +33,7 @@ const BAD_MEDIA_LABEL_REGEX =
 
 const stickerFloodTracker = new Map<string, number[]>();
 const msgFloodTracker = new Map<string, number[]>();
+const kickAllTracker = new Map<string, number[]>();
 
 function recordFloodHit(
   tracker: Map<string, number[]>,
@@ -62,6 +64,31 @@ export function normalizeFileSha256(
   return Buffer.from(raw).toString('base64');
 }
 
+async function expandActorKeys(
+  sock: WASocket,
+  rawAuthor: string,
+  extraAuthorPn?: string
+): Promise<string[]> {
+  const set = new Set<string>();
+  const add = (val?: string | null) => {
+    const bare = normalizeBareJid(val);
+    if (bare) set.add(bare);
+  };
+  add(rawAuthor);
+  add(extraAuthorPn);
+  for (const item of Array.from(set)) {
+    if (isLidUser(item) && sock.signalRepository?.lidMapping?.getPNForLID) {
+      try {
+        const pn = await sock.signalRepository.lidMapping.getPNForLID(item);
+        if (pn) add(pn);
+      } catch {
+        // Ignore unavailable LID mapping
+      }
+    }
+  }
+  return Array.from(set);
+}
+
 export async function handleGroupParticipantsUpdate(
   sock: WASocket,
   update: BaileysEventMap['group-participants.update']
@@ -72,20 +99,35 @@ export async function handleGroupParticipantsUpdate(
     const groupCfg = vipStore.getGroupConfig(groupId);
     const cfg = loadConfig();
 
-    // Anti-Add & Anti-Bot check on newly added participants
+    const updateExtra = update as { author?: string; authorPn?: string };
+    const authorRaw = updateExtra.author || '';
+    const authorPnRaw = updateExtra.authorPn || '';
+
+    // 1. Anti-Add & Anti-Bot check on newly added participants
     if (update.action === 'add' && (groupCfg.antiAdd || groupCfg.antiBot) && cfg.mode !== 'self') {
       try {
         const meta = await getCachedGroupMetadata(sock, groupId, true);
         const botJids = await getBotJids(sock);
         const botParticipant = findParticipant(meta.participants, botJids);
         const botIsAdmin = isParticipantAdmin(botParticipant);
-        const ownerNum = cfg.ownerNumber;
+        const ownerNum = normalizePhone(cfg.ownerNumber);
 
-        const authorRaw = (update as { author?: string }).author || '';
-        const authorBare = normalizeBareJid(authorRaw);
-        const authorParticipant = authorBare ? findParticipant(meta.participants, [authorBare]) : undefined;
-        const authorIsBot = Boolean(authorBare && botJids.some((b) => jidUserPart(b) === jidUserPart(authorBare)));
-        const authorIsOwner = Boolean(authorBare && ownerNum && jidUserPart(authorBare) === ownerNum);
+        const actorCandidates = await expandActorKeys(sock, authorRaw, authorPnRaw);
+        const authorBare = actorCandidates[0] || '';
+        const authorParticipant = actorCandidates.length
+          ? findParticipant(meta.participants, actorCandidates)
+          : undefined;
+        const actorUserParts = new Set(
+          [
+            ...actorCandidates.map((c) => jidUserPart(c)),
+            jidUserPart(authorParticipant?.id),
+            jidUserPart(authorParticipant?.phoneNumber),
+          ].filter(Boolean)
+        );
+        const authorIsBot = botJids.some((b) => actorUserParts.has(jidUserPart(b)));
+        const authorIsOwner = Boolean(
+          ownerNum && Array.from(actorUserParts).some((u) => normalizePhone(u) === ownerNum)
+        );
         const authorIsAdmin = isParticipantAdmin(authorParticipant) || authorIsBot || authorIsOwner;
 
         if (botIsAdmin) {
@@ -100,7 +142,7 @@ export async function handleGroupParticipantsUpdate(
             const wasAddedByNonAdmin = Boolean(
               groupCfg.antiAdd &&
                 authorBare &&
-                jidUserPart(authorBare) !== jidUserPart(bareAdded) &&
+                !actorUserParts.has(jidUserPart(bareAdded)) &&
                 !authorIsAdmin
             );
 
@@ -130,8 +172,194 @@ export async function handleGroupParticipantsUpdate(
       }
     }
 
-    if (!groupCfg.welcome && !groupCfg.goodbye) return;
+    // 2. Anti-Admin Guard: Only Bot itself, Bot Owner, or Group Creator can promote admins
+    if (update.action === 'promote' && groupCfg.antiAdmin && cfg.mode !== 'self') {
+      try {
+        const meta = await getCachedGroupMetadata(sock, groupId, true);
+        const botJids = await getBotJids(sock);
+        const botParticipant = findParticipant(meta.participants, botJids);
+        if (isParticipantAdmin(botParticipant)) {
+          const ownerNum = normalizePhone(cfg.ownerNumber);
+          const actorCandidates = await expandActorKeys(sock, authorRaw, authorPnRaw);
+          const actorParticipant = actorCandidates.length
+            ? findParticipant(meta.participants, actorCandidates)
+            : undefined;
+          const actorParts = new Set(
+            [
+              ...actorCandidates.map((c) => jidUserPart(c)),
+              jidUserPart(actorParticipant?.id),
+              jidUserPart(actorParticipant?.phoneNumber),
+            ].filter(Boolean)
+          );
+
+          const creatorParts = new Set(
+            [
+              jidUserPart(meta.owner),
+              jidUserPart(meta.ownerPn),
+              ...meta.participants
+                .filter((p) => p.admin === 'superadmin')
+                .flatMap((p) => [jidUserPart(p.id), jidUserPart(p.phoneNumber)]),
+            ].filter(Boolean)
+          );
+
+          const actorIsBot = botJids.some((b) => actorParts.has(jidUserPart(b)));
+          const actorIsOwner = Boolean(
+            ownerNum && Array.from(actorParts).some((u) => normalizePhone(u) === ownerNum)
+          );
+          const actorIsCreator =
+            actorParticipant?.admin === 'superadmin' ||
+            Array.from(actorParts).some((u) => creatorParts.has(u));
+
+          if (!actorIsBot && !actorIsOwner && !actorIsCreator) {
+            const targetsToDemote: string[] = [];
+            for (const participant of update.participants) {
+              const pObj = typeof participant === 'string' ? { id: participant } : participant;
+              const rawJid = pObj.id;
+              const pnPart = jidUserPart((pObj as { phoneNumber?: string }).phoneNumber);
+              const uPart = jidUserPart(rawJid);
+              const isTargetBot = botJids.some((b) => jidUserPart(b) === uPart || jidUserPart(b) === pnPart);
+              const isTargetOwner = Boolean(
+                ownerNum &&
+                  (normalizePhone(uPart) === ownerNum || normalizePhone(pnPart) === ownerNum)
+              );
+              if (!isTargetBot && !isTargetOwner) {
+                targetsToDemote.push(rawJid);
+              }
+            }
+
+            if (targetsToDemote.length > 0) {
+              await sock.groupParticipantsUpdate(groupId, targetsToDemote, 'demote').catch(() => {});
+              invalidateGroupMetadataCache(groupId);
+              const actorJid = actorParticipant?.id || actorCandidates[0] || '';
+              const actorTag = actorJid ? `@${jidUserPart(actorJid)}` : 'An admin';
+              const targetTags = targetsToDemote.map((t) => `@${jidUserPart(t)}`).join(', ');
+              const mentions = Array.from(
+                new Set([...targetsToDemote, ...(actorJid ? [actorJid] : [])])
+              );
+              await sock
+                .sendMessage(groupId, {
+                  text: `🛡️ *Anti-Admin Guard*\nOnly the *Group Creator* or *Bot Owner* can promote members here.\n• Unauthorized promotion by: ${actorTag}\n• Automatically demoted: ${targetTags}`,
+                  mentions,
+                })
+                .catch(() => {});
+              logger.security(
+                'antiAdmin',
+                `Reverted unauthorized promotion of [${targetsToDemote.join(', ')}] by ${actorJid || 'unknown'} in ${groupId}`
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn('antiAdmin', `Anti-Admin check failed in ${groupId}: ${(err as Error).message}`);
+      }
+    }
+
+    // 3. Anti-KickAll Guard: When ON, demote non-creator/non-owner admin performing bulk/rapid kicks (no re-add)
+    if (update.action === 'remove' && groupCfg.antiKickAll && cfg.mode !== 'self' && authorRaw) {
+      try {
+        const meta = await getCachedGroupMetadata(sock, groupId, true);
+        const botJids = await getBotJids(sock);
+        const botParticipant = findParticipant(meta.participants, botJids);
+        if (isParticipantAdmin(botParticipant)) {
+          const ownerNum = normalizePhone(cfg.ownerNumber);
+          const actorCandidates = await expandActorKeys(sock, authorRaw, authorPnRaw);
+          const actorParticipant = actorCandidates.length
+            ? findParticipant(meta.participants, actorCandidates)
+            : undefined;
+          const actorParts = new Set(
+            [
+              ...actorCandidates.map((c) => jidUserPart(c)),
+              jidUserPart(actorParticipant?.id),
+              jidUserPart(actorParticipant?.phoneNumber),
+            ].filter(Boolean)
+          );
+
+          const creatorParts = new Set(
+            [
+              jidUserPart(meta.owner),
+              jidUserPart(meta.ownerPn),
+              ...meta.participants
+                .filter((p) => p.admin === 'superadmin')
+                .flatMap((p) => [jidUserPart(p.id), jidUserPart(p.phoneNumber)]),
+            ].filter(Boolean)
+          );
+
+          const actorIsBot = botJids.some((b) => actorParts.has(jidUserPart(b)));
+          const actorIsOwner = Boolean(
+            ownerNum && Array.from(actorParts).some((u) => normalizePhone(u) === ownerNum)
+          );
+          const actorIsCreator =
+            actorParticipant?.admin === 'superadmin' ||
+            Array.from(actorParts).some((u) => creatorParts.has(u));
+
+          if (!actorIsBot && !actorIsOwner && !actorIsCreator) {
+            let nonSelfRemoved = 0;
+            for (const participant of update.participants) {
+              const pObj = typeof participant === 'string' ? { id: participant } : participant;
+              const tUser = jidUserPart(pObj.id);
+              const tPn = jidUserPart((pObj as { phoneNumber?: string }).phoneNumber);
+              if (actorParts.has(tUser) || (tPn && actorParts.has(tPn))) {
+                continue; // Member left voluntarily
+              }
+              nonSelfRemoved += 1;
+            }
+
+            if (nonSelfRemoved > 0) {
+              const actorKey =
+                jidUserPart(actorParticipant?.phoneNumber || actorParticipant?.id || actorCandidates[0]) ||
+                jidUserPart(authorRaw);
+              const trackKey = `${groupId}:${actorKey}`;
+              const now = Date.now();
+              const recent = (kickAllTracker.get(trackKey) || []).filter((ts) => now - ts <= 12_000);
+              for (let i = 0; i < nonSelfRemoved; i += 1) {
+                recent.push(now);
+              }
+              kickAllTracker.set(trackKey, recent);
+
+              if (kickAllTracker.size > 2000) {
+                for (const [k, list] of kickAllTracker.entries()) {
+                  if (!list.length || now - list[list.length - 1] > 12_000) {
+                    kickAllTracker.delete(k);
+                  }
+                }
+              }
+
+              if (recent.length >= 2) {
+                kickAllTracker.delete(trackKey);
+                const actorTargetJid = actorParticipant?.id || actorCandidates[0] || authorRaw;
+                if (actorTargetJid) {
+                  await sock
+                    .groupParticipantsUpdate(groupId, [actorTargetJid], 'demote')
+                    .catch(() => {});
+                  invalidateGroupMetadataCache(groupId);
+                  await sock
+                    .sendMessage(groupId, {
+                      text: `🛑 *Anti-KickAll Shield*\nMass-kick / kickall attempt detected by @${jidUserPart(actorTargetJid)}.\nThey have been automatically *demoted from Admin* to protect the group.`,
+                      mentions: [actorTargetJid],
+                    })
+                    .catch(() => {});
+                  logger.security(
+                    'antiKickAll',
+                    `Demoted ${actorTargetJid} after ${recent.length} removals in ${groupId}`
+                  );
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn('antiKickAll', `Anti-KickAll check failed in ${groupId}: ${(err as Error).message}`);
+      }
+    }
+
+    // 4. Welcome / Welcome Image Card / Goodbye Messages
+    if (!groupCfg.welcome && !groupCfg.welcomeImg && !groupCfg.goodbye) return;
     if (cfg.mode === 'self') return;
+
+    let cachedGroupMeta: Awaited<ReturnType<typeof getCachedGroupMetadata>> | null = null;
+    if (update.action === 'add' && groupCfg.welcomeImg) {
+      cachedGroupMeta = await getCachedGroupMetadata(sock, groupId).catch(() => null);
+    }
 
     for (const participant of update.participants) {
       const pObj = typeof participant === 'string' ? { id: participant } : participant;
@@ -152,7 +380,63 @@ export async function handleGroupParticipantsUpdate(
       const num = jidUserPart(targetDm);
       const mentionUser = jidUserPart(rawJid) || num;
 
-      if (update.action === 'add' && groupCfg.welcome) {
+      if (update.action === 'add' && groupCfg.welcomeImg) {
+        try {
+          let avatarBuf: Buffer | null = null;
+          const ppCandidates = Array.from(new Set([rawJid, targetDm].filter(Boolean)));
+          for (const jidCandidate of ppCandidates) {
+            let ppUrl: string | undefined;
+            try {
+              ppUrl = await sock.profilePictureUrl(jidCandidate, 'image');
+            } catch {
+              ppUrl = await sock.profilePictureUrl(jidCandidate, 'preview').catch(() => undefined);
+            }
+            if (ppUrl) {
+              try {
+                const res = await fetch(ppUrl, { signal: AbortSignal.timeout(8000) });
+                if (res.ok) {
+                  avatarBuf = Buffer.from(await res.arrayBuffer());
+                  if (avatarBuf.length > 0) break;
+                }
+              } catch {
+                avatarBuf = null;
+              }
+            }
+          }
+
+          const notifyName = (pObj as { notify?: string }).notify;
+          const memberName =
+            notifyName ||
+            lookupKnownUserName(rawJid) ||
+            lookupKnownUserName(targetDm) ||
+            (num ? `+${num}` : 'New Member');
+          const groupName = cachedGroupMeta?.subject || 'WhatsApp Group';
+          const memberCount = cachedGroupMeta?.participants?.length || 1;
+
+          const cardBuffer = await generateWelcomeImageCard({
+            memberName,
+            memberNumber: num || mentionUser,
+            groupName,
+            memberCount,
+            avatarBuffer: avatarBuf,
+            botName: cfg.botName || 'FADI KING MD',
+          });
+
+          await sock
+            .sendMessage(groupId, {
+              image: cardBuffer,
+              caption: `🎉 *Welcome @${mentionUser || num} to ${groupName}!*\n• Member #${memberCount}`,
+              mentions: [rawJid],
+            })
+            .catch(() => {});
+          continue;
+        } catch (cardErr) {
+          logger.warn('welcomeImg', `Card generation failed in ${groupId}: ${(cardErr as Error).message}`);
+          // Fallback gracefully to text welcome if card failed
+        }
+      }
+
+      if (update.action === 'add' && (groupCfg.welcome || groupCfg.welcomeImg)) {
         await sock
           .sendMessage(groupId, {
             text: `*_${mentionUser ? `@${mentionUser}` : 'Welcome'} joined the group, welcome!_* 🎉`,

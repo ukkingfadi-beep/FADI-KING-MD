@@ -10,6 +10,7 @@ import {
   extractBodyText,
   extractRawTargetCandidates,
   findParticipant,
+  getBotJids,
   getCachedGroupMetadata,
   isLidUser,
   isParticipantAdmin,
@@ -773,6 +774,144 @@ export const ownerCommands: BotCommand[] = [
         await ctx.reply(msg);
         return msg;
       }
+    },
+  },
+  {
+    name: 'ban',
+    aliases: ['banuser', 'botban'],
+    category: 'owner',
+    description: 'User ko bot commands use karne se permanently database mein ban kare (optional reason ke sath)',
+    usage: 'ban <@user|number|reply> [reason] | .ban list',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      if (ctx.args[0]?.toLowerCase() === 'list') {
+        const banned = vipStore.listBannedUsers();
+        if (banned.length === 0) {
+          const msg = `🚫 *Banned Bot Users (0)*\nNo users are currently banned from bot commands.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const lines = [
+          `🚫 *Banned Bot Users (${banned.length})*`,
+          ...banned.slice(0, 60).map(
+            (b, i) =>
+              `${i + 1}. +${b.number}${b.reason ? ` — _${b.reason}_` : ''} (${b.bannedAt.slice(0, 10)})`
+          ),
+        ];
+        const msg = lines.join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const explicitCandidates = extractRawTargetCandidates(ctx.msg, ctx.args);
+      let target: { primaryJid: string; candidates: string[]; displayPhone: string } | null = null;
+      if (explicitCandidates.length > 0 || !ctx.isGroup) {
+        target = await resolveDmOrMentionTarget(ctx);
+      }
+
+      if (!target || (!target.displayPhone && !target.primaryJid)) {
+        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}ban @user Spamming commands\` or \`${ctx.prefix}ban list\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const cfg = loadConfig();
+      const ownerClean = normalizePhone(cfg.ownerNumber);
+      const targetNum = target.displayPhone || normalizePhone(jidUserPart(target.primaryJid));
+      const botParts = ctx.sock
+        ? (await getBotJids(ctx.sock)).map((j) => normalizePhone(jidUserPart(j)))
+        : [];
+
+      if (
+        (ownerClean && targetNum === ownerClean) ||
+        vipStore.isOwner(targetNum) ||
+        (targetNum && botParts.includes(targetNum))
+      ) {
+        const msg = 'Cannot ban the Bot Owner or the Bot itself.';
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      // Extract optional reason after removing leading @mention or phone number token
+      let reasonTokens = [...ctx.args];
+      if (reasonTokens[0] && (reasonTokens[0].startsWith('@') || /^\+?\d{7,15}$/.test(reasonTokens[0]))) {
+        reasonTokens = reasonTokens.slice(1);
+      }
+      const reason = reasonTokens.join(' ').trim();
+
+      const entry = vipStore.banUser({
+        number: targetNum || jidUserPart(target.primaryJid),
+        jid: target.primaryJid,
+        reason: reason || undefined,
+        bannedBy: ctx.senderNumber,
+      });
+
+      logger.security(
+        'owner',
+        `Banned +${entry.number} from bot commands${entry.reason ? ` (${entry.reason})` : ''}`
+      );
+
+      const text = [
+        `🚫 *User Banned from Bot*`,
+        `• User: +${entry.number}`,
+        ...(entry.reason ? [`• Reason: ${entry.reason}`] : []),
+        `• Persisted in database — they can no longer trigger bot commands.`,
+      ].join('\n');
+
+      if (ctx.sock && !ctx.isSimulated && target.primaryJid && ctx.isGroup) {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          { text, mentions: [target.primaryJid] },
+          { quoted: ctx.msg ?? undefined }
+        );
+      } else {
+        await ctx.reply(text);
+      }
+      return text;
+    },
+  },
+  {
+    name: 'unban',
+    aliases: ['unbanuser', 'botunban'],
+    category: 'owner',
+    description: 'Banned user ko database ban list se remove kare taake woh dubara bot use kar sake',
+    usage: 'unban <@user|number|reply>',
+    ownerOnly: true,
+    execute: async (ctx) => {
+      const explicitCandidates = extractRawTargetCandidates(ctx.msg, ctx.args);
+      const target =
+        explicitCandidates.length > 0 || !ctx.isGroup ? await resolveDmOrMentionTarget(ctx) : null;
+
+      if (!target) {
+        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}unban @user\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const candidates = Array.from(
+        new Set([target.displayPhone, target.primaryJid, ...target.candidates].filter(Boolean))
+      );
+      const removed = vipStore.unbanUser(candidates);
+      const label = removed?.number || target.displayPhone || jidUserPart(target.primaryJid);
+
+      const text = removed
+        ? `✅ *User Unbanned:* +${label} has been removed from the bot ban list and can use commands again.`
+        : `ℹ️ +${label} is not currently on the bot ban list.`;
+
+      if (removed) {
+        logger.info('owner', `Unbanned +${removed.number} from bot commands`);
+      }
+
+      if (ctx.sock && !ctx.isSimulated && target.primaryJid && ctx.isGroup) {
+        await ctx.sock.sendMessage(
+          ctx.chatId,
+          { text, mentions: [target.primaryJid] },
+          { quoted: ctx.msg ?? undefined }
+        );
+      } else {
+        await ctx.reply(text);
+      }
+      return text;
     },
   },
 ];

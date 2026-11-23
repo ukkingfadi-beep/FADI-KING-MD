@@ -1263,10 +1263,12 @@ export const groupCommands: BotCommand[] = [
         `• JID: \`${meta.id}\``,
         `• Members: ${meta.participants.length} (${admins.length} Admins)`,
         `• Antilink: ${antilinkLabel}`,
-        `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'}`,
-        `• Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'}`,
-        `• Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
-        `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
+        `• Anti-Admin: ${cfg.antiAdmin ? 'ON' : 'OFF'} | Anti-KickAll: ${cfg.antiKickAll ? 'ON' : 'OFF'}`,
+        `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'} | Anti-Add: ${cfg.antiAdd ? 'ON' : 'OFF'}`,
+        `• Anti-Forward: ${cfg.antiForward ? 'ON' : 'OFF'} | Anti-Media: ${cfg.antiMedia ? 'ON' : 'OFF'}`,
+        `• Anti-Sticker: ${cfg.antiSticker ? 'ON' : 'OFF'} | Anti-Bot: ${cfg.antiBot ? 'ON' : 'OFF'}`,
+        `• Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'} | Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
+        `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Welcome Card: ${cfg.welcomeImg ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
         ...(meta.desc ? ['', `*Description:*\n${meta.desc.slice(0, 300)}`] : []),
       ].join('\n');
       await ctx.reply(msg);
@@ -2134,6 +2136,94 @@ export const groupCommands: BotCommand[] = [
       return `Created poll "${question}" with ${uniqueOptions.length} options.`;
     },
   },
+  {
+    name: 'welcomeimg',
+    aliases: ['welcomeimage', 'wimg', 'imgwelcome', 'welcomecard'],
+    category: 'group',
+    description: 'New member join hone par profile photo aur group naam ke sath stylized Welcome Image Card on/off kare',
+    usage: 'welcomeimg <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'welcomeImg',
+        'Welcome Image Card',
+        'New members will receive a stylized welcome image card with their name, number, and profile photo.',
+        { requireBotAdminWhenOn: false }
+      ),
+  },
+  {
+    name: 'antiadmin',
+    aliases: ['nopromote', 'antipromote'],
+    category: 'group',
+    description: 'Group Creator ya Bot Owner ke ilawa kisi bhi unauthorized admin promotion ko auto-demote kare',
+    usage: 'antiadmin <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiAdmin',
+        'Anti-Admin Guard',
+        'Only the Group Creator or Bot Owner can promote admins; unauthorized promotions will be automatically demoted.',
+        { requireBotAdminWhenOn: true }
+      ),
+  },
+  {
+    name: 'antikickall',
+    aliases: ['nokickall', 'antimasskick'],
+    category: 'group',
+    description: 'Rapid/bulk member removals (kickall attempt) karne wale admin ko turant demote kare (bina members re-add kiye)',
+    usage: 'antikickall <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiKickAll',
+        'Anti-KickAll Shield',
+        'Any admin (except Group Creator/Bot Owner) performing rapid or bulk kicks will be immediately demoted.',
+        { requireBotAdminWhenOn: true }
+      ),
+  },
+  {
+    name: 'resetgroup',
+    aliases: ['groupreset', 'resetgc', 'gcreset'],
+    category: 'group',
+    description: 'Current group ke tamam bot toggles aur settings default state par reset kare',
+    usage: 'resetgroup',
+    groupOnly: true,
+    cooldownSeconds: 4,
+    execute: async (ctx) => {
+      if (!ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          const errText = check.reason || 'Only Group Admins or Bot Owner can reset group settings.';
+          await ctx.reply(errText);
+          return errText;
+        }
+      } else if (!ctx.isOwner) {
+        const errText = 'Only Group Admins or Bot Owner can reset group settings.';
+        await ctx.reply(errText);
+        return errText;
+      }
+
+      const reset = vipStore.resetGroupConfig(ctx.chatId);
+      const msg = [
+        `🔄 *Group Settings Reset to Default*`,
+        `• Group: \`${ctx.chatId}\``,
+        `• AI Chat: *OFF* | Welcome / Card / Goodbye: *OFF*`,
+        `• Antilink / Antidelete / Slow Mode: *OFF*`,
+        `• Anti-Add / Anti-Forward / Anti-Media / Anti-Sticker: *OFF*`,
+        `• Anti-Bot / Anti-Admin / Anti-KickAll: *OFF*`,
+        `• Anti-Scam: *${reset.antiScam ? 'ON (Global Default)' : 'OFF'}* | Anti-Mention: *${reset.antiStatusMention ? 'ON (Global Default)' : 'OFF'}*`,
+        `• Warnings & Mutes: *Cleared*`,
+      ].join('\n');
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
 ];
 
 async function bulkHandlePendingRequests(
@@ -2190,19 +2280,33 @@ async function bulkHandlePendingRequests(
 
 async function togglePerGroupProtection(
   ctx: CommandContext,
-  field: 'antiAdd' | 'antiForward' | 'antiMedia' | 'antiSticker' | 'antiBot',
+  field:
+    | 'antiAdd'
+    | 'antiForward'
+    | 'antiMedia'
+    | 'antiSticker'
+    | 'antiBot'
+    | 'antiAdmin'
+    | 'antiKickAll'
+    | 'welcomeImg',
   label: string,
-  activeSummary: string
+  activeSummary: string,
+  options: { requireBotAdminWhenOn?: boolean } = {}
 ): Promise<string> {
-  const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+  const arg = ctx.args[0]?.toLowerCase();
+  const current = Boolean(vipStore.getGroupConfig(ctx.chatId)[field]);
+
+  const check = ctx.isSimulated
+    ? { ok: true, botIsAdmin: true, participants: [] as GroupParticipant[] }
+    : await verifyGroupAdmins(ctx, {
+        requireBotAdmin: Boolean(options.requireBotAdminWhenOn && arg === 'on'),
+      });
   if (!check.ok) {
     const errText = check.reason || 'Group Admin privileges required.';
     await ctx.reply(errText);
     return errText;
   }
 
-  const arg = ctx.args[0]?.toLowerCase();
-  const current = Boolean(vipStore.getGroupConfig(ctx.chatId)[field]);
   if (arg !== 'on' && arg !== 'off') {
     const msg = `${label} is currently *${current ? 'ON' : 'OFF'}* in this group.\nUsage: \`${ctx.prefix}${ctx.commandName} on\` or \`${ctx.prefix}${ctx.commandName} off\``;
     await ctx.reply(msg);
@@ -2213,7 +2317,13 @@ async function togglePerGroupProtection(
   vipStore.updateGroupConfig(ctx.chatId, { [field]: enabled });
 
   let adminHint = '';
-  if (enabled && ctx.sock && !ctx.isSimulated) {
+  if (
+    enabled &&
+    !options.requireBotAdminWhenOn &&
+    field !== 'welcomeImg' &&
+    ctx.sock &&
+    !ctx.isSimulated
+  ) {
     const botJids = await getBotJids(ctx.sock);
     const botParticipant = findParticipant(check.participants, botJids);
     if (!isParticipantAdmin(botParticipant)) {
@@ -2221,8 +2331,9 @@ async function togglePerGroupProtection(
     }
   }
 
+  const icon = field === 'welcomeImg' ? '🖼️' : '🛡️';
   const msg = enabled
-    ? `🛡️ *${label} turned ON* for this group.\n${activeSummary}${adminHint}`
+    ? `${icon} *${label} turned ON* for this group.\n${activeSummary}${adminHint}`
     : `⚪ *${label} turned OFF* for this group.`;
   await ctx.reply(msg);
   return msg;
