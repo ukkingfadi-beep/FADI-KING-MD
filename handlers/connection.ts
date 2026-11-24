@@ -627,6 +627,14 @@ function processSocketMessageUpdates(
   }
 }
 
+export function getPreferredActiveSocket(): WASocket | null {
+  if (mainSock && botState.status === 'connected') return mainSock;
+  for (const entry of vipSubSockets.values()) {
+    if (entry.info.status === 'connected') return entry.sock;
+  }
+  return mainSock;
+}
+
 export function getBotSnapshot() {
   const cfg = loadConfig();
   if (!persistedCacheLoaded) {

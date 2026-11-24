@@ -234,3 +234,49 @@ export interface SourceFileEntry {
   path: string;
   content: string;
 }
+
+export type ReportActionType = 'ban' | 'unban';
+
+export interface ReportTemplate {
+  id: string;
+  type: ReportActionType;
+  title: string;
+  body: string;
+  enabled: boolean;
+  createdAt: string;
+}
+
+export interface ReportSettingsView {
+  banRepeatCount: number;
+  unbanRepeatCount: number;
+  blockOnBan: boolean;
+  unblockOnUnban: boolean;
+  sendSpamStanzaOnBan: boolean;
+  echoReportsInChat: boolean;
+  smtpEnabled: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string;
+  hasSmtpPass: boolean;
+  supportRecipients: string;
+}
+
+export interface ReportExecutionLog {
+  id: string;
+  type: ReportActionType;
+  targetNumber: string;
+  targetJid: string;
+  triggeredBy: string;
+  templateCount: number;
+  totalReportsFired: number;
+  spamStanzasAccepted: number;
+  spamStanzasAttempted: number;
+  emailsSent: number;
+  emailsAttempted: number;
+  emailError?: string;
+  blockActionStatus: string;
+  appliedReports: Array<{ title: string; body: string }>;
+  summary: string;
+  timestamp: string;
+}

@@ -10,6 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import { AdminLogsPanel } from './components/AdminLogsPanel';
+import { BanUnbanReports } from './components/BanUnbanReports';
 import { BotControls } from './components/BotControls';
 import { CommandCenter } from './components/CommandCenter';
 import { LiveScreenAdmin } from './components/LiveScreenAdmin';
@@ -26,12 +27,13 @@ import type {
   VipUser,
 } from './types/bot';
 
-type AdminTabId = 'live' | 'vip' | 'commands' | 'controls' | 'logs' | 'source';
+type AdminTabId = 'live' | 'vip' | 'commands' | 'reports' | 'controls' | 'logs' | 'source';
 
 const ADMIN_NAV_ITEMS: Array<{ id: AdminTabId; label: string }> = [
   { id: 'live', label: 'Live & Alerts' },
   { id: 'vip', label: 'VIP Access' },
   { id: 'commands', label: 'Commands' },
+  { id: 'reports', label: 'Ban / Unban Reports' },
   { id: 'controls', label: 'Control' },
   { id: 'logs', label: 'Logs & Health' },
   { id: 'source', label: 'Source' },
@@ -444,6 +446,13 @@ export default function App() {
             {adminTab === 'commands' && (
               <CommandCenter
                 commands={commands}
+                prefix={adminStatus?.config.prefix || '.'}
+                adminToken={adminToken}
+                onRefresh={refreshAll}
+              />
+            )}
+            {adminTab === 'reports' && (
+              <BanUnbanReports
                 prefix={adminStatus?.config.prefix || '.'}
                 adminToken={adminToken}
                 onRefresh={refreshAll}

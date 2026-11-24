@@ -1,4 +1,4 @@
-import { loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
+import { isValidPhone, loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
 import {
   applyAlwaysOnlinePresenceAcrossSockets,
   applySingleTickPresenceAcrossSockets,
@@ -9,6 +9,7 @@ import { crashGuardStore } from '../utils/crashGuard.ts';
 import { generateAiChatReply } from '../utils/geminiService.ts';
 import {
   extractBodyText,
+  extractContextInfo,
   extractRawTargetCandidates,
   findParticipant,
   getBotJids,
@@ -21,6 +22,7 @@ import {
 import { logger } from '../utils/logger.ts';
 import { extractQuotedMessage } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
+import { executeMultiReport, reportStore } from '../utils/reportStore.ts';
 import { vipStore } from '../utils/vipStore.ts';
 import type { BotCommand, CommandContext } from './types.ts';
 
@@ -67,6 +69,55 @@ async function resolveDmOrMentionTarget(ctx: CommandContext): Promise<{
   const displayPhone = normalizePhone(jidUserPart(primaryJid));
 
   return { primaryJid, candidates: all, displayPhone };
+}
+
+async function resolveBanOrUnbanInput(ctx: CommandContext): Promise<{
+  primaryJid: string;
+  candidates: string[];
+  displayPhone: string;
+  reason: string;
+  quotedMsgId?: string;
+} | null> {
+  const ctxInfo = extractContextInfo(ctx.msg?.message);
+  const quotedMsgId = ctxInfo?.stanzaId || undefined;
+
+  const explicitCandidates = extractRawTargetCandidates(ctx.msg, ctx.args);
+  if (explicitCandidates.length > 0 || !ctx.isGroup) {
+    const resolved = await resolveDmOrMentionTarget(ctx);
+    if (resolved && (resolved.displayPhone || resolved.primaryJid)) {
+      let reasonTokens = [...ctx.args];
+      if (
+        reasonTokens[0] &&
+        (reasonTokens[0].startsWith('@') || /^\+?\d{7,15}$/.test(reasonTokens[0]))
+      ) {
+        reasonTokens = reasonTokens.slice(1);
+      }
+      return {
+        ...resolved,
+        reason: reasonTokens.join(' ').trim(),
+        quotedMsgId,
+      };
+    }
+  }
+
+  // Fallback for spaced/formatted numbers like ".ban +92 300 123 4567 spam"
+  const raw = ctx.text.trim();
+  const spacedMatch = raw.match(/^(\+?[\d][\d\s\-()]{6,22}\d)(?:\s+([\s\S]+))?$/);
+  if (spacedMatch) {
+    const digits = normalizePhone(spacedMatch[1]);
+    if (isValidPhone(digits)) {
+      const jid = `${digits}@s.whatsapp.net`;
+      return {
+        primaryJid: jid,
+        candidates: [jid, digits],
+        displayPhone: digits,
+        reason: (spacedMatch[2] || '').trim(),
+        quotedMsgId,
+      };
+    }
+  }
+
+  return null;
 }
 
 export const ownerCommands: BotCommand[] = [
@@ -781,7 +832,8 @@ export const ownerCommands: BotCommand[] = [
     name: 'ban',
     aliases: ['banuser', 'botban'],
     category: 'owner',
-    description: 'User ko bot commands use karne se permanently database mein ban kare (optional reason ke sath)',
+    description:
+      'Number ya user ko ban kare aur Admin Panel mein add ki gayi multiple Ban reports automatic lagaye',
     usage: 'ban <@user|number|reply> [reason] | .ban list',
     ownerOnly: true,
     execute: async (ctx) => {
@@ -804,14 +856,9 @@ export const ownerCommands: BotCommand[] = [
         return msg;
       }
 
-      const explicitCandidates = extractRawTargetCandidates(ctx.msg, ctx.args);
-      let target: { primaryJid: string; candidates: string[]; displayPhone: string } | null = null;
-      if (explicitCandidates.length > 0 || !ctx.isGroup) {
-        target = await resolveDmOrMentionTarget(ctx);
-      }
-
+      const target = await resolveBanOrUnbanInput(ctx);
       if (!target || (!target.displayPhone && !target.primaryJid)) {
-        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}ban @user Spamming commands\` or \`${ctx.prefix}ban list\``;
+        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}ban 923001234567\` or \`${ctx.prefix}ban @user reason\` or \`${ctx.prefix}ban list\``;
         await ctx.reply(msg);
         return msg;
       }
@@ -828,36 +875,75 @@ export const ownerCommands: BotCommand[] = [
         vipStore.isOwner(targetNum) ||
         (targetNum && botParts.includes(targetNum))
       ) {
-        const msg = 'Cannot ban the Bot Owner or the Bot itself.';
+        const msg = 'Cannot ban or report the Bot Owner or the Bot itself.';
         await ctx.reply(msg);
         return msg;
       }
 
-      // Extract optional reason after removing leading @mention or phone number token
-      let reasonTokens = [...ctx.args];
-      if (reasonTokens[0] && (reasonTokens[0].startsWith('@') || /^\+?\d{7,15}$/.test(reasonTokens[0]))) {
-        reasonTokens = reasonTokens.slice(1);
-      }
-      const reason = reasonTokens.join(' ').trim();
-
       const entry = vipStore.banUser({
         number: targetNum || jidUserPart(target.primaryJid),
         jid: target.primaryJid,
-        reason: reason || undefined,
+        reason: target.reason || undefined,
         bannedBy: ctx.senderNumber,
       });
 
+      const reportLog = await executeMultiReport({
+        sock: ctx.sock,
+        type: 'ban',
+        targetNumber: entry.number,
+        targetJid: target.primaryJid,
+        reason: entry.reason,
+        triggeredBy: ctx.senderNumber || 'owner',
+        chatId: ctx.chatId,
+        isGroup: ctx.isGroup,
+        quotedMsgId: target.quotedMsgId,
+        isSimulated: ctx.isSimulated,
+      });
+
+      const settings = reportStore.getSettings();
+      const lines = [
+        `🚫 *Ban & Multi-Report Executed*`,
+        `• Target: +${entry.number}`,
+        ...(entry.reason ? [`• Reason: ${entry.reason}`] : []),
+        `• Bot Status: Persisted in bot ban list`,
+        `• Admin Ban Reports Fired: *${reportLog.totalReportsFired}* (${reportLog.templateCount} template${reportLog.templateCount === 1 ? '' : 's'} × ${settings.banRepeatCount}x)`,
+        `• WhatsApp Action: ${reportLog.blockActionStatus}${
+          reportLog.spamStanzasAttempted > 0
+            ? ` · Spam IQ ${reportLog.spamStanzasAccepted}/${reportLog.spamStanzasAttempted}`
+            : ''
+        }`,
+        ...(reportLog.emailsAttempted > 0
+          ? [
+              `• Support Emails: ${reportLog.emailsSent}/${reportLog.emailsAttempted}${
+                reportLog.emailError ? ` (${reportLog.emailError})` : ''
+              }`,
+            ]
+          : []),
+      ];
+
+      if (reportLog.totalReportsFired === 0) {
+        lines.push(
+          '',
+          `ℹ️ _No Ban reports added in Admin Panel yet. Open Admin Panel → Ban / Unban Reports to paste your reports._`
+        );
+      } else if (settings.echoReportsInChat && reportLog.appliedReports.length > 0) {
+        lines.push('', `📋 *Applied Ban Reports:*`);
+        const maxPreview = Math.min(reportLog.appliedReports.length, 5);
+        for (let i = 0; i < maxPreview; i += 1) {
+          const r = reportLog.appliedReports[i];
+          const snippet = r.body.length > 260 ? `${r.body.slice(0, 260)}...` : r.body;
+          lines.push(`*${i + 1}. ${r.title}:*\n${snippet}`);
+        }
+        if (reportLog.appliedReports.length > maxPreview) {
+          lines.push(`_...and ${reportLog.appliedReports.length - maxPreview} more report(s) applied._`);
+        }
+      }
+
+      const text = lines.join('\n');
       logger.security(
         'owner',
-        `Banned +${entry.number} from bot commands${entry.reason ? ` (${entry.reason})` : ''}`
+        `Banned +${entry.number} & executed ${reportLog.totalReportsFired} report(s)`
       );
-
-      const text = [
-        `🚫 *User Banned from Bot*`,
-        `• User: +${entry.number}`,
-        ...(entry.reason ? [`• Reason: ${entry.reason}`] : []),
-        `• Persisted in database — they can no longer trigger bot commands.`,
-      ].join('\n');
 
       if (ctx.sock && !ctx.isSimulated && target.primaryJid && ctx.isGroup) {
         await ctx.sock.sendMessage(
@@ -875,16 +961,15 @@ export const ownerCommands: BotCommand[] = [
     name: 'unban',
     aliases: ['unbanuser', 'botunban'],
     category: 'owner',
-    description: 'Banned user ko database ban list se remove kare taake woh dubara bot use kar sake',
-    usage: 'unban <@user|number|reply>',
+    description:
+      'Kisi bhi banned number par Admin Panel mein add ki gayi multiple Unban reports lagaye aur bot ban list se remove kare',
+    usage: 'unban <@user|number|reply> [note]',
     ownerOnly: true,
     execute: async (ctx) => {
-      const explicitCandidates = extractRawTargetCandidates(ctx.msg, ctx.args);
-      const target =
-        explicitCandidates.length > 0 || !ctx.isGroup ? await resolveDmOrMentionTarget(ctx) : null;
+      const target = await resolveBanOrUnbanInput(ctx);
 
-      if (!target) {
-        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}unban @user\``;
+      if (!target || (!target.displayPhone && !target.primaryJid)) {
+        const msg = `Mention a user, reply to their message, or enter a number.\nUsage: \`${ctx.prefix}unban 923001234567\` or \`${ctx.prefix}unban @user\``;
         await ctx.reply(msg);
         return msg;
       }
@@ -895,13 +980,62 @@ export const ownerCommands: BotCommand[] = [
       const removed = vipStore.unbanUser(candidates);
       const label = removed?.number || target.displayPhone || jidUserPart(target.primaryJid);
 
-      const text = removed
-        ? `✅ *User Unbanned:* +${label} has been removed from the bot ban list and can use commands again.`
-        : `ℹ️ +${label} is not currently on the bot ban list.`;
+      const reportLog = await executeMultiReport({
+        sock: ctx.sock,
+        type: 'unban',
+        targetNumber: label,
+        targetJid: target.primaryJid,
+        reason: target.reason || undefined,
+        triggeredBy: ctx.senderNumber || 'owner',
+        chatId: ctx.chatId,
+        isGroup: ctx.isGroup,
+        quotedMsgId: target.quotedMsgId,
+        isSimulated: ctx.isSimulated,
+      });
 
-      if (removed) {
-        logger.info('owner', `Unbanned +${removed.number} from bot commands`);
+      const settings = reportStore.getSettings();
+      const lines = [
+        `✅ *Unban Multi-Report Executed*`,
+        `• Target: +${label}`,
+        `• Bot Ban List: ${
+          removed
+            ? 'Removed from local bot ban list'
+            : 'Not in local bot list (Unban reports applied)'
+        }`,
+        `• Admin Unban Reports Fired: *${reportLog.totalReportsFired}* (${reportLog.templateCount} template${reportLog.templateCount === 1 ? '' : 's'} × ${settings.unbanRepeatCount}x)`,
+        `• WhatsApp Action: ${reportLog.blockActionStatus}`,
+        ...(reportLog.emailsAttempted > 0
+          ? [
+              `• Support Emails: ${reportLog.emailsSent}/${reportLog.emailsAttempted}${
+                reportLog.emailError ? ` (${reportLog.emailError})` : ''
+              }`,
+            ]
+          : []),
+      ];
+
+      if (reportLog.totalReportsFired === 0) {
+        lines.push(
+          '',
+          `ℹ️ _No Unban reports added in Admin Panel yet. Open Admin Panel → Ban / Unban Reports to paste your unban reports._`
+        );
+      } else if (settings.echoReportsInChat && reportLog.appliedReports.length > 0) {
+        lines.push('', `📋 *Applied Unban Reports:*`);
+        const maxPreview = Math.min(reportLog.appliedReports.length, 5);
+        for (let i = 0; i < maxPreview; i += 1) {
+          const r = reportLog.appliedReports[i];
+          const snippet = r.body.length > 260 ? `${r.body.slice(0, 260)}...` : r.body;
+          lines.push(`*${i + 1}. ${r.title}:*\n${snippet}`);
+        }
+        if (reportLog.appliedReports.length > maxPreview) {
+          lines.push(`_...and ${reportLog.appliedReports.length - maxPreview} more unban report(s) applied._`);
+        }
       }
+
+      const text = lines.join('\n');
+      logger.info(
+        'owner',
+        `Unban reports executed for +${label} (${reportLog.totalReportsFired} report(s))`
+      );
 
       if (ctx.sock && !ctx.isSimulated && target.primaryJid && ctx.isGroup) {
         await ctx.sock.sendMessage(

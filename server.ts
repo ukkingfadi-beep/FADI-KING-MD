@@ -10,6 +10,7 @@ import {
   closeAllSocketsGracefully,
   disconnectMainBot,
   getBotSnapshot,
+  getPreferredActiveSocket,
   initializeSavedSessionOnBoot,
   requestVipSubPairingCode,
   resolveNewsletterMetadataFromActiveSockets,
@@ -33,6 +34,12 @@ import { crashGuardStore } from './utils/crashGuard.ts';
 import { initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
 import { pairingRateLimiter } from './utils/rateLimiter.ts';
+import {
+  executeMultiReport,
+  reportStore,
+  sendTestSmtpEmail,
+  type ReportActionType,
+} from './utils/reportStore.ts';
 import { vipStore, type VipTier } from './utils/vipStore.ts';
 
 // Global process crash protection so a single async error never kills the bot
@@ -67,6 +74,7 @@ const SOURCE_FILES = [
   'utils/liveStore.ts',
   'utils/anticallStore.ts',
   'utils/crashGuard.ts',
+  'utils/reportStore.ts',
   'utils/chatHistoryStore.ts',
   'utils/reminderStore.ts',
   'utils/geminiService.ts',
@@ -825,6 +833,138 @@ async function startServer(): Promise<void> {
       logger.info('anticall', `Removed ${raw} from Anti-Call guard via Admin Panel`);
     }
     return res.json({ ok: true, removed });
+  });
+
+  // Ban & Unban Multi-Report Templates, Settings & Execution History (Admin Only)
+  app.get('/api/reports', requireAdmin, (_req, res) => {
+    res.json({
+      ok: true,
+      templates: reportStore.listTemplates(),
+      settings: reportStore.getPublicSettings(),
+      logs: reportStore.listLogs(50),
+    });
+  });
+
+  app.post('/api/reports/templates', requireAdmin, (req, res) => {
+    const rawType = String(req.body?.type || '').toLowerCase();
+    const type: ReportActionType = rawType === 'unban' ? 'unban' : 'ban';
+    const rawBlock = typeof req.body?.rawBlock === 'string' ? req.body.rawBlock.trim() : '';
+
+    if (rawBlock) {
+      const created = reportStore.bulkAddTemplates({ type, rawBlock });
+      if (created.length === 0) {
+        return res.status(400).json({ ok: false, error: 'Paste at least one report text.' });
+      }
+      logger.info('reportEngine', `Added ${created.length} ${type} report template(s) via Admin Panel`);
+      return res.json({ ok: true, created });
+    }
+
+    const body = String(req.body?.body || '').trim();
+    if (!body) {
+      return res.status(400).json({ ok: false, error: 'Report text cannot be empty.' });
+    }
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
+    const entry = reportStore.addTemplate({ type, title, body });
+    logger.info('reportEngine', `Added ${type} report template "${entry.title}"`);
+    return res.json({ ok: true, template: entry });
+  });
+
+  app.patch('/api/reports/templates/:id', requireAdmin, (req, res) => {
+    const updated = reportStore.updateTemplate(req.params.id, {
+      title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+      body: typeof req.body?.body === 'string' ? req.body.body : undefined,
+      enabled: typeof req.body?.enabled === 'boolean' ? req.body.enabled : undefined,
+    });
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: 'Report template not found.' });
+    }
+    return res.json({ ok: true, template: updated });
+  });
+
+  app.delete('/api/reports/templates/type/:type', requireAdmin, (req, res) => {
+    const type: ReportActionType = req.params.type === 'unban' ? 'unban' : 'ban';
+    const removed = reportStore.clearTemplates(type);
+    return res.json({ ok: true, removed });
+  });
+
+  app.delete('/api/reports/templates/:id', requireAdmin, (req, res) => {
+    const deleted = reportStore.deleteTemplate(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({ ok: false, error: 'Report template not found.' });
+    }
+    return res.json({ ok: true });
+  });
+
+  app.patch('/api/reports/settings', requireAdmin, (req, res) => {
+    const b = req.body || {};
+    reportStore.updateSettings({
+      banRepeatCount: typeof b.banRepeatCount === 'number' ? b.banRepeatCount : undefined,
+      unbanRepeatCount: typeof b.unbanRepeatCount === 'number' ? b.unbanRepeatCount : undefined,
+      blockOnBan: typeof b.blockOnBan === 'boolean' ? b.blockOnBan : undefined,
+      unblockOnUnban: typeof b.unblockOnUnban === 'boolean' ? b.unblockOnUnban : undefined,
+      sendSpamStanzaOnBan:
+        typeof b.sendSpamStanzaOnBan === 'boolean' ? b.sendSpamStanzaOnBan : undefined,
+      echoReportsInChat:
+        typeof b.echoReportsInChat === 'boolean' ? b.echoReportsInChat : undefined,
+      smtpEnabled: typeof b.smtpEnabled === 'boolean' ? b.smtpEnabled : undefined,
+      smtpHost: typeof b.smtpHost === 'string' ? b.smtpHost : undefined,
+      smtpPort: typeof b.smtpPort === 'number' ? b.smtpPort : undefined,
+      smtpSecure: typeof b.smtpSecure === 'boolean' ? b.smtpSecure : undefined,
+      smtpUser: typeof b.smtpUser === 'string' ? b.smtpUser : undefined,
+      smtpPass: typeof b.smtpPass === 'string' ? b.smtpPass : undefined,
+      supportRecipients:
+        typeof b.supportRecipients === 'string' ? b.supportRecipients : undefined,
+    });
+    return res.json({ ok: true, settings: reportStore.getPublicSettings() });
+  });
+
+  app.post('/api/reports/test-smtp', requireAdmin, async (req, res) => {
+    const to = typeof req.body?.to === 'string' ? req.body.to.trim() : undefined;
+    const result = await sendTestSmtpEmail(to);
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/reports/run', requireAdmin, async (req, res) => {
+    const type: ReportActionType = req.body?.type === 'unban' ? 'unban' : 'ban';
+    const clean = normalizePhone(String(req.body?.number || ''));
+    if (!isValidPhone(clean)) {
+      return res.status(400).json({ ok: false, error: 'Enter a valid phone number (8-15 digits).' });
+    }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : undefined;
+    const targetJid = `${clean}@s.whatsapp.net`;
+
+    if (type === 'ban') {
+      const cfg = loadConfig();
+      if (clean === normalizePhone(cfg.ownerNumber) || vipStore.isOwner(clean)) {
+        return res.status(400).json({ ok: false, error: 'Cannot ban or report the Bot Owner.' });
+      }
+      vipStore.banUser({
+        number: clean,
+        jid: targetJid,
+        reason,
+        bannedBy: 'admin_panel',
+      });
+    } else {
+      vipStore.unbanUser([clean, targetJid]);
+    }
+
+    const activeSock = getPreferredActiveSocket();
+    const log = await executeMultiReport({
+      sock: activeSock,
+      type,
+      targetNumber: clean,
+      targetJid,
+      reason,
+      triggeredBy: 'admin_panel',
+      isSimulated: !activeSock,
+    });
+
+    return res.json({ ok: true, log });
+  });
+
+  app.delete('/api/reports/logs', requireAdmin, (_req, res) => {
+    reportStore.clearLogs();
+    return res.json({ ok: true });
   });
 
   app.post('/api/broadcast', requireAdmin, async (req, res) => {
