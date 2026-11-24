@@ -818,6 +818,54 @@ export async function dispatchOpenGcProtectedPost(
   return { sent, totalOpen: openGroups.length };
 }
 
+export async function dispatchOpenGcPayMessage(
+  sock: WASocket,
+  params: {
+    finalText: string;
+    linkUrl?: string;
+    currency?: string;
+    amount1000?: number;
+    requestFrom?: string;
+  }
+): Promise<{ sent: number; totalOpen: number }> {
+  const groupsMap = await sock.groupFetchAllParticipating();
+  const openGroups = Object.values(groupsMap).filter((g) => !g.announce && !g.isCommunityAnnounce);
+  if (openGroups.length === 0) {
+    return { sent: 0, totalOpen: 0 };
+  }
+
+  let sent = 0;
+  for (let i = 0; i < openGroups.length; i += 1) {
+    const gc = openGroups[i];
+    try {
+      const res = await sendEncryptedPayMessage(sock, {
+        chatId: gc.id,
+        finalText: params.finalText,
+        linkUrl: params.linkUrl,
+        currency: params.currency,
+        amount1000: params.amount1000,
+        requestFrom: params.requestFrom,
+      });
+      sent += 1;
+      if (res.keyId) {
+        vipStore.registerProtectedPost(res.keyId, gc.id, res.finalText, 0, {
+          currency: res.currency,
+          amount1000: res.amount1000,
+          finalText: res.finalText,
+          linkUrl: res.linkUrl,
+          requestFrom: res.requestFrom,
+        });
+      }
+    } catch (err) {
+      logger.warn('protectedPost', `Failed open-GC paymsg send to ${gc.id}: ${(err as Error).message}`);
+    }
+    if (i < openGroups.length - 1) {
+      await new Promise((r) => setTimeout(r, 350));
+    }
+  }
+  return { sent, totalOpen: openGroups.length };
+}
+
 export async function handleAntidelete(
   sock: WASocket,
   revokedMsg: WAMessage,

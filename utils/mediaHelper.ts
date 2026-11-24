@@ -19,13 +19,11 @@ import {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
-import { loadConfig } from '../config/bot.config.ts';
 import { resolveDataDir } from './db.ts';
 import {
   extractContextInfo,
   extractFirstUrl,
   hasValidMediaPayload,
-  jidUserPart,
   normalizeBareJid,
   unwrapMessage,
 } from './jidHelper.ts';
@@ -1319,6 +1317,56 @@ export function parsePayMessageInput(rawInput: string): ParsedPayMessageInput | 
   };
 }
 
+export function mergePayMessageInputs(
+  cmdText: string,
+  quotedText: string
+): ParsedPayMessageInput | null {
+  const cleanCmd = cmdText.trim();
+  const cleanQuoted = quotedText.trim();
+  if (!cleanCmd && !cleanQuoted) return null;
+  if (!cleanCmd) return parsePayMessageInput(cleanQuoted);
+  if (!cleanQuoted) return parsePayMessageInput(cleanCmd);
+
+  const parsedCmd = parsePayMessageInput(cleanCmd);
+  const parsedQuoted = parsePayMessageInput(cleanQuoted);
+  if (!parsedCmd) return parsedQuoted;
+  if (!parsedQuoted) return parsedCmd;
+
+  const linkUrl = parsedCmd.linkUrl || parsedQuoted.linkUrl;
+  const cmdIsOnlyUrl = Boolean(parsedCmd.linkUrl && parsedCmd.noteText === parsedCmd.linkUrl);
+  const quotedIsOnlyUrl = Boolean(parsedQuoted.linkUrl && parsedQuoted.noteText === parsedQuoted.linkUrl);
+
+  const textParts: string[] = [];
+  if (!cmdIsOnlyUrl && parsedCmd.noteText) {
+    textParts.push(parsedCmd.noteText);
+  }
+  if (!quotedIsOnlyUrl && parsedQuoted.noteText && !textParts.includes(parsedQuoted.noteText)) {
+    textParts.push(parsedQuoted.noteText);
+  }
+
+  let combinedText = textParts.join('\n').trim();
+  if (linkUrl) {
+    const rawMatched = extractFirstUrl(combinedText);
+    const hasLinkAlready =
+      Boolean(rawMatched) || combinedText.includes(linkUrl);
+    if (!combinedText) {
+      combinedText = linkUrl;
+    } else if (!hasLinkAlready) {
+      combinedText = `${combinedText}\n\n${linkUrl}`;
+    }
+  }
+
+  if (!combinedText) return null;
+
+  return {
+    currency: parsedCmd.currency,
+    amount1000: parsedCmd.amount1000,
+    noteText: textParts.join('\n').trim() || linkUrl || combinedText,
+    ...(linkUrl ? { linkUrl } : {}),
+    finalText: combinedText,
+  };
+}
+
 export async function sendEncryptedPayMessage(
   sock: WASocket,
   params: {
@@ -1337,7 +1385,6 @@ export async function sendEncryptedPayMessage(
   linkUrl?: string;
   requestFrom: string;
 }> {
-  const cfg = loadConfig();
   const rawSelfJid = sock.user?.id || sock.authState?.creds?.me?.id || '';
   const botUserJid = rawSelfJid ? jidNormalizedUser(rawSelfJid) : '';
   const candidateFrom = params.requestFrom ? normalizeBareJid(params.requestFrom) : '';
@@ -1345,7 +1392,7 @@ export async function sendEncryptedPayMessage(
     ? candidateFrom
     : botUserJid.endsWith('@s.whatsapp.net')
       ? botUserJid
-      : `${jidUserPart(botUserJid || candidateFrom || '0')}@s.whatsapp.net`;
+      : '0@s.whatsapp.net';
 
   const currency = (params.currency || 'USD').toUpperCase();
   const amount1000 = Math.max(1000, Math.round(params.amount1000 || 375_000));
@@ -1357,17 +1404,6 @@ export async function sendEncryptedPayMessage(
       ? {
           matchedText: params.linkUrl,
           canonicalUrl: params.linkUrl,
-          title: cfg.botName || 'FADI KING MD',
-          description: params.finalText.slice(0, 140),
-          contextInfo: {
-            externalAdReply: {
-              title: cfg.botName || 'FADI KING MD',
-              body: params.finalText.slice(0, 120),
-              mediaType: 1,
-              sourceUrl: params.linkUrl,
-              renderLargerThumbnail: false,
-            },
-          },
         }
       : {}),
   };
@@ -1399,6 +1435,7 @@ export async function sendEncryptedPayMessage(
 
   await sock.relayMessage(params.chatId, waMsg.message, {
     messageId: waMsg.key.id,
+    useCachedGroupMetadata: true,
   });
 
   return {

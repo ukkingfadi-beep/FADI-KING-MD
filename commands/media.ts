@@ -16,6 +16,7 @@ import {
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { dispatchOpenGcPayMessage } from '../handlers/group.ts';
 import {
   applyBassBoostEffect,
   clearSocketPlaceholderCacheEntry,
@@ -31,7 +32,7 @@ import {
   getUnavailableViewOnceRecord,
   inspectWebpStickerBuffer,
   isFfmpegAvailable,
-  parsePayMessageInput,
+  mergePayMessageInputs,
   sendEncryptedPayMessage,
   sendImmediateViewOncePdo,
   synthesizeTtsVoiceNote,
@@ -2075,20 +2076,26 @@ export const mediaCommands: BotCommand[] = [
     aliases: ['paylock', 'reqpay', 'encmsg', 'admindelblock'],
     category: 'media',
     description:
-      'Encrypted payment-request card bheje jo group admins delete na kar sakein (custom text, link aur optional amount ke sath)',
-    usage: 'paymsg [amount] <link | text> (e.g. .paymsg https://chat.whatsapp.com/... hello)',
+      'Encrypted payment-request card bheje jo group admins delete na kar sakein; apni IB mein likhne/reply karne par automatic sab Open GCs mein bhej deta hai',
+    usage: 'paymsg [amount] <link | text> (or reply to text/link in IB)',
     cooldownSeconds: 3,
     execute: async (ctx) => {
       const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
       const quotedText = quoted ? extractBodyText(quoted).trim() : '';
-      const rawInput = ctx.text.trim() || quotedText;
 
-      const parsed = parsePayMessageInput(rawInput);
+      const forceLocalHere =
+        !ctx.isGroup && ctx.args[0]?.toLowerCase() === 'here' && ctx.args.length > 1;
+      const effectiveCmdText = forceLocalHere
+        ? ctx.text.trim().replace(/^here\s+/i, '')
+        : ctx.text.trim();
+
+      const parsed = mergePayMessageInputs(effectiveCmdText, quotedText);
       if (!parsed) {
         const msg = [
-          `Provide text, a link, or both to send an encrypted admin-protected card.`,
+          `Provide text, a link, or reply to a text/link message with \`${ctx.prefix}paymsg\`.`,
+          `• In your *IB*, typing or replying \`${ctx.prefix}paymsg\` automatically dispatches the encrypted card to *ALL Open GCs*!`,
           `• Example 1: \`${ctx.prefix}paymsg https://chat.whatsapp.com/... hello\``,
-          `• Example 2: \`${ctx.prefix}paymsg hello everyone\``,
+          `• Example 2: Reply to any link/text in your IB with \`${ctx.prefix}paymsg\` (or \`${ctx.prefix}paymsg extra text\`)`,
           `• Example 3: \`${ctx.prefix}paymsg $500 | https://example.com | Custom note\``,
         ].join('\n');
         await ctx.reply(msg);
@@ -2103,6 +2110,16 @@ export const mediaCommands: BotCommand[] = [
       }
 
       try {
+        const cfg = loadConfig();
+        const botJids = await getBotJids(ctx.sock);
+        const botUserParts = new Set(botJids.map((j) => jidUserPart(j)).filter(Boolean));
+        const chatTargets = [ctx.chatId, ctx.msg?.key?.remoteJidAlt].filter(Boolean) as string[];
+        const isOwnBotInbox =
+          !ctx.isGroup &&
+          ctx.isOwner &&
+          (chatTargets.some((j) => botUserParts.has(jidUserPart(j))) ||
+            (!ctx.msg?.key?.fromMe && ctx.senderNumber === normalizePhone(cfg.ownerNumber)));
+
         const ownPn = normalizePhone(jidUserPart(ctx.sock.user?.id));
         const senderPn = isValidPhone(ctx.senderNumber) ? ctx.senderNumber : '';
         const requestFrom = senderPn
@@ -2110,6 +2127,24 @@ export const mediaCommands: BotCommand[] = [
           : ownPn
             ? `${ownPn}@s.whatsapp.net`
             : undefined;
+        const formattedAmount = `${parsed.currency} ${(parsed.amount1000 / 1000).toLocaleString('en-US')}`;
+
+        // When Owner runs .paymsg inside their own IB (on text, link, or reply), automatically send to ALL Open GCs!
+        if (isOwnBotInbox && !forceLocalHere) {
+          const result = await dispatchOpenGcPayMessage(ctx.sock, {
+            finalText: parsed.finalText,
+            linkUrl: parsed.linkUrl,
+            currency: parsed.currency,
+            amount1000: parsed.amount1000,
+            requestFrom,
+          });
+          const confirmMsg =
+            result.totalOpen === 0
+              ? 'No open WhatsApp groups found right now.'
+              : `✅ Encrypted *${formattedAmount}* PayMsg delivered to *${result.sent}/${result.totalOpen}* Open Group(s) with Admin-Delete Lock.`;
+          await ctx.reply(confirmMsg);
+          return confirmMsg;
+        }
 
         const sent = await sendEncryptedPayMessage(ctx.sock, {
           chatId: ctx.chatId,
@@ -2130,7 +2165,6 @@ export const mediaCommands: BotCommand[] = [
           });
         }
 
-        const formattedAmount = `${sent.currency} ${(sent.amount1000 / 1000).toLocaleString('en-US')}`;
         return `Sent encrypted ${formattedAmount} card${ctx.isGroup ? ' with admin-delete lock' : ''}.`;
       } catch (err) {
         const msg = `Encrypted pay message failed: ${(err as Error).message}`;
