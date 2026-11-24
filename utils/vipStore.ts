@@ -79,12 +79,21 @@ export interface BannedUserEntry {
   bannedAt: string;
 }
 
+export interface ProtectedPayMsgPayload {
+  currency: string;
+  amount1000: number;
+  finalText: string;
+  linkUrl?: string;
+  requestFrom?: string;
+}
+
 export interface ProtectedPostEntry {
   msgId: string;
   chatId: string;
   text: string;
   repostCount: number;
   createdAt: number;
+  paymsg?: ProtectedPayMsgPayload;
 }
 
 export interface BannedStickerEntry {
@@ -737,7 +746,13 @@ export const vipStore = {
     return pairingLogsCache.slice(0, limit);
   },
 
-  registerProtectedPost(msgId: string, chatId: string, text: string, repostCount = 0): void {
+  registerProtectedPost(
+    msgId: string,
+    chatId: string,
+    text: string,
+    repostCount = 0,
+    paymsg?: ProtectedPayMsgPayload
+  ): void {
     if (!msgId || !chatId || !text) return;
     if (!protectedPostsCache) {
       protectedPostsCache = dbGetSync<Record<string, ProtectedPostEntry>>('protected_posts') || {};
@@ -748,6 +763,7 @@ export const vipStore = {
       text,
       repostCount,
       createdAt: Date.now(),
+      ...(paymsg ? { paymsg } : {}),
     };
     const keys = Object.keys(protectedPostsCache);
     if (keys.length > 400) {

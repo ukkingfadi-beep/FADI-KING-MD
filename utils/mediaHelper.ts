@@ -7,7 +7,9 @@ import ffmpegStatic from 'ffmpeg-static';
 import {
   downloadContentFromMessage,
   downloadMediaMessage,
+  generateWAMessageFromContent,
   getContentType,
+  jidNormalizedUser,
   proto,
   type CacheStore,
   type MediaType,
@@ -17,10 +19,13 @@ import {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
+import { loadConfig } from '../config/bot.config.ts';
 import { resolveDataDir } from './db.ts';
 import {
   extractContextInfo,
+  extractFirstUrl,
   hasValidMediaPayload,
+  jidUserPart,
   normalizeBareJid,
   unwrapMessage,
 } from './jidHelper.ts';
@@ -1224,4 +1229,186 @@ ${assEvents.join('\n')}
     ]);
   }
 }
+
+export interface ParsedPayMessageInput {
+  currency: string;
+  amount1000: number;
+  noteText: string;
+  linkUrl?: string;
+  finalText: string;
+}
+
+export function parsePayMessageInput(rawInput: string): ParsedPayMessageInput | null {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return null;
+
+  let currency = 'USD';
+  let amountValue = 375;
+  let working = trimmed;
+
+  // Support pipe-separated parts: "<amount?> | <link?> | <text?>"
+  if (working.includes('|')) {
+    const segments = working
+      .split('|')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const remaining: string[] = [];
+    let amountParsed = false;
+    for (const seg of segments) {
+      if (!amountParsed) {
+        const amtMatch = seg.match(/^(?:([A-Za-z]{2,4})\s*\$?|\$)\s*(\d+(?:\.\d{1,2})?)(?:\s*([A-Za-z]{3}))?$/);
+        if (amtMatch) {
+          const curRaw = (amtMatch[1] || amtMatch[3] || 'USD').toUpperCase();
+          currency = curRaw === 'US' ? 'USD' : curRaw.length === 3 ? curRaw : 'USD';
+          const num = Number(amtMatch[2]);
+          if (Number.isFinite(num) && num > 0 && num <= 1_000_000) {
+            amountValue = num;
+            amountParsed = true;
+            continue;
+          }
+        }
+      }
+      remaining.push(seg);
+    }
+    working = remaining.join(' ').trim();
+  } else {
+    // Support optional leading "$375 ..." or "PKR 500 ..." or "USD:375 ..."
+    const leadMatch = working.match(
+      /^(?:([A-Za-z]{2,4})[:\s]*\$?|\$\s*)(\d+(?:\.\d{1,2})?)\s+([\s\S]+)$/
+    );
+    if (leadMatch) {
+      const curRaw = (leadMatch[1] || 'USD').toUpperCase();
+      const validCurrencies = new Set(['USD', 'PKR', 'INR', 'EUR', 'GBP', 'AED', 'SAR', 'CAD', 'AUD', 'US']);
+      if (!leadMatch[1] || validCurrencies.has(curRaw)) {
+        const num = Number(leadMatch[2]);
+        if (Number.isFinite(num) && num > 0 && num <= 1_000_000) {
+          currency = curRaw === 'US' ? 'USD' : curRaw.length === 3 ? curRaw : 'USD';
+          amountValue = num;
+          working = leadMatch[3].trim();
+        }
+      }
+    }
+  }
+
+  const foundUrl = extractFirstUrl(working) || undefined;
+  let linkUrl = foundUrl;
+  if (linkUrl && !/^https?:\/\//i.test(linkUrl)) {
+    linkUrl = `https://${linkUrl}`;
+  }
+
+  let noteText = working;
+  if (foundUrl && working.startsWith(foundUrl)) {
+    // Handles ".paymsg https://chat.whatsapp.com/... hello"
+    noteText = working.slice(foundUrl.length).trim();
+  }
+
+  const finalText = noteText
+    ? linkUrl && !noteText.includes(foundUrl || '') && !noteText.includes(linkUrl)
+      ? `${noteText}\n\n${linkUrl}`
+      : noteText
+    : linkUrl || '';
+
+  if (!finalText) return null;
+
+  return {
+    currency,
+    amount1000: Math.round(amountValue * 1000),
+    noteText: noteText || linkUrl || '',
+    ...(linkUrl ? { linkUrl } : {}),
+    finalText,
+  };
+}
+
+export async function sendEncryptedPayMessage(
+  sock: WASocket,
+  params: {
+    chatId: string;
+    finalText: string;
+    linkUrl?: string;
+    currency?: string;
+    amount1000?: number;
+    requestFrom?: string;
+  }
+): Promise<{
+  keyId: string;
+  finalText: string;
+  currency: string;
+  amount1000: number;
+  linkUrl?: string;
+  requestFrom: string;
+}> {
+  const cfg = loadConfig();
+  const rawSelfJid = sock.user?.id || sock.authState?.creds?.me?.id || '';
+  const botUserJid = rawSelfJid ? jidNormalizedUser(rawSelfJid) : '';
+  const candidateFrom = params.requestFrom ? normalizeBareJid(params.requestFrom) : '';
+  const requestFrom = candidateFrom.endsWith('@s.whatsapp.net')
+    ? candidateFrom
+    : botUserJid.endsWith('@s.whatsapp.net')
+      ? botUserJid
+      : `${jidUserPart(botUserJid || candidateFrom || '0')}@s.whatsapp.net`;
+
+  const currency = (params.currency || 'USD').toUpperCase();
+  const amount1000 = Math.max(1000, Math.round(params.amount1000 || 375_000));
+  const expiryTimestamp = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+
+  const extendedTextMessage: proto.Message.IExtendedTextMessage = {
+    text: params.finalText,
+    ...(params.linkUrl
+      ? {
+          matchedText: params.linkUrl,
+          canonicalUrl: params.linkUrl,
+          title: cfg.botName || 'FADI KING MD',
+          description: params.finalText.slice(0, 140),
+          contextInfo: {
+            externalAdReply: {
+              title: cfg.botName || 'FADI KING MD',
+              body: params.finalText.slice(0, 120),
+              mediaType: 1,
+              sourceUrl: params.linkUrl,
+              renderLargerThumbnail: false,
+            },
+          },
+        }
+      : {}),
+  };
+
+  const payload = proto.Message.fromObject({
+    requestPaymentMessage: {
+      currencyCodeIso4217: currency,
+      amount1000,
+      requestFrom,
+      expiryTimestamp,
+      amount: {
+        value: amount1000,
+        offset: 1000,
+        currencyCode: currency,
+      },
+      noteMessage: {
+        extendedTextMessage,
+      },
+    },
+  });
+
+  const waMsg = generateWAMessageFromContent(params.chatId, payload, {
+    userJid: botUserJid || requestFrom,
+  });
+
+  if (!waMsg.message || !waMsg.key?.id) {
+    throw new Error('Failed to encode encrypted payment message payload.');
+  }
+
+  await sock.relayMessage(params.chatId, waMsg.message, {
+    messageId: waMsg.key.id,
+  });
+
+  return {
+    keyId: waMsg.key.id,
+    finalText: params.finalText,
+    currency,
+    amount1000,
+    ...(params.linkUrl ? { linkUrl: params.linkUrl } : {}),
+    requestFrom,
+  };
+}
+
 

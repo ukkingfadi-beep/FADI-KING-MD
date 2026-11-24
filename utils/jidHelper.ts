@@ -368,6 +368,9 @@ export function extractBodyText(message: proto.IMessage | null | undefined): str
     inner.buttonsResponseMessage?.selectedButtonId ||
     inner.listResponseMessage?.singleSelectReply?.selectedRowId ||
     inner.templateButtonReplyMessage?.selectedId ||
+    (inner.requestPaymentMessage?.noteMessage
+      ? extractBodyText(inner.requestPaymentMessage.noteMessage)
+      : '') ||
     ''
   );
 }

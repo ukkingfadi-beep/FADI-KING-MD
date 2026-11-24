@@ -76,7 +76,6 @@ const SOURCE_FILES = [
 ];
 
 async function startServer(): Promise<void> {
-  await initDatabase();
   const app = express();
   const envPort = Number(process.env.PORT || 0);
   const nginxPort = Number(process.env.NGINX_PORT || 0);
@@ -106,6 +105,39 @@ async function startServer(): Promise<void> {
     const activeConnected =
       snap.status === 'connected' || snap.subSessions.some((s) => s.status === 'connected');
     res.json({ ok: true, connected: activeConnected, uptimeSeconds: snap.uptimeSeconds });
+  });
+
+  let readyError: Error | null = null;
+  let viteMiddleware: express.RequestHandler | null = null;
+  let viteInstance: { close: () => Promise<void> } | null = null;
+
+  const readyPromise = (async () => {
+    const dbInitPromise = initDatabase().then(() => {
+      initializeSavedSessionOnBoot();
+    });
+
+    if (isDev) {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true, hmr: false, ws: false },
+        appType: 'spa',
+      });
+      viteInstance = vite;
+      viteMiddleware = vite.middlewares;
+    }
+
+    await dbInitPromise;
+  })().catch((err) => {
+    readyError = err instanceof Error ? err : new Error(String(err));
+    logger.error('server', `Startup initialization failed: ${readyError.message}`);
+  });
+
+  app.use(async (_req, res, next) => {
+    await readyPromise;
+    if (readyError) {
+      return res.status(500).json({ ok: false, error: readyError.message });
+    }
+    return next();
   });
 
   app.get('/api/public/state', (_req, res) => {
@@ -816,12 +848,12 @@ async function startServer(): Promise<void> {
 
   // Mount Vite in dev or serve built static files in production
   if (isDev) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
-      appType: 'spa',
+    app.use((req, res, next) => {
+      if (viteMiddleware) {
+        return viteMiddleware(req, res, next);
+      }
+      return next();
     });
-    app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -830,21 +862,42 @@ async function startServer(): Promise<void> {
     });
   }
 
+  let bindRetries = 0;
   const httpServer = app.listen(port, '0.0.0.0', () => {
     logger.info('server', `FADI KING MD Control Board running on http://0.0.0.0:${port}`);
-    initializeSavedSessionOnBoot();
+  });
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE' && bindRetries < 5) {
+      bindRetries += 1;
+      logger.warn('server', `Port ${port} busy, retrying bind (${bindRetries}/5)...`);
+      setTimeout(() => {
+        httpServer.listen(port, '0.0.0.0');
+      }, 350);
+      return;
+    }
+    logger.error('server', `HTTP server failed to bind port ${port}: ${err.message}`);
+    process.exit(1);
   });
   httpServer.keepAliveTimeout = 65_000;
   httpServer.headersTimeout = 66_000;
   httpServer.maxRequestsPerSocket = 0;
 
+  let shuttingDown = false;
   const gracefulShutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info('server', `Received ${signal}. Closing WhatsApp sockets cleanly before exit...`);
-    closeAllSocketsGracefully();
+    try {
+      closeAllSocketsGracefully();
+    } catch {
+      // Ignore socket close error on shutdown
+    }
+    void viteInstance?.close().catch(() => {});
+    httpServer.closeAllConnections?.();
     httpServer.close(() => {
       process.exit(0);
     });
-    setTimeout(() => process.exit(0), 2500).unref();
+    setTimeout(() => process.exit(0), 400).unref();
   };
 
   process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));

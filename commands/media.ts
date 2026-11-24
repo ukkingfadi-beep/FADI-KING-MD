@@ -31,6 +31,8 @@ import {
   getUnavailableViewOnceRecord,
   inspectWebpStickerBuffer,
   isFfmpegAvailable,
+  parsePayMessageInput,
+  sendEncryptedPayMessage,
   sendImmediateViewOncePdo,
   synthesizeTtsVoiceNote,
   unwrapViewOnce,
@@ -2063,6 +2065,75 @@ export const mediaCommands: BotCommand[] = [
         return summary;
       } catch (err) {
         const msg = `Cricket scores unavailable right now: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    },
+  },
+  {
+    name: 'paymsg',
+    aliases: ['paylock', 'reqpay', 'encmsg', 'admindelblock'],
+    category: 'media',
+    description:
+      'Encrypted payment-request card bheje jo group admins delete na kar sakein (custom text, link aur optional amount ke sath)',
+    usage: 'paymsg [amount] <link | text> (e.g. .paymsg https://chat.whatsapp.com/... hello)',
+    cooldownSeconds: 3,
+    execute: async (ctx) => {
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const rawInput = ctx.text.trim() || quotedText;
+
+      const parsed = parsePayMessageInput(rawInput);
+      if (!parsed) {
+        const msg = [
+          `Provide text, a link, or both to send an encrypted admin-protected card.`,
+          `• Example 1: \`${ctx.prefix}paymsg https://chat.whatsapp.com/... hello\``,
+          `• Example 2: \`${ctx.prefix}paymsg hello everyone\``,
+          `• Example 3: \`${ctx.prefix}paymsg $500 | https://example.com | Custom note\``,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const amountLabel = `${parsed.currency} ${(parsed.amount1000 / 1000).toLocaleString('en-US')}`;
+        const msg = `[Simulated Encrypted PayMsg] ${amountLabel} — ${parsed.finalText}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      try {
+        const ownPn = normalizePhone(jidUserPart(ctx.sock.user?.id));
+        const senderPn = isValidPhone(ctx.senderNumber) ? ctx.senderNumber : '';
+        const requestFrom = senderPn
+          ? `${senderPn}@s.whatsapp.net`
+          : ownPn
+            ? `${ownPn}@s.whatsapp.net`
+            : undefined;
+
+        const sent = await sendEncryptedPayMessage(ctx.sock, {
+          chatId: ctx.chatId,
+          finalText: parsed.finalText,
+          linkUrl: parsed.linkUrl,
+          currency: parsed.currency,
+          amount1000: parsed.amount1000,
+          requestFrom,
+        });
+
+        if (ctx.isGroup && sent.keyId) {
+          vipStore.registerProtectedPost(sent.keyId, ctx.chatId, sent.finalText, 0, {
+            currency: sent.currency,
+            amount1000: sent.amount1000,
+            finalText: sent.finalText,
+            linkUrl: sent.linkUrl,
+            requestFrom: sent.requestFrom,
+          });
+        }
+
+        const formattedAmount = `${sent.currency} ${(sent.amount1000 / 1000).toLocaleString('en-US')}`;
+        return `Sent encrypted ${formattedAmount} card${ctx.isGroup ? ' with admin-delete lock' : ''}.`;
+      } catch (err) {
+        const msg = `Encrypted pay message failed: ${(err as Error).message}`;
         await ctx.reply(msg);
         return msg;
       }

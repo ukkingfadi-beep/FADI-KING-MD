@@ -16,7 +16,7 @@ import {
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
-import { generateWelcomeImageCard } from '../utils/mediaHelper.ts';
+import { generateWelcomeImageCard, sendEncryptedPayMessage } from '../utils/mediaHelper.ts';
 import { vipStore } from '../utils/vipStore.ts';
 
 const LINK_REGEX =
@@ -829,22 +829,42 @@ export async function handleAntidelete(
     if (!chatId || !protocolMsg || protocolMsg.type !== 0 || !protocolMsg.key?.id) return;
     if (!chatId.endsWith('@g.us')) return;
 
-    // 1. Protected Open-GC Anti-Delete Lock: even if a Group Admin deletes it, immediately repost!
+    // 1. Protected Open-GC / PayMsg Anti-Delete Lock: even if a Group Admin deletes it, immediately repost!
     const protectedPost = vipStore.consumeProtectedPost(chatId, protocolMsg.key.id);
     if (protectedPost) {
       if (protectedPost.repostCount < 10) {
-        const resent = await sock.sendMessage(chatId, { text: protectedPost.text }).catch(() => null);
-        if (resent?.key?.id) {
-          vipStore.registerProtectedPost(
-            resent.key.id,
+        if (protectedPost.paymsg) {
+          const resentPay = await sendEncryptedPayMessage(sock, {
             chatId,
-            protectedPost.text,
-            protectedPost.repostCount + 1
-          );
+            finalText: protectedPost.paymsg.finalText,
+            linkUrl: protectedPost.paymsg.linkUrl,
+            currency: protectedPost.paymsg.currency,
+            amount1000: protectedPost.paymsg.amount1000,
+            requestFrom: protectedPost.paymsg.requestFrom,
+          }).catch(() => null);
+          if (resentPay?.keyId) {
+            vipStore.registerProtectedPost(
+              resentPay.keyId,
+              chatId,
+              protectedPost.text,
+              protectedPost.repostCount + 1,
+              protectedPost.paymsg
+            );
+          }
+        } else {
+          const resent = await sock.sendMessage(chatId, { text: protectedPost.text }).catch(() => null);
+          if (resent?.key?.id) {
+            vipStore.registerProtectedPost(
+              resent.key.id,
+              chatId,
+              protectedPost.text,
+              protectedPost.repostCount + 1
+            );
+          }
         }
         logger.security(
           'protectedPost',
-          `Deleted protected Open-GC message in ${chatId}; auto-restored (attempt ${protectedPost.repostCount + 1}).`
+          `Deleted protected message in ${chatId}; auto-restored (attempt ${protectedPost.repostCount + 1}).`
         );
       }
       return;
