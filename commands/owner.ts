@@ -5,6 +5,7 @@ import {
 } from '../handlers/connection.ts';
 import { dispatchOpenGcProtectedPost } from '../handlers/group.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
+import { crashGuardStore } from '../utils/crashGuard.ts';
 import { generateAiChatReply } from '../utils/geminiService.ts';
 import {
   extractBodyText,
@@ -912,6 +913,159 @@ export const ownerCommands: BotCommand[] = [
         await ctx.reply(text);
       }
       return text;
+    },
+  },
+  {
+    name: 'antivirus',
+    aliases: ['anticrash', 'antibug', 'zeroday', 'crashshield'],
+    category: 'owner',
+    description: 'Zero-Day Crash, Invisible Unicode Bomb & Anti-Virus Shield control aur blacklist manage kare',
+    usage: 'antivirus <on|off|global on|global off|list|unblock @user>',
+    execute: async (ctx) => {
+      const arg0 = ctx.args[0]?.toLowerCase() || '';
+      const arg1 = ctx.args[1]?.toLowerCase() || '';
+      const cfg = loadConfig();
+
+      if (arg0 === 'global') {
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: \`${ctx.prefix}antivirus global\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        if (arg1 === 'on' || arg1 === 'off') {
+          const enabled = arg1 === 'on';
+          saveConfig({ antiVirusGlobal: enabled });
+          logger.security('crashGuard', `Global Anti-Virus & Zero-Day Shield turned ${enabled ? 'ON' : 'OFF'}`);
+          const msg = `🛡️ *Global Anti-Virus & Zero-Day Shield turned ${enabled ? 'ON' : 'OFF'}*\n• Owner & VIP Private IBs remain protected and attackers are auto-blacklisted.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const msg = `Global Anti-Virus Shield is *${cfg.antiVirusGlobal ? 'ON' : 'OFF'}*.\nUsage: \`${ctx.prefix}antivirus global on\` / \`off\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (arg0 === 'list' || arg0 === 'threats' || arg0 === 'incidents') {
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: \`${ctx.prefix}antivirus ${arg0}\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const blocked = crashGuardStore.listBlacklist();
+        const incidents = crashGuardStore.listIncidents(10);
+        const lines = [
+          `🛡️ *Anti-Virus Threat Blacklist (${blocked.length})*`,
+          ...(blocked.length === 0
+            ? ['  _No blacklisted crash attackers right now._']
+            : blocked
+                .slice(0, 30)
+                .map(
+                  (b, i) =>
+                    `  ${i + 1}. +${b.number} — *${b.categories.join(', ')}* (${b.hits}x · ${b.blockedAt.slice(0, 10)})`
+                )),
+          ...(incidents.length > 0
+            ? [
+                '',
+                `📋 *Recent Neutralized Attacks (${incidents.length}):*`,
+                ...incidents
+                  .slice(0, 5)
+                  .map(
+                    (inc) =>
+                      `  • [${inc.scope.toUpperCase()}] +${inc.attackerNumber}: ${inc.categories.join(', ')}`
+                  ),
+              ]
+            : []),
+        ];
+        const msg = lines.join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (arg0 === 'unblock' || arg0 === 'unban' || arg0 === 'remove' || arg0 === 'clear') {
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: \`${ctx.prefix}antivirus ${arg0}\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const subArgs = ctx.args.slice(1);
+        const target = await resolveDmOrMentionTarget({ ...ctx, args: subArgs });
+        if (!target) {
+          const msg = `Mention a user, reply, or pass a number.\nUsage: \`${ctx.prefix}antivirus unblock @user\``;
+          await ctx.reply(msg);
+          return msg;
+        }
+        const candidates = Array.from(
+          new Set([target.displayPhone, target.primaryJid, ...target.candidates].filter(Boolean))
+        );
+        const removed = crashGuardStore.removeFromBlacklist(candidates);
+        vipStore.unbanUser(candidates);
+        anticallStore.unblockCaller(candidates);
+        if (ctx.sock && !ctx.isSimulated && target.primaryJid) {
+          await ctx.sock.updateBlockStatus(target.primaryJid, 'unblock').catch(() => {});
+        }
+        const label = removed?.number || target.displayPhone || jidUserPart(target.primaryJid);
+        const msg = removed
+          ? `✅ *Removed from Anti-Virus Blacklist:* +${label} has been unblacklisted & unblocked.`
+          : `ℹ️ +${label} was not in the Anti-Virus blacklist (WhatsApp unblock attempted).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (arg0 === 'on' || arg0 === 'off') {
+        const enabled = arg0 === 'on';
+        if (ctx.isGroup) {
+          if (!ctx.isOwner) {
+            if (!ctx.sock || ctx.isSimulated) {
+              const msg = 'Group Admin or Owner permission required.';
+              await ctx.reply(msg);
+              return msg;
+            }
+            const meta = await getCachedGroupMetadata(ctx.sock, ctx.chatId, true);
+            const senderP = findParticipant(meta.participants, ctx.senderCandidates || [ctx.senderJid]);
+            if (!isParticipantAdmin(senderP)) {
+              const msg = 'Only Group Admins or the Bot Owner can toggle Anti-Virus Crash Shield in this group.';
+              await ctx.reply(msg);
+              return msg;
+            }
+          }
+          vipStore.updateGroupConfig(ctx.chatId, { antiVirus: enabled });
+          const msg = enabled
+            ? `🛡️ *Group Anti-Virus & Zero-Day Shield turned ON!*\nInvisible unicode bombs, malformed protobuf crashes, and exploit payloads will be neutralized, with attackers kicked & blacklisted.`
+            : `⚪ *Group Anti-Virus Shield turned OFF* for this group.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+
+        if (!ctx.isOwner) {
+          const msg = `Access Denied: Global \`${ctx.prefix}antivirus ${arg0}\` is restricted to the Bot Owner.`;
+          await ctx.reply(msg);
+          return msg;
+        }
+        saveConfig({ antiVirusGlobal: enabled });
+        const msg = `🛡️ *Global Anti-Virus & Zero-Day Shield turned ${arg0.toUpperCase()}*.`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const blacklistedCount = crashGuardStore.listBlacklist().length;
+      const recentCount = crashGuardStore.listIncidents(50).length;
+      const groupCfg = ctx.isGroup ? vipStore.getGroupConfig(ctx.chatId) : null;
+      const msg = [
+        `🛡️ *Anti-Virus & Zero-Day Crash Protection*`,
+        `• Global / DM Shield: *${cfg.antiVirusGlobal ? 'ON' : 'OFF'}*`,
+        `• Owner & VIP IB Shield: *ACTIVE (Always Protected)*`,
+        ...(groupCfg ? [`• This Group Shield: *${groupCfg.antiVirus ? 'ON' : 'OFF'}*`] : []),
+        `• Blacklisted Attackers: *${blacklistedCount}*`,
+        `• Neutralized Attacks Logged: *${recentCount}*`,
+        '',
+        `Usage:`,
+        `• \`${ctx.prefix}antivirus on\` / \`off\` — Toggle in current group (or global for Owner DM)`,
+        `• \`${ctx.prefix}antivirus global on\` / \`off\` — Toggle global shield`,
+        `• \`${ctx.prefix}antivirus list\` — View blacklisted attackers & incidents`,
+        `• \`${ctx.prefix}antivirus unblock @user\` — Unblacklist & unblock a user`,
+      ].join('\n');
+      await ctx.reply(msg);
+      return msg;
     },
   },
 ];

@@ -54,6 +54,7 @@ export interface GroupConfig {
   antidelete?: boolean;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  antiVirus?: boolean;
   antiAdd?: boolean;
   antiForward?: boolean;
   antiMedia?: boolean;
@@ -544,6 +545,7 @@ export const vipStore = {
         antidelete: false,
         antiScam: cfg.antiScamGlobal,
         antiStatusMention: cfg.antiStatusMentionGlobal,
+        antiVirus: cfg.antiVirusGlobal,
         antiAdd: false,
         antiForward: false,
         antiMedia: false,
@@ -569,6 +571,7 @@ export const vipStore = {
         typeof found.antiStatusMention === 'boolean'
           ? found.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      antiVirus: typeof found.antiVirus === 'boolean' ? found.antiVirus : cfg.antiVirusGlobal,
       antiAdd: Boolean(found.antiAdd),
       antiForward: Boolean(found.antiForward),
       antiMedia: Boolean(found.antiMedia),
@@ -597,6 +600,7 @@ export const vipStore = {
         typeof g.antiStatusMention === 'boolean'
           ? g.antiStatusMention
           : cfg.antiStatusMentionGlobal,
+      antiVirus: typeof g.antiVirus === 'boolean' ? g.antiVirus : cfg.antiVirusGlobal,
       antiAdd: Boolean(g.antiAdd),
       antiForward: Boolean(g.antiForward),
       antiMedia: Boolean(g.antiMedia),
@@ -639,6 +643,7 @@ export const vipStore = {
     if (typeof patch.antiStatusMention === 'boolean') {
       cleanPatch.antiStatusMention = patch.antiStatusMention;
     }
+    if (typeof patch.antiVirus === 'boolean') cleanPatch.antiVirus = patch.antiVirus;
     if (typeof patch.antiAdd === 'boolean') cleanPatch.antiAdd = patch.antiAdd;
     if (typeof patch.antiForward === 'boolean') cleanPatch.antiForward = patch.antiForward;
     if (typeof patch.antiMedia === 'boolean') cleanPatch.antiMedia = patch.antiMedia;
@@ -679,6 +684,7 @@ export const vipStore = {
       antidelete: false,
       antiScam: cfg.antiScamGlobal,
       antiStatusMention: cfg.antiStatusMentionGlobal,
+      antiVirus: cfg.antiVirusGlobal,
       antiAdd: false,
       antiForward: false,
       antiMedia: false,

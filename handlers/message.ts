@@ -13,6 +13,7 @@ import {
   resolveSenderInfo,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
+import { inspectAndMitigateThreat } from '../utils/crashGuard.ts';
 import { recordChatMessage } from '../utils/chatHistoryStore.ts';
 import { commandRateLimiter, getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { formatDurationHuman } from '../utils/reminderStore.ts';
@@ -135,6 +136,8 @@ export async function handleIncomingMessage(
       await handleAntidelete(sock, msg, getCachedMessage);
       return;
     }
+
+    if (await inspectAndMitigateThreat(sock, msg)) return;
 
     if (!markProcessed(msg.key.id)) return;
 

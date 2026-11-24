@@ -18,6 +18,11 @@ import {
 import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
 import {
+  inspectAndMitigateThreat,
+  inspectMessagePayload,
+  sanitizeMessageInPlace,
+} from '../utils/crashGuard.ts';
+import {
   backupAuthDirToDb,
   deleteAuthBackupFromDb,
   restoreAuthDirsFromDb,
@@ -553,6 +558,75 @@ async function handleIncomingCalls(
   }
 }
 
+async function processSocketUpsertMessages(
+  sock: WASocket,
+  messages: WAMessage[],
+  type: string
+): Promise<void> {
+  for (const msg of messages) {
+    try {
+      if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
+        void recordBroadcastStatus(sock, msg);
+      }
+      if (
+        msg.key?.id &&
+        msg.key?.remoteJid &&
+        msg.key.remoteJid !== 'status@broadcast' &&
+        !msg.message &&
+        (msg.key.isViewOnce ||
+          msg.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
+      ) {
+        recordUnavailableViewOnceKey(msg.key);
+        const unavail = getUnavailableViewOnceRecord(msg.key.id);
+        if (unavail) {
+          void sendImmediateViewOncePdo(sock, [unavail.cleanKey, ...unavail.altKeys]);
+        }
+      }
+
+      if (msg.message && msg.key?.remoteJid !== 'status@broadcast') {
+        const threatBlocked = await inspectAndMitigateThreat(sock, msg);
+        if (threatBlocked) continue;
+      }
+
+      cacheMessage(msg);
+      void precacheViewOnceMedia(sock, msg);
+      if (type === 'notify') {
+        void handleIncomingMessage(sock, msg, getCachedMessage);
+      }
+    } catch (err) {
+      logger.warn('crashGuard', `Isolated message upsert error: ${(err as Error).message}`);
+    }
+  }
+}
+
+function processSocketMessageUpdates(
+  sock: WASocket,
+  updates: Array<{ key: WAMessageKey; update: { message?: WAMessage['message'] | null } }>
+): void {
+  for (const upd of updates) {
+    try {
+      if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
+        const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
+        if (upd.key.remoteJid !== 'status@broadcast') {
+          const check = inspectMessagePayload(upd.update.message);
+          if (check.isThreat) {
+            sanitizeMessageInPlace(synthetic);
+            void inspectAndMitigateThreat(sock, { key: upd.key, message: upd.update.message });
+            continue;
+          }
+        }
+        if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
+          void recordBroadcastStatus(sock, synthetic);
+        }
+        cacheMessage(synthetic);
+        void precacheViewOnceMedia(sock, synthetic);
+      }
+    } catch (err) {
+      logger.warn('crashGuard', `Isolated message update error: ${(err as Error).message}`);
+    }
+  }
+}
+
 export function getBotSnapshot() {
   const cfg = loadConfig();
   if (!persistedCacheLoaded) {
@@ -860,52 +934,31 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
     });
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
-      for (const msg of messages) {
-        if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
-          void recordBroadcastStatus(sock, msg);
-        }
-        if (
-          msg.key?.id &&
-          msg.key?.remoteJid &&
-          msg.key.remoteJid !== 'status@broadcast' &&
-          !msg.message &&
-          (msg.key.isViewOnce ||
-            msg.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
-        ) {
-          recordUnavailableViewOnceKey(msg.key);
-          const unavail = getUnavailableViewOnceRecord(msg.key.id);
-          if (unavail) {
-            void sendImmediateViewOncePdo(sock, [unavail.cleanKey, ...unavail.altKeys]);
-          }
-        }
-        cacheMessage(msg);
-        void precacheViewOnceMedia(sock, msg);
-        if (type === 'notify') {
-          void handleIncomingMessage(sock, msg, getCachedMessage);
-        }
-      }
+      void processSocketUpsertMessages(sock, messages, type);
     });
 
     sock.ev.on('messages.update', (updates) => {
-      for (const upd of updates) {
-        if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
-          const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
-          if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
-            void recordBroadcastStatus(sock, synthetic);
-          }
-          cacheMessage(synthetic);
-          void precacheViewOnceMedia(sock, synthetic);
-        }
-      }
+      processSocketMessageUpdates(sock, updates);
     });
 
     sock.ev.on('messaging-history.set', ({ messages }) => {
       for (const msg of messages || []) {
-        if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
-          void recordBroadcastStatus(sock, msg);
+        try {
+          if (msg.message && msg.key?.remoteJid !== 'status@broadcast') {
+            const check = inspectMessagePayload(msg.message);
+            if (check.isThreat) {
+              sanitizeMessageInPlace(msg);
+              continue;
+            }
+          }
+          if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
+            void recordBroadcastStatus(sock, msg);
+          }
+          cacheMessage(msg);
+          void precacheViewOnceMedia(sock, msg);
+        } catch {
+          // Ignore malformed history sync item
         }
-        cacheMessage(msg);
-        void precacheViewOnceMedia(sock, msg);
       }
     });
 
@@ -1197,52 +1250,31 @@ async function connectSubSession(params: {
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    for (const m of messages) {
-      if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
-        void recordBroadcastStatus(sock, m);
-      }
-      if (
-        m.key?.id &&
-        m.key?.remoteJid &&
-        m.key.remoteJid !== 'status@broadcast' &&
-        !m.message &&
-        (m.key.isViewOnce ||
-          m.messageStubParameters?.some((p: string) => /view_once|absent/i.test(String(p))))
-      ) {
-        recordUnavailableViewOnceKey(m.key);
-        const unavail = getUnavailableViewOnceRecord(m.key.id);
-        if (unavail) {
-          void sendImmediateViewOncePdo(sock, [unavail.cleanKey, ...unavail.altKeys]);
-        }
-      }
-      cacheMessage(m);
-      void precacheViewOnceMedia(sock, m);
-      if (type === 'notify') {
-        void handleIncomingMessage(sock, m, getCachedMessage);
-      }
-    }
+    void processSocketUpsertMessages(sock, messages, type);
   });
 
   sock.ev.on('messages.update', (updates) => {
-    for (const upd of updates) {
-      if (upd.update?.message && upd.key?.remoteJid && upd.key?.id) {
-        const synthetic: WAMessage = { key: upd.key, message: upd.update.message };
-        if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
-          void recordBroadcastStatus(sock, synthetic);
-        }
-        cacheMessage(synthetic);
-        void precacheViewOnceMedia(sock, synthetic);
-      }
-    }
+    processSocketMessageUpdates(sock, updates);
   });
 
   sock.ev.on('messaging-history.set', ({ messages }) => {
     for (const m of messages || []) {
-      if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
-        void recordBroadcastStatus(sock, m);
+      try {
+        if (m.message && m.key?.remoteJid !== 'status@broadcast') {
+          const check = inspectMessagePayload(m.message);
+          if (check.isThreat) {
+            sanitizeMessageInPlace(m);
+            continue;
+          }
+        }
+        if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
+          void recordBroadcastStatus(sock, m);
+        }
+        cacheMessage(m);
+        void precacheViewOnceMedia(sock, m);
+      } catch {
+        // Ignore malformed history sync item
       }
-      cacheMessage(m);
-      void precacheViewOnceMedia(sock, m);
     }
   });
 

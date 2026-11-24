@@ -29,6 +29,7 @@ import {
 } from './utils/adminAuth.ts';
 import { liveStore, type AlertLevel } from './utils/liveStore.ts';
 import { anticallStore } from './utils/anticallStore.ts';
+import { crashGuardStore } from './utils/crashGuard.ts';
 import { initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
 import { pairingRateLimiter } from './utils/rateLimiter.ts';
@@ -65,6 +66,7 @@ const SOURCE_FILES = [
   'utils/adminAuth.ts',
   'utils/liveStore.ts',
   'utils/anticallStore.ts',
+  'utils/crashGuard.ts',
   'utils/chatHistoryStore.ts',
   'utils/reminderStore.ts',
   'utils/geminiService.ts',
@@ -448,6 +450,7 @@ async function startServer(): Promise<void> {
         antiScamGlobal: cfg.antiScamGlobal,
         antiScamBlockAllStickers: cfg.antiScamBlockAllStickers,
         antiStatusMentionGlobal: cfg.antiStatusMentionGlobal,
+        antiVirusGlobal: cfg.antiVirusGlobal,
         autoForwardIbToOpenGcs: cfg.autoForwardIbToOpenGcs,
         autoReact: cfg.autoReact,
         aiEnabled: cfg.aiEnabled,
@@ -566,6 +569,10 @@ async function startServer(): Promise<void> {
       antiStatusMentionGlobal:
         typeof body.antiStatusMentionGlobal === 'boolean'
           ? body.antiStatusMentionGlobal
+          : undefined,
+      antiVirusGlobal:
+        typeof body.antiVirusGlobal === 'boolean'
+          ? body.antiVirusGlobal
           : undefined,
       autoForwardIbToOpenGcs:
         typeof body.autoForwardIbToOpenGcs === 'boolean'
@@ -747,6 +754,7 @@ async function startServer(): Promise<void> {
       antiScam: typeof req.body?.antiScam === 'boolean' ? req.body.antiScam : undefined,
       antiStatusMention:
         typeof req.body?.antiStatusMention === 'boolean' ? req.body.antiStatusMention : undefined,
+      antiVirus: typeof req.body?.antiVirus === 'boolean' ? req.body.antiVirus : undefined,
       aiEnabled: typeof req.body?.aiEnabled === 'boolean' ? req.body.aiEnabled : undefined,
       antiAdd: typeof req.body?.antiAdd === 'boolean' ? req.body.antiAdd : undefined,
       antiForward: typeof req.body?.antiForward === 'boolean' ? req.body.antiForward : undefined,
@@ -762,6 +770,30 @@ async function startServer(): Promise<void> {
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });
     res.json({ ok: true, group: updated });
+  });
+
+  // Anti-Virus & Zero-Day Crash Shield Registry (Admin Only)
+  app.get('/api/antivirus', requireAdmin, (_req, res) => {
+    const cfg = loadConfig();
+    res.json({
+      ok: true,
+      globalEnabled: cfg.antiVirusGlobal,
+      blacklist: crashGuardStore.listBlacklist(),
+      incidents: crashGuardStore.listIncidents(25),
+    });
+  });
+
+  app.delete('/api/antivirus/:target', requireAdmin, (req, res) => {
+    const raw = decodeURIComponent(req.params.target || '');
+    const clean = normalizePhone(raw);
+    const candidates = [raw, clean, clean ? `${clean}@s.whatsapp.net` : ''].filter(Boolean);
+    const removed = crashGuardStore.removeFromBlacklist(candidates);
+    vipStore.unbanUser(candidates);
+    anticallStore.unblockCaller(candidates);
+    if (removed) {
+      logger.info('crashGuard', `Removed ${raw} from Anti-Virus blacklist via Admin Panel`);
+    }
+    return res.json({ ok: true, removed });
   });
 
   // Anti-Call Guard Management (Admin Only)

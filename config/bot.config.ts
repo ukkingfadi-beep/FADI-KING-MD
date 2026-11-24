@@ -46,6 +46,7 @@ export interface BotConfig {
   antiScamGlobal: boolean;
   antiScamBlockAllStickers: boolean;
   antiStatusMentionGlobal: boolean;
+  antiVirusGlobal: boolean;
   autoForwardIbToOpenGcs: boolean;
   autoReact: boolean;
   aiEnabled: boolean;
@@ -107,6 +108,7 @@ const defaultConfig: BotConfig = {
   antiScamGlobal: process.env.ANTI_SCAM_GLOBAL === 'true',
   antiScamBlockAllStickers: process.env.ANTI_SCAM_BLOCK_ALL_STICKERS === 'true',
   antiStatusMentionGlobal: process.env.ANTI_STATUS_MENTION_GLOBAL === 'true',
+  antiVirusGlobal: process.env.ANTI_VIRUS_GLOBAL !== 'false',
   autoForwardIbToOpenGcs: process.env.AUTO_FORWARD_IB_TO_OPEN_GCS === 'true',
   autoReact: process.env.AUTO_REACT === 'true',
   aiEnabled: process.env.AI_ENABLED === 'true',
@@ -347,6 +349,10 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof cleanPartial.antiStatusMentionGlobal === 'boolean'
         ? cleanPartial.antiStatusMentionGlobal
         : Boolean(current.antiStatusMentionGlobal),
+    antiVirusGlobal:
+      typeof cleanPartial.antiVirusGlobal === 'boolean'
+        ? cleanPartial.antiVirusGlobal
+        : Boolean(current.antiVirusGlobal ?? true),
     autoForwardIbToOpenGcs:
       typeof cleanPartial.autoForwardIbToOpenGcs === 'boolean'
         ? cleanPartial.autoForwardIbToOpenGcs
@@ -431,6 +437,7 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     antiScamGlobal: next.antiScamGlobal,
     antiScamBlockAllStickers: next.antiScamBlockAllStickers,
     antiStatusMentionGlobal: next.antiStatusMentionGlobal,
+    antiVirusGlobal: next.antiVirusGlobal,
     autoForwardIbToOpenGcs: next.autoForwardIbToOpenGcs,
     autoReact: next.autoReact,
     aiEnabled: next.aiEnabled,

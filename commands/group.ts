@@ -10,6 +10,7 @@ import {
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
 import { normalizeFileSha256 } from '../handlers/group.ts';
 import {
+  extractBodyText,
   extractContextInfo,
   extractFirstUrl,
   extractRawTargetCandidates,
@@ -2241,7 +2242,229 @@ export const groupCommands: BotCommand[] = [
       return msg;
     },
   },
+  {
+    name: 'multimessage',
+    aliases: ['multimsg', 'mm', 'linkblast', 'sendmulti', 'spamlink'],
+    category: 'group',
+    description:
+      'Kisi bhi group ya chat mein lagaya gaya GC link ya message 100-500+ quantity mein fast speed ke sath send kare',
+    usage: 'multimessage <link/message> <quantity: 100|200|300|400|500> | .multimessage stop',
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      // Allow Bot Owner, VIP sub-bot owners, or Group Admins (in groups)
+      if (!ctx.isOwner && !ctx.isVip) {
+        if (ctx.isGroup && !ctx.isSimulated) {
+          const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+          if (!check.ok) {
+            const errText =
+              check.reason || 'Only Group Admins, VIP users, or the Bot Owner can run this command.';
+            await ctx.reply(errText);
+            return errText;
+          }
+        } else {
+          const errText = 'Only Group Admins, VIP users, or the Bot Owner can run this command.';
+          await ctx.reply(errText);
+          return errText;
+        }
+      }
+
+      const subCmd = ctx.args[0]?.toLowerCase() || '';
+      if (subCmd === 'stop' || subCmd === 'cancel' || subCmd === 'off') {
+        const active = activeMultiMessageRuns.get(ctx.chatId);
+        if (!active) {
+          const msg = 'ℹ️ No active multi-message dispatch is running in this chat.';
+          await ctx.reply(msg);
+          return msg;
+        }
+        active.cancelled = true;
+        const msg = `🛑 Stopping multi-message dispatch (${active.sent}/${active.total} sent so far)...`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const quoted = ctx.msg ? extractQuotedMessage(ctx.msg) : null;
+      const quotedText = quoted ? extractBodyText(quoted).trim() : '';
+      const parsed = parseMultiMessageInput(ctx.text, quotedText);
+
+      if (!parsed) {
+        const msg = [
+          `⚡ *Multi-Message Fast Link Sender*`,
+          `Send any GC link or message repeatedly at high speed:`,
+          ``,
+          `*Usage:*`,
+          `• \`${ctx.prefix}multimessage https://chat.whatsapp.com/... 100\``,
+          `• \`${ctx.prefix}multimessage https://chat.whatsapp.com/... 200\``,
+          `• \`${ctx.prefix}multimessage Join fast https://chat.whatsapp.com/... 500\``,
+          `• \`${ctx.prefix}multimessage 300 https://chat.whatsapp.com/...\``,
+          `• Reply to a link/message with \`${ctx.prefix}multimessage 100\``,
+          `• \`${ctx.prefix}multimessage stop\` — Stop an active blast`,
+        ].join('\n');
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      const MAX_MULTI_QUANTITY = 1000;
+      if (parsed.quantity < 1 || parsed.quantity > MAX_MULTI_QUANTITY) {
+        const msg = `⚠️ Quantity must be between *1* and *${MAX_MULTI_QUANTITY}* (e.g. 100, 200, 300, 400, 500).`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      if (!ctx.sock || ctx.isSimulated) {
+        const msg = `⚡ [Simulated Multi-Message] Queued *${parsed.quantity}x* fast sends to ${ctx.chatId}:\n"${parsed.payload}"`;
+        await ctx.reply(msg);
+        return msg;
+      }
+
+      // Cancel any previous running blast in this same chat before starting the new one
+      const existingRun = activeMultiMessageRuns.get(ctx.chatId);
+      if (existingRun) {
+        existingRun.cancelled = true;
+      }
+
+      const runState = {
+        cancelled: false,
+        startedAt: Date.now(),
+        total: parsed.quantity,
+        sent: 0,
+        failed: 0,
+      };
+      activeMultiMessageRuns.set(ctx.chatId, runState);
+
+      const cfg = loadConfig();
+      if (!cfg.singleTick && ctx.msg?.key?.id) {
+        void ctx.sock
+          .sendMessage(ctx.chatId, { react: { text: '⚡', key: ctx.msg.key } })
+          .catch(() => {});
+      }
+
+      // Resolve URL preview ONCE beforehand so Baileys does not re-fetch HTTP metadata 100-500 times
+      let sendPayload: AnyMessageContent = { text: parsed.payload };
+      if (extractFirstUrl(parsed.payload)) {
+        const urlInfo = await getUrlInfo(parsed.payload, {
+          thumbnailWidth: 192,
+          fetchOpts: { timeout: 1800 },
+          uploadImage: ctx.sock.waUploadToServer,
+        }).catch(() => undefined);
+        sendPayload = {
+          text: parsed.payload,
+          linkPreview: urlInfo ?? null,
+        };
+      }
+
+      const sock = ctx.sock;
+      const targetChatId = ctx.chatId;
+      const total = parsed.quantity;
+      const CONCURRENCY = total >= 20 ? 5 : Math.min(3, total);
+      let nextIndex = 0;
+      let consecutiveErrors = 0;
+
+      const worker = async (): Promise<void> => {
+        while (!runState.cancelled) {
+          const idx = nextIndex;
+          if (idx >= total) break;
+          nextIndex += 1;
+
+          try {
+            await sock.sendMessage(targetChatId, sendPayload);
+            runState.sent += 1;
+            consecutiveErrors = 0;
+          } catch {
+            // Quick single retry on transient socket contention before counting failure
+            await new Promise((r) => setTimeout(r, 150));
+            if (runState.cancelled) break;
+            try {
+              await sock.sendMessage(targetChatId, sendPayload);
+              runState.sent += 1;
+              consecutiveErrors = 0;
+            } catch {
+              runState.failed += 1;
+              consecutiveErrors += 1;
+              if (consecutiveErrors >= 15) {
+                runState.cancelled = true;
+                break;
+              }
+            }
+          }
+
+          if (total > 50 && !runState.cancelled) {
+            await new Promise((r) => setTimeout(r, 20));
+          }
+        }
+      };
+
+      try {
+        await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+      } finally {
+        if (activeMultiMessageRuns.get(ctx.chatId) === runState) {
+          activeMultiMessageRuns.delete(ctx.chatId);
+        }
+      }
+
+      const elapsedSec = ((Date.now() - runState.startedAt) / 1000).toFixed(1);
+      if (!cfg.singleTick && ctx.msg?.key?.id) {
+        void sock
+          .sendMessage(targetChatId, {
+            react: { text: runState.cancelled ? '🛑' : '✅', key: ctx.msg.key },
+          })
+          .catch(() => {});
+      }
+
+      const summary = runState.cancelled
+        ? `🛑 *Multi-Message Stopped:* Sent *${runState.sent}/${total}* in ${elapsedSec}s${runState.failed ? ` (${runState.failed} failed)` : ''}.`
+        : `✅ *Multi-Message Complete:* Sent *${runState.sent}/${total}* messages in *${elapsedSec}s*${runState.failed ? ` (${runState.failed} failed)` : ''}.`;
+
+      logger.cmd('multimessage', `${ctx.chatId}: sent ${runState.sent}/${total} in ${elapsedSec}s`);
+      await ctx.reply(summary);
+      return summary;
+    },
+  },
 ];
+
+const activeMultiMessageRuns = new Map<
+  string,
+  { cancelled: boolean; startedAt: number; total: number; sent: number; failed: number }
+>();
+
+export function parseMultiMessageInput(
+  rawText: string,
+  quotedText = ''
+): { payload: string; quantity: number } | null {
+  const trimmed = rawText.trim();
+  const quoted = quotedText.trim();
+
+  // Case 1: Only quantity passed while replying to a message/link (e.g., ".multimessage 100")
+  if (/^\d{1,5}$/.test(trimmed) && quoted) {
+    return {
+      payload: quoted,
+      quantity: Number.parseInt(trimmed, 10),
+    };
+  }
+
+  if (!trimmed) return null;
+
+  // Case 2: Trailing quantity after whitespace or pipe (e.g., ".multimessage https://chat.whatsapp.com/... 100")
+  const trailingMatch = trimmed.match(/^([\s\S]*?)(?:\s+|\s*\|\s*)(\d{1,5})$/);
+  if (trailingMatch) {
+    const candidatePayload = trailingMatch[1].replace(/\s*\|\s*$/, '').trim();
+    const qty = Number.parseInt(trailingMatch[2], 10);
+    if (candidatePayload) {
+      return { payload: candidatePayload, quantity: qty };
+    }
+  }
+
+  // Case 3: Leading quantity before message/link (e.g., ".multimessage 100 https://chat.whatsapp.com/...")
+  const leadingMatch = trimmed.match(/^(\d{1,5})(?:\s+|\s*\|\s*)([\s\S]+)$/);
+  if (leadingMatch) {
+    const qty = Number.parseInt(leadingMatch[1], 10);
+    const candidatePayload = leadingMatch[2].replace(/^\|\s*/, '').trim();
+    if (candidatePayload) {
+      return { payload: candidatePayload, quantity: qty };
+    }
+  }
+
+  return null;
+}
 
 async function bulkHandlePendingRequests(
   ctx: CommandContext,

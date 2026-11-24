@@ -88,6 +88,7 @@ export interface BotConfigView {
   antiScamGlobal: boolean;
   antiScamBlockAllStickers: boolean;
   antiStatusMentionGlobal: boolean;
+  antiVirusGlobal?: boolean;
   autoForwardIbToOpenGcs: boolean;
   autoReact: boolean;
   aiEnabled: boolean;
@@ -106,6 +107,16 @@ export interface BlockedCallerEntry {
   phone: string;
   label?: string;
   addedAt: string;
+}
+
+export interface VirusBlacklistEntry {
+  jid: string;
+  number: string;
+  categories: string[];
+  reason: string;
+  chatId: string;
+  blockedAt: string;
+  hits: number;
 }
 
 export interface ActiveSessionInfo {
@@ -206,6 +217,7 @@ export interface GroupConfig {
   antilinkMode?: AntilinkMode;
   antiScam?: boolean;
   antiStatusMention?: boolean;
+  antiVirus?: boolean;
   antiAdd?: boolean;
   antiForward?: boolean;
   antiMedia?: boolean;

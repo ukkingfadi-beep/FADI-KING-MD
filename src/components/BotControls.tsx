@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { PhoneOff, Plus, Radio, Save, Send, Shield, Trash2 } from 'lucide-react';
-import type { BlockedCallerEntry, BotConfigView, GroupConfig } from '../types/bot';
+import { PhoneOff, Plus, Radio, Save, Send, Shield, ShieldAlert, Trash2 } from 'lucide-react';
+import type {
+  BlockedCallerEntry,
+  BotConfigView,
+  GroupConfig,
+  VirusBlacklistEntry,
+} from '../types/bot';
 
 interface BotControlsProps {
   config: BotConfigView | null;
@@ -42,6 +47,7 @@ const DEFAULT_BOT_CONFIG_FORM: BotConfigView = {
   antiScamGlobal: false,
   antiScamBlockAllStickers: false,
   antiStatusMentionGlobal: false,
+  antiVirusGlobal: true,
   autoForwardIbToOpenGcs: false,
   autoReact: false,
   aiEnabled: false,
@@ -106,6 +112,9 @@ function normalizeBotConfigForm(cfg: Partial<BotConfigView>): BotConfigView {
     antiStatusMentionGlobal: Boolean(
       cfg.antiStatusMentionGlobal ?? DEFAULT_BOT_CONFIG_FORM.antiStatusMentionGlobal
     ),
+    antiVirusGlobal: Boolean(
+      cfg.antiVirusGlobal ?? DEFAULT_BOT_CONFIG_FORM.antiVirusGlobal
+    ),
     autoForwardIbToOpenGcs: Boolean(
       cfg.autoForwardIbToOpenGcs ?? DEFAULT_BOT_CONFIG_FORM.autoForwardIbToOpenGcs
     ),
@@ -156,6 +165,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
   const [blockedCallers, setBlockedCallers] = useState<BlockedCallerEntry[]>([]);
   const [anticallPhone, setAnticallPhone] = useState('');
   const [anticallError, setAnticallError] = useState<string | null>(null);
+  const [virusBlacklist, setVirusBlacklist] = useState<VirusBlacklistEntry[]>([]);
 
   function updateForm(patch: Partial<BotConfigView>) {
     isDirtyRef.current = true;
@@ -177,6 +187,21 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
     }
   }, [adminToken]);
 
+  const fetchAntivirus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/antivirus', {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.blacklist)) {
+        setVirusBlacklist(data.blacklist);
+      }
+    } catch {
+      // Ignore network hiccup
+    }
+  }, [adminToken]);
+
   useEffect(() => {
     if (!config || isDirtyRef.current) return;
     const normalized = normalizeBotConfigForm(config);
@@ -189,7 +214,8 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
 
   useEffect(() => {
     void fetchAnticall();
-  }, [fetchAnticall]);
+    void fetchAntivirus();
+  }, [fetchAnticall, fetchAntivirus]);
 
   async function handleSaveConfig(e: FormEvent) {
     e.preventDefault();
@@ -265,6 +291,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
       | 'goodbye'
       | 'antiScam'
       | 'antiStatusMention'
+      | 'antiVirus'
       | 'aiEnabled'
       | 'antiAdd'
       | 'antiForward'
@@ -337,6 +364,15 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
       method: 'DELETE',
       headers: { Authorization: `Bearer ${adminToken}` },
     });
+    await fetchAnticall();
+  }
+
+  async function handleRemoveAntivirusBlacklist(target: string) {
+    await fetch(`/api/antivirus/${encodeURIComponent(target)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    await fetchAntivirus();
     await fetchAnticall();
   }
 
@@ -754,6 +790,16 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
               <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
                 <input
                   type="checkbox"
+                  checked={Boolean(form.antiVirusGlobal ?? true)}
+                  onChange={(e) => updateForm({ antiVirusGlobal: e.target.checked })}
+                  className="w-4 h-4 accent-[#8B5CF6]"
+                />
+                Anti-Virus & Zero-Day Crash Shield (Owner/VIP IB + Groups)
+              </label>
+
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#D5D0ED] cursor-pointer">
+                <input
+                  type="checkbox"
                   checked={form.autoForwardIbToOpenGcs}
                   onChange={(e) => updateForm({ autoForwardIbToOpenGcs: e.target.checked })}
                   className="w-4 h-4 accent-[#8B5CF6]"
@@ -913,6 +959,24 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                         }`}
                       >
                         Anti-Mention Status: {(g.antiStatusMention ?? form.antiStatusMentionGlobal) ? 'On' : 'Off'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          toggleGroupSetting(
+                            g.groupId,
+                            'antiVirus',
+                            !(g.antiVirus ?? form.antiVirusGlobal ?? true)
+                          )
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+                          (g.antiVirus ?? form.antiVirusGlobal ?? true)
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-white/[0.06] text-[#9E97C2]'
+                        }`}
+                      >
+                        Anti-Virus: {(g.antiVirus ?? form.antiVirusGlobal ?? true) ? 'On' : 'Off'}
                       </button>
 
                       <button
@@ -1099,6 +1163,65 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                   Allow Calls
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+
+      {/* Anti-Virus & Zero-Day Threat Blacklist */}
+      <section className="glass-surface rounded-2xl p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-white/[0.07]">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlert className="w-4 h-4 text-rose-400" />
+            <div>
+              <h3 className="text-base font-semibold text-white">
+                Anti-Virus & Zero-Day Threat Blacklist
+              </h3>
+              <p className="text-xs text-[#9E97C2]">
+                Senders caught transmitting crash bombs, invisible unicode floods, or malformed protobuf payloads are purged and permanently blacklisted.
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-mono tabular-nums text-[#C4BFE0]">
+            Shield: {(form.antiVirusGlobal ?? true) ? 'ACTIVE' : 'PAUSED'} · Blacklisted: {virusBlacklist.length}
+          </span>
+        </div>
+
+        <div className="divide-y divide-white/[0.06]">
+          {virusBlacklist.length === 0 ? (
+            <div className="py-6 text-center text-xs text-[#8B84AD]">
+              No crash attackers blacklisted. Manage via WhatsApp with <span className="font-mono text-white">.antivirus list</span> or <span className="font-mono text-white">.antivirus unblock</span>.
+            </div>
+          ) : (
+            virusBlacklist.map((entry) => (
+              <div key={entry.jid} className="py-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-0.5 text-xs min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono tabular-nums text-white font-semibold">
+                      +{entry.number || entry.jid}
+                    </span>
+                    <span className="text-[#8B84AD]">·</span>
+                    <span className="font-mono text-rose-300">
+                      {entry.categories.join(', ')}
+                    </span>
+                    <span className="text-[#8B84AD]">·</span>
+                    <span className="font-mono tabular-nums text-[#9E97C2]">
+                      {entry.hits}x · {entry.blockedAt.slice(0, 10)}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-[#9E97C2] truncate max-w-[560px]">
+                    {entry.reason}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleRemoveAntivirusBlacklist(entry.jid)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-emerald-500/20 text-xs text-[#C4BFE0] hover:text-emerald-200 transition-colors cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Unblacklist
                 </button>
               </div>
             ))
