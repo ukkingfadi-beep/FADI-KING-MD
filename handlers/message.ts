@@ -479,7 +479,7 @@ export async function handleIncomingMessage(
     try {
       const explicitDelayMs = Math.min(Math.max(0, cmdTiming.delaySeconds), 60) * 1000;
       const humanPaceMs =
-        cfg.humanDelayEnabled && cfg.humanDelayMaxMs > 0
+        command.name !== 'multimessage' && cfg.humanDelayEnabled && cfg.humanDelayMaxMs > 0
           ? getRandomDelayMs(cfg.humanDelayMinMs, cfg.humanDelayMaxMs)
           : 0;
       const waitMs = Math.max(explicitDelayMs, humanPaceMs);

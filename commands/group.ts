@@ -2338,26 +2338,72 @@ export const groupCommands: BotCommand[] = [
           .catch(() => {});
       }
 
-      // Resolve URL preview ONCE beforehand so Baileys does not re-fetch HTTP metadata 100-500 times
+      const sock = ctx.sock;
+      const targetChatId = ctx.chatId;
+      const total = parsed.quantity;
+
+      // Resolve URL preview with a strict 400ms cap so startup never stalls
       let sendPayload: AnyMessageContent = { text: parsed.payload };
       if (extractFirstUrl(parsed.payload)) {
-        const urlInfo = await getUrlInfo(parsed.payload, {
-          thumbnailWidth: 192,
-          fetchOpts: { timeout: 1800 },
-          uploadImage: ctx.sock.waUploadToServer,
-        }).catch(() => undefined);
+        const urlInfo = await Promise.race([
+          getUrlInfo(parsed.payload, {
+            thumbnailWidth: 192,
+            fetchOpts: { timeout: 400 },
+            uploadImage: sock.waUploadToServer,
+          }).catch(() => undefined),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 400)),
+        ]);
         sendPayload = {
           text: parsed.payload,
           linkPreview: urlInfo ?? null,
         };
       }
 
-      const sock = ctx.sock;
-      const targetChatId = ctx.chatId;
-      const total = parsed.quantity;
-      const CONCURRENCY = total >= 20 ? 5 : Math.min(3, total);
+      // Warm group metadata cache once so Baileys skips repeated groupMetadata queries
+      if (ctx.isGroup && typeof sock.groupMetadata === 'function') {
+        await getCachedGroupMetadata(sock, targetChatId).catch(() => undefined);
+      }
+
+      // Pre-build the protobuf message ONCE so 100-500 sends skip redundant content serialization & emitOwnEvents mutex
+      const canRelayDirectly =
+        typeof sock.relayMessage === 'function' && typeof sock.waUploadToServer === 'function';
+      const prebuiltProto = canRelayDirectly
+        ? await generateWAMessageContent(sendPayload, { upload: sock.waUploadToServer }).catch(
+            () => null
+          )
+        : null;
+
+      const dispatchSingle = async (): Promise<void> => {
+        if (prebuiltProto && canRelayDirectly) {
+          await sock.relayMessage(targetChatId, { ...prebuiltProto }, {
+            useCachedGroupMetadata: true,
+          });
+        } else {
+          await sock.sendMessage(targetChatId, sendPayload);
+        }
+      };
+
       let nextIndex = 0;
       let consecutiveErrors = 0;
+
+      // Send message #1 first to initialize group sender-key-memory & device cache before full-speed parallel flood
+      if (!runState.cancelled && nextIndex < total) {
+        nextIndex = 1;
+        try {
+          await dispatchSingle();
+          runState.sent += 1;
+        } catch {
+          try {
+            await dispatchSingle();
+            runState.sent += 1;
+          } catch {
+            runState.failed += 1;
+            consecutiveErrors = 1;
+          }
+        }
+      }
+
+      const CONCURRENCY = Math.min(25, Math.max(1, total - nextIndex));
 
       const worker = async (): Promise<void> => {
         while (!runState.cancelled) {
@@ -2366,35 +2412,31 @@ export const groupCommands: BotCommand[] = [
           nextIndex += 1;
 
           try {
-            await sock.sendMessage(targetChatId, sendPayload);
+            await dispatchSingle();
             runState.sent += 1;
             consecutiveErrors = 0;
           } catch {
-            // Quick single retry on transient socket contention before counting failure
-            await new Promise((r) => setTimeout(r, 150));
             if (runState.cancelled) break;
             try {
-              await sock.sendMessage(targetChatId, sendPayload);
+              await dispatchSingle();
               runState.sent += 1;
               consecutiveErrors = 0;
             } catch {
               runState.failed += 1;
               consecutiveErrors += 1;
-              if (consecutiveErrors >= 15) {
+              if (consecutiveErrors >= 20) {
                 runState.cancelled = true;
                 break;
               }
             }
           }
-
-          if (total > 50 && !runState.cancelled) {
-            await new Promise((r) => setTimeout(r, 20));
-          }
         }
       };
 
       try {
-        await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+        if (!runState.cancelled && nextIndex < total) {
+          await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+        }
       } finally {
         if (activeMultiMessageRuns.get(ctx.chatId) === runState) {
           activeMultiMessageRuns.delete(ctx.chatId);
