@@ -965,6 +965,36 @@ function isAutomatedBotMessage(msg: WAMessage, senderCandidates: string[]): bool
   return false;
 }
 
+function hasPaymentMessagePayload(message: WAMessage['message'] | undefined | null): boolean {
+  const candidates = [message, unwrapMessage(message)];
+  for (const m of candidates) {
+    if (!m) continue;
+    if (
+      m.requestPaymentMessage ||
+      m.sendPaymentMessage ||
+      m.cancelPaymentRequestMessage ||
+      m.declinePaymentRequestMessage ||
+      m.paymentInviteMessage ||
+      m.orderMessage ||
+      m.invoiceMessage
+    ) {
+      return true;
+    }
+    const buttons = m.interactiveMessage?.nativeFlowMessage?.buttons;
+    if (
+      Array.isArray(buttons) &&
+      buttons.some((b) =>
+        ['payment_info', 'order_details', 'pay_now', 'send_payment', 'review_and_pay'].includes(
+          String(b?.name || '').toLowerCase()
+        )
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function enforceAdvancedGroupGuards(
   sock: WASocket,
   msg: WAMessage,
@@ -984,7 +1014,8 @@ export async function enforceAdvancedGroupGuards(
     Boolean(groupCfg.antiBot) ||
     Boolean(groupCfg.antiForward) ||
     Boolean(groupCfg.antiMedia) ||
-    Boolean(groupCfg.antiSticker);
+    Boolean(groupCfg.antiSticker) ||
+    Boolean(groupCfg.antiPayMsg);
 
   if (!anyGuardEnabled) return false;
 
@@ -1058,6 +1089,22 @@ export async function enforceAdvancedGroupGuards(
           })
           .catch(() => {});
         logger.security('antiBot', `Kicked bot +${senderKey} in ${chatId}`);
+      }
+      return true;
+    }
+
+    // 2b. Anti-PayMsg Check (requestPaymentMessage, sendPaymentMessage, paymentInvite, order, invoice)
+    if (groupCfg.antiPayMsg && hasPaymentMessagePayload(msg.message)) {
+      if (!botIsAdmin) return false;
+      await deleteCurrentMsg();
+      logger.security('antiPayMsg', `Deleted payment message from +${senderKey} in ${chatId}`);
+      if (canSendGuardNotice(`pay:${chatId}:${senderKey}`)) {
+        await sock
+          .sendMessage(chatId, {
+            text: `*Anti-PayMsg Guard*\n@${senderKey}, payment, order, and invoice messages are not allowed in this group.`,
+            mentions: [senderJid],
+          })
+          .catch(() => {});
       }
       return true;
     }

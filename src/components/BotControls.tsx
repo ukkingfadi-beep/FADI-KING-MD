@@ -271,6 +271,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
       | 'antiMedia'
       | 'antiSticker'
       | 'antiBot'
+      | 'antiPayMsg'
       | 'slowModeSeconds',
     value: boolean | number
   ) {
@@ -928,7 +929,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                         AI Chat: {Boolean(g.aiEnabled) ? 'On' : 'Off'}
                       </button>
 
-                      {(['antiAdd', 'antiForward', 'antiMedia', 'antiSticker', 'antiBot'] as const).map(
+                      {(['antiAdd', 'antiForward', 'antiMedia', 'antiSticker', 'antiBot', 'antiPayMsg'] as const).map(
                         (field) => {
                           const labels: Record<typeof field, string> = {
                             antiAdd: 'Anti-Add',
@@ -936,6 +937,7 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                             antiMedia: 'Anti-Media',
                             antiSticker: 'Anti-Sticker',
                             antiBot: 'Anti-Bot',
+                            antiPayMsg: 'Anti-PayMsg',
                           };
                           const active = Boolean(g[field]);
                           return (

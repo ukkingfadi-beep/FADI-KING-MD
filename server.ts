@@ -3,7 +3,7 @@ import path from 'path';
 import express from 'express';
 import JSZip from 'jszip';
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from './config/bot.config.ts';
-import { getAllCommands } from './commands/index.ts';
+import { findCommand, getAllCommands } from './commands/index.ts';
 import {
   applyAlwaysOnlinePresenceAcrossSockets,
   applySingleTickPresenceAcrossSockets,
@@ -647,17 +647,76 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/commands', requireAdmin, (_req, res) => {
-    const commands = getAllCommands().map((c) => ({
-      name: c.name,
-      aliases: c.aliases || [],
-      category: c.category,
-      description: c.description,
-      usage: c.usage,
-      ownerOnly: Boolean(c.ownerOnly),
-      vipOnly: Boolean(c.vipOnly),
-      groupOnly: Boolean(c.groupOnly),
-    }));
+    const timings = vipStore.getCommandTimings();
+    const commands = getAllCommands().map((c) => {
+      const rule = timings[c.name.toLowerCase()];
+      return {
+        name: c.name,
+        aliases: c.aliases || [],
+        category: c.category,
+        description: c.description,
+        usage: c.usage,
+        ownerOnly: Boolean(c.ownerOnly),
+        vipOnly: Boolean(c.vipOnly),
+        groupOnly: Boolean(c.groupOnly),
+        cooldownSeconds: Number(c.cooldownSeconds || 0),
+        delaySeconds: Math.max(0, Math.min(300, Math.floor(Number(rule?.delaySeconds || 0)))),
+        deleteAfterSeconds: Math.max(
+          0,
+          Math.min(86400, Math.floor(Number(rule?.deleteAfterSeconds || 0)))
+        ),
+      };
+    });
     res.json({ ok: true, commands });
+  });
+
+  app.patch('/api/commands/:name/timing', requireAdmin, (req, res) => {
+    const cmd = findCommand(String(req.params.name || '').trim().toLowerCase());
+    if (!cmd) {
+      return res.status(404).json({ ok: false, error: 'Command not found.' });
+    }
+    const patch: { delaySeconds?: number; deleteAfterSeconds?: number } = {};
+    if (req.body?.delaySeconds !== undefined) {
+      const n = Number(req.body.delaySeconds);
+      if (Number.isFinite(n)) patch.delaySeconds = n;
+    }
+    if (req.body?.deleteAfterSeconds !== undefined) {
+      const n = Number(req.body.deleteAfterSeconds);
+      if (Number.isFinite(n)) patch.deleteAfterSeconds = n;
+    }
+    const timing = vipStore.setCommandTiming(cmd.name, patch);
+    logger.info(
+      'commands',
+      `Updated timing for .${cmd.name}: delay=${timing.delaySeconds}s, auto-delete=${timing.deleteAfterSeconds}s`
+    );
+    return res.json({ ok: true, name: cmd.name, timing });
+  });
+
+  app.post('/api/commands/timing/bulk', requireAdmin, (req, res) => {
+    const allNames = getAllCommands().map((c) => c.name.toLowerCase());
+    const allowedSet = new Set(allNames);
+    const requestedNames = Array.isArray(req.body?.names)
+      ? req.body.names
+          .map((n: unknown) => String(n || '').trim().toLowerCase())
+          .filter((n: string) => allowedSet.has(n))
+      : allNames;
+
+    const patch: { delaySeconds?: number; deleteAfterSeconds?: number } = {};
+    if (req.body?.delaySeconds !== undefined) {
+      const n = Number(req.body.delaySeconds);
+      if (Number.isFinite(n)) patch.delaySeconds = n;
+    }
+    if (req.body?.deleteAfterSeconds !== undefined) {
+      const n = Number(req.body.deleteAfterSeconds);
+      if (Number.isFinite(n)) patch.deleteAfterSeconds = n;
+    }
+
+    const timings = vipStore.setBulkCommandTimings(requestedNames, patch);
+    logger.info(
+      'commands',
+      `Bulk updated timing for ${requestedNames.length} command(s): delay=${patch.delaySeconds ?? 'unchanged'}s, auto-delete=${patch.deleteAfterSeconds ?? 'unchanged'}s`
+    );
+    return res.json({ ok: true, count: requestedNames.length, timings });
   });
 
   app.post('/api/commands/execute', requireAdmin, async (req, res) => {
@@ -694,6 +753,7 @@ async function startServer(): Promise<void> {
       antiMedia: typeof req.body?.antiMedia === 'boolean' ? req.body.antiMedia : undefined,
       antiSticker: typeof req.body?.antiSticker === 'boolean' ? req.body.antiSticker : undefined,
       antiBot: typeof req.body?.antiBot === 'boolean' ? req.body.antiBot : undefined,
+      antiPayMsg: typeof req.body?.antiPayMsg === 'boolean' ? req.body.antiPayMsg : undefined,
       slowModeSeconds:
         typeof req.body?.slowModeSeconds === 'number' && Number.isFinite(req.body.slowModeSeconds)
           ? Math.max(0, Math.min(3600, Math.round(req.body.slowModeSeconds)))

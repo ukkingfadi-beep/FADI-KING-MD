@@ -193,6 +193,9 @@ export interface CommandItem {
   ownerOnly: boolean;
   vipOnly: boolean;
   groupOnly: boolean;
+  cooldownSeconds?: number;
+  delaySeconds?: number;
+  deleteAfterSeconds?: number;
 }
 
 export type AntilinkMode = 'off' | 'delete' | 'warn' | 'kick';
@@ -208,6 +211,7 @@ export interface GroupConfig {
   antiMedia?: boolean;
   antiSticker?: boolean;
   antiBot?: boolean;
+  antiPayMsg?: boolean;
   slowModeSeconds?: number;
   aiEnabled?: boolean;
   welcome: boolean;

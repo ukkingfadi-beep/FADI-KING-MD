@@ -347,9 +347,15 @@ export async function handleIncomingMessage(
       return;
     }
 
+    const cmdTiming = vipStore.getCommandTiming(command.name);
+
     // Per-user and per-group anti-spam command cooldowns
     if (!isOwner) {
-      const userCooldownSec = Math.max(cfg.cmdCooldownSeconds, command.cooldownSeconds || 0);
+      const userCooldownSec = Math.max(
+        cfg.cmdCooldownSeconds,
+        command.cooldownSeconds || 0,
+        cmdTiming.delaySeconds || 0
+      );
       const userCd = commandRateLimiter.checkCooldown(
         `cmd-user:${senderNumber}:${command.name}`,
         userCooldownSec
@@ -386,8 +392,63 @@ export async function handleIncomingMessage(
       }
     }
 
+    const trackedSentKeys: Array<{
+      jid: string;
+      key: NonNullable<WAMessage['key']>;
+    }> = [];
+    const shouldAutoDelete = cmdTiming.deleteAfterSeconds > 0;
+    const effectiveSock: WASocket = shouldAutoDelete
+      ? new Proxy(sock, {
+          get(target, prop, receiver) {
+            if (prop === 'sendMessage') {
+              return async (
+                targetJid: string,
+                content: Parameters<WASocket['sendMessage']>[1],
+                options?: Parameters<WASocket['sendMessage']>[2]
+              ) => {
+                const sent = await target.sendMessage(targetJid, content, options);
+                const isMetaAction =
+                  content &&
+                  typeof content === 'object' &&
+                  ('react' in content || 'delete' in content || 'pin' in content);
+                if (!isMetaAction && sent?.key?.id) {
+                  trackedSentKeys.push({
+                    jid: sent.key.remoteJid || targetJid,
+                    key: sent.key,
+                  });
+                }
+                return sent;
+              };
+            }
+            if (prop === 'relayMessage') {
+              return async (
+                targetJid: string,
+                message: Parameters<WASocket['relayMessage']>[1],
+                options: Parameters<WASocket['relayMessage']>[2]
+              ) => {
+                const relayedId = await target.relayMessage(targetJid, message, options);
+                const effectiveId = relayedId || options?.messageId;
+                if (effectiveId) {
+                  trackedSentKeys.push({
+                    jid: targetJid,
+                    key: {
+                      remoteJid: targetJid,
+                      fromMe: true,
+                      id: effectiveId,
+                    },
+                  });
+                }
+                return relayedId;
+              };
+            }
+            const value = Reflect.get(target, prop, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        })
+      : sock;
+
     const ctx: CommandContext = {
-      sock,
+      sock: effectiveSock,
       msg,
       chatId,
       senderJid,
@@ -403,29 +464,59 @@ export async function handleIncomingMessage(
       text,
       isSimulated: false,
       reply: async (replyText: string) => {
-        await sock.sendMessage(chatId, { text: replyText }, { quoted: msg });
+        await effectiveSock.sendMessage(chatId, { text: replyText }, { quoted: msg });
       },
       sendText: async (jid: string, messageText: string) => {
-        await sock.sendMessage(jid, { text: messageText });
+        await effectiveSock.sendMessage(jid, { text: messageText });
       },
       getCachedMessage,
     };
 
     logger.cmd('messageHandler', `${matchedPrefix}${command.name} from +${senderNumber}`);
     try {
-      if (cfg.humanDelayEnabled && cfg.humanDelayMaxMs > 0) {
+      const explicitDelayMs = Math.min(Math.max(0, cmdTiming.delaySeconds), 60) * 1000;
+      const humanPaceMs =
+        cfg.humanDelayEnabled && cfg.humanDelayMaxMs > 0
+          ? getRandomDelayMs(cfg.humanDelayMinMs, cfg.humanDelayMaxMs)
+          : 0;
+      const waitMs = Math.max(explicitDelayMs, humanPaceMs);
+
+      if (waitMs > 0) {
         if (!cfg.singleTick) {
           const presenceMode = command.name === 'tts' ? 'recording' : 'composing';
           void sock.sendPresenceUpdate(presenceMode, chatId).catch(() => {});
         }
-        const paceMs = getRandomDelayMs(cfg.humanDelayMinMs, cfg.humanDelayMaxMs);
-        if (paceMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, paceMs));
-        }
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
       await command.execute(ctx);
-      if (cfg.humanDelayEnabled && !cfg.singleTick) {
+      if (waitMs > 0 && !cfg.singleTick) {
         void sock.sendPresenceUpdate('paused', chatId).catch(() => {});
+      }
+
+      if (shouldAutoDelete && trackedSentKeys.length > 0) {
+        const deduped = new Map<
+          string,
+          { jid: string; key: NonNullable<WAMessage['key']> }
+        >();
+        for (const item of trackedSentKeys) {
+          if (item.key?.id) {
+            deduped.set(`${item.jid}:${item.key.id}`, item);
+          }
+        }
+        const toDelete = Array.from(deduped.values());
+        if (toDelete.length > 0) {
+          const timer = setTimeout(() => {
+            void (async () => {
+              for (const item of toDelete) {
+                if (item.key.id) {
+                  vipStore.removeProtectedPost(item.jid, item.key.id);
+                }
+                await sock.sendMessage(item.jid, { delete: item.key }).catch(() => {});
+              }
+            })();
+          }, cmdTiming.deleteAfterSeconds * 1000);
+          if (typeof timer.unref === 'function') timer.unref();
+        }
       }
     } catch (cmdErr) {
       const errText = (cmdErr as Error).message || 'Unexpected error';

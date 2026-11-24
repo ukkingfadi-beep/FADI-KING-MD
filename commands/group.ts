@@ -1267,7 +1267,8 @@ export const groupCommands: BotCommand[] = [
         `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'} | Anti-Add: ${cfg.antiAdd ? 'ON' : 'OFF'}`,
         `• Anti-Forward: ${cfg.antiForward ? 'ON' : 'OFF'} | Anti-Media: ${cfg.antiMedia ? 'ON' : 'OFF'}`,
         `• Anti-Sticker: ${cfg.antiSticker ? 'ON' : 'OFF'} | Anti-Bot: ${cfg.antiBot ? 'ON' : 'OFF'}`,
-        `• Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'} | Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
+        `• Anti-PayMsg: ${cfg.antiPayMsg ? 'ON' : 'OFF'} | Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'}`,
+        `• Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
         `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Welcome Card: ${cfg.welcomeImg ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
         ...(meta.desc ? ['', `*Description:*\n${meta.desc.slice(0, 300)}`] : []),
       ].join('\n');
@@ -1757,6 +1758,22 @@ export const groupCommands: BotCommand[] = [
       ),
   },
   {
+    name: 'antipaymsg',
+    aliases: ['antipay', 'antipaylock', 'nopaymsg'],
+    category: 'group',
+    description: 'Group mein non-admins ke payment request, pay message, order aur invoice auto-delete kare',
+    usage: 'antipaymsg <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiPayMsg',
+        'Anti-PayMsg Guard',
+        'Payment requests, payment cards, orders, and invoice messages from non-admins will be automatically deleted.'
+      ),
+  },
+  {
     name: 'muteuser',
     aliases: ['silence', 'timeout'],
     category: 'group',
@@ -2216,7 +2233,7 @@ export const groupCommands: BotCommand[] = [
         `• AI Chat: *OFF* | Welcome / Card / Goodbye: *OFF*`,
         `• Antilink / Antidelete / Slow Mode: *OFF*`,
         `• Anti-Add / Anti-Forward / Anti-Media / Anti-Sticker: *OFF*`,
-        `• Anti-Bot / Anti-Admin / Anti-KickAll: *OFF*`,
+        `• Anti-Bot / Anti-PayMsg / Anti-Admin / Anti-KickAll: *OFF*`,
         `• Anti-Scam: *${reset.antiScam ? 'ON (Global Default)' : 'OFF'}* | Anti-Mention: *${reset.antiStatusMention ? 'ON (Global Default)' : 'OFF'}*`,
         `• Warnings & Mutes: *Cleared*`,
       ].join('\n');
@@ -2286,6 +2303,7 @@ async function togglePerGroupProtection(
     | 'antiMedia'
     | 'antiSticker'
     | 'antiBot'
+    | 'antiPayMsg'
     | 'antiAdmin'
     | 'antiKickAll'
     | 'welcomeImg',

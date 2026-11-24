@@ -59,6 +59,7 @@ export interface GroupConfig {
   antiMedia?: boolean;
   antiSticker?: boolean;
   antiBot?: boolean;
+  antiPayMsg?: boolean;
   antiAdmin?: boolean;
   antiKickAll?: boolean;
   slowModeSeconds?: number;
@@ -69,6 +70,11 @@ export interface GroupConfig {
   goodbye: boolean;
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
+}
+
+export interface CommandTimingRule {
+  delaySeconds: number;
+  deleteAfterSeconds: number;
 }
 
 export interface BannedUserEntry {
@@ -125,6 +131,7 @@ let bannedStickersCache: BannedStickerEntry[] | null = null;
 let bannedUsersCache: BannedUserEntry[] | null = null;
 let protectedPostsCache: Record<string, ProtectedPostEntry> | null = null;
 let afkUsersCache: Record<string, AfkUserEntry> | null = null;
+let commandTimingsCache: Record<string, CommandTimingRule> | null = null;
 
 registerDbHydrationHook(() => {
   vipsCache = null;
@@ -135,6 +142,7 @@ registerDbHydrationHook(() => {
   bannedUsersCache = null;
   protectedPostsCache = null;
   afkUsersCache = null;
+  commandTimingsCache = null;
 });
 
 function readStoreKey<T>(key: string, legacyPath: string, fallback: T): T {
@@ -541,6 +549,7 @@ export const vipStore = {
         antiMedia: false,
         antiSticker: false,
         antiBot: false,
+        antiPayMsg: false,
         antiAdmin: false,
         antiKickAll: false,
         slowModeSeconds: 0,
@@ -565,6 +574,7 @@ export const vipStore = {
       antiMedia: Boolean(found.antiMedia),
       antiSticker: Boolean(found.antiSticker),
       antiBot: Boolean(found.antiBot),
+      antiPayMsg: Boolean(found.antiPayMsg),
       antiAdmin: Boolean(found.antiAdmin),
       antiKickAll: Boolean(found.antiKickAll),
       slowModeSeconds: Math.max(0, Number(found.slowModeSeconds || 0)),
@@ -592,6 +602,7 @@ export const vipStore = {
       antiMedia: Boolean(g.antiMedia),
       antiSticker: Boolean(g.antiSticker),
       antiBot: Boolean(g.antiBot),
+      antiPayMsg: Boolean(g.antiPayMsg),
       antiAdmin: Boolean(g.antiAdmin),
       antiKickAll: Boolean(g.antiKickAll),
       slowModeSeconds: Math.max(0, Number(g.slowModeSeconds || 0)),
@@ -633,6 +644,7 @@ export const vipStore = {
     if (typeof patch.antiMedia === 'boolean') cleanPatch.antiMedia = patch.antiMedia;
     if (typeof patch.antiSticker === 'boolean') cleanPatch.antiSticker = patch.antiSticker;
     if (typeof patch.antiBot === 'boolean') cleanPatch.antiBot = patch.antiBot;
+    if (typeof patch.antiPayMsg === 'boolean') cleanPatch.antiPayMsg = patch.antiPayMsg;
     if (typeof patch.antiAdmin === 'boolean') cleanPatch.antiAdmin = patch.antiAdmin;
     if (typeof patch.antiKickAll === 'boolean') cleanPatch.antiKickAll = patch.antiKickAll;
     if (typeof patch.slowModeSeconds === 'number' && Number.isFinite(patch.slowModeSeconds)) {
@@ -672,6 +684,7 @@ export const vipStore = {
       antiMedia: false,
       antiSticker: false,
       antiBot: false,
+      antiPayMsg: false,
       antiAdmin: false,
       antiKickAll: false,
       slowModeSeconds: 0,
@@ -790,6 +803,18 @@ export const vipStore = {
     return entry;
   },
 
+  removeProtectedPost(chatId: string, msgId: string): void {
+    if (!msgId || !chatId) return;
+    if (!protectedPostsCache) {
+      protectedPostsCache = dbGetSync<Record<string, ProtectedPostEntry>>('protected_posts') || {};
+    }
+    const key = `${chatId}:${msgId}`;
+    if (protectedPostsCache[key]) {
+      delete protectedPostsCache[key];
+      dbSetSync('protected_posts', protectedPostsCache);
+    }
+  },
+
   setAfkUser(input: { number: string; jid: string; name: string; reason: string }): AfkUserEntry {
     if (!afkUsersCache) {
       afkUsersCache = dbGetSync<Record<string, AfkUserEntry>>('afk_users') || {};
@@ -901,5 +926,84 @@ export const vipStore = {
     bannedUsersCache = list;
     dbSetSync('banned_users', list);
     return match;
+  },
+
+  getCommandTimings(): Record<string, CommandTimingRule> {
+    if (!commandTimingsCache) {
+      const fromDb = dbGetSync<Record<string, CommandTimingRule>>('command_timings') || {};
+      commandTimingsCache = fromDb && typeof fromDb === 'object' ? { ...fromDb } : {};
+    }
+    return { ...commandTimingsCache };
+  },
+
+  getCommandTiming(commandName: string): CommandTimingRule {
+    const key = String(commandName || '').trim().toLowerCase();
+    if (!key) return { delaySeconds: 0, deleteAfterSeconds: 0 };
+    const map = this.getCommandTimings();
+    const rule = map[key];
+    return {
+      delaySeconds: Math.max(0, Math.min(300, Math.floor(Number(rule?.delaySeconds || 0)))),
+      deleteAfterSeconds: Math.max(
+        0,
+        Math.min(86400, Math.floor(Number(rule?.deleteAfterSeconds || 0)))
+      ),
+    };
+  },
+
+  setCommandTiming(
+    commandName: string,
+    patch: Partial<CommandTimingRule>
+  ): CommandTimingRule {
+    const key = String(commandName || '').trim().toLowerCase();
+    const map = this.getCommandTimings();
+    const current = this.getCommandTiming(key);
+    const delaySeconds =
+      typeof patch.delaySeconds === 'number' && Number.isFinite(patch.delaySeconds)
+        ? Math.max(0, Math.min(300, Math.floor(patch.delaySeconds)))
+        : current.delaySeconds;
+    const deleteAfterSeconds =
+      typeof patch.deleteAfterSeconds === 'number' && Number.isFinite(patch.deleteAfterSeconds)
+        ? Math.max(0, Math.min(86400, Math.floor(patch.deleteAfterSeconds)))
+        : current.deleteAfterSeconds;
+    const next: CommandTimingRule = { delaySeconds, deleteAfterSeconds };
+    if (key) {
+      if (next.delaySeconds === 0 && next.deleteAfterSeconds === 0) {
+        delete map[key];
+      } else {
+        map[key] = next;
+      }
+      commandTimingsCache = map;
+      dbSetSync('command_timings', map);
+    }
+    return next;
+  },
+
+  setBulkCommandTimings(
+    commandNames: string[],
+    patch: Partial<CommandTimingRule>
+  ): Record<string, CommandTimingRule> {
+    const map = this.getCommandTimings();
+    for (const raw of commandNames) {
+      const key = String(raw || '').trim().toLowerCase();
+      if (!key) continue;
+      const current = map[key] || { delaySeconds: 0, deleteAfterSeconds: 0 };
+      const delaySeconds =
+        typeof patch.delaySeconds === 'number' && Number.isFinite(patch.delaySeconds)
+          ? Math.max(0, Math.min(300, Math.floor(patch.delaySeconds)))
+          : Math.max(0, Math.min(300, Math.floor(Number(current.delaySeconds || 0))));
+      const deleteAfterSeconds =
+        typeof patch.deleteAfterSeconds === 'number' && Number.isFinite(patch.deleteAfterSeconds)
+          ? Math.max(0, Math.min(86400, Math.floor(patch.deleteAfterSeconds)))
+          : Math.max(0, Math.min(86400, Math.floor(Number(current.deleteAfterSeconds || 0))));
+
+      if (delaySeconds === 0 && deleteAfterSeconds === 0) {
+        delete map[key];
+      } else {
+        map[key] = { delaySeconds, deleteAfterSeconds };
+      }
+    }
+    commandTimingsCache = map;
+    dbSetSync('command_timings', map);
+    return { ...map };
   },
 };
