@@ -356,6 +356,14 @@ export interface LiveChatMessageItem {
     | 'poll'
     | 'payment'
     | 'other';
+  mimetype?: string;
+  fileName?: string;
+  hasMedia?: boolean;
+  ptt?: boolean;
+  seconds?: number;
+  locationLat?: number;
+  locationLng?: number;
+  locationName?: string;
   timestamp: number;
   key?: {
     remoteJid: string;
@@ -363,6 +371,23 @@ export interface LiveChatMessageItem {
     fromMe: boolean;
     participant?: string;
   };
+}
+
+export interface LiveStatusItem {
+  id: string;
+  mediaType: 'image' | 'video' | 'audio' | 'text';
+  caption?: string;
+  textBody?: string;
+  backgroundArgb?: number;
+  mimetype?: string;
+  ptt?: boolean;
+  seconds?: number;
+  senderPhone: string;
+  senderJid: string;
+  pushName: string;
+  timestampMs: number;
+  hasBuffer: boolean;
+  sessionKeys: string[];
 }
 
 export interface LiveGroupParticipantItem {

@@ -776,7 +776,7 @@ function computePcmWaveformAndSeconds(pcmBuffer: Buffer, sampleRate = 8000): {
 
 export async function convertAudioPartsToWhatsAppVoice(
   audioParts: Buffer[],
-  inputExt: 'mp3' | 'wav' = 'mp3'
+  inputExt: 'mp3' | 'wav' | 'webm' | 'ogg' | 'm4a' | 'bin' = 'mp3'
 ): Promise<{
   buffer: Buffer;
   seconds: number;
@@ -853,6 +853,29 @@ export async function convertAudioPartsToWhatsAppVoice(
 export async function convertAudioToOggOpus(mp3Buffer: Buffer): Promise<Buffer> {
   const res = await convertAudioPartsToWhatsAppVoice([mp3Buffer]);
   return res.buffer;
+}
+
+export async function convertWebAudioToWhatsAppVoice(
+  audioBuffer: Buffer,
+  mimeType?: string
+): Promise<{
+  buffer: Buffer;
+  seconds: number;
+  waveform: Uint8Array;
+}> {
+  const mt = String(mimeType || '').toLowerCase();
+  const ext: 'mp3' | 'wav' | 'webm' | 'ogg' | 'm4a' | 'bin' = mt.includes('webm')
+    ? 'webm'
+    : mt.includes('ogg') || mt.includes('opus')
+      ? 'ogg'
+      : mt.includes('wav')
+        ? 'wav'
+        : mt.includes('mp4') || mt.includes('m4a') || mt.includes('aac')
+          ? 'm4a'
+          : mt.includes('mpeg') || mt.includes('mp3')
+            ? 'mp3'
+            : 'bin';
+  return convertAudioPartsToWhatsAppVoice([audioBuffer], ext);
 }
 
 export async function synthesizeTtsVoiceNote(

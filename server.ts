@@ -10,20 +10,26 @@ import {
   closeAllSocketsGracefully,
   deleteSessionLiveMessage,
   disconnectMainBot,
+  downloadSessionChatMedia,
   executeSessionAccountAction,
   executeSessionGroupAction,
   getBotSnapshot,
   getLiveControlOverview,
+  getLiveStatusMedia,
   getPreferredActiveSocket,
   getSessionChatHistory,
   getSessionChatsOverview,
   getSessionGroupDetail,
   initializeSavedSessionOnBoot,
+  listLiveStatuses,
+  postSessionLiveStatus,
   requestVipSubPairingCode,
   resolveNewsletterMetadataFromActiveSockets,
   restartMainBot,
   sendDashboardBroadcast,
+  sendSessionLiveMedia,
   sendSessionLiveMessage,
+  shareLiveItemToChat,
   startMainBot,
   syncAutoJoinsAcrossConnectedSessions,
 } from './handlers/connection.ts';
@@ -1087,6 +1093,152 @@ async function startServer(): Promise<void> {
           : req.body?.presence === 'available'
             ? 'available'
             : undefined,
+    });
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  const sendSafeMediaBuffer = (
+    req: express.Request,
+    res: express.Response,
+    buffer: Buffer,
+    rawMime: string,
+    fileName: string,
+    forceDownload: boolean
+  ) => {
+    const cleanMime = String(rawMime || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+    const isUnsafeInline =
+      cleanMime.includes('html') ||
+      cleanMime.includes('svg') ||
+      cleanMime.includes('javascript') ||
+      cleanMime.includes('xml');
+    const safeMime = isUnsafeInline ? 'application/octet-stream' : rawMime || 'application/octet-stream';
+    const safeName = encodeURIComponent(fileName || 'whatsapp-media.bin').replace(
+      /['()*]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    if (forceDownload || isUnsafeInline) {
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName.replace(/"/g, '')}"; filename*=UTF-8''${safeName}`
+      );
+    }
+
+    const total = buffer.length;
+    const rangeHeader = req.headers.range;
+    if (rangeHeader && typeof rangeHeader === 'string' && rangeHeader.startsWith('bytes=')) {
+      const parts = rangeHeader.replace(/bytes=/, '').split('-');
+      const start = Math.max(0, parseInt(parts[0], 10) || 0);
+      const end = parts[1] ? Math.min(total - 1, parseInt(parts[1], 10)) : total - 1;
+      if (start < total && end >= start) {
+        const chunk = buffer.subarray(start, end + 1);
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', chunk.length);
+        res.setHeader('Content-Type', safeMime);
+        return res.end(chunk);
+      }
+    }
+
+    res.setHeader('Content-Length', total);
+    res.setHeader('Content-Type', safeMime);
+    return res.end(buffer);
+  };
+
+  app.get('/api/live-chat/sessions/:sessionId/media', requireAdmin, async (req, res) => {
+    const chatId = String(req.query?.chatId || '').trim();
+    const msgId = String(req.query?.msgId || '').trim();
+    const forceDownload = req.query?.download === '1' || req.query?.download === 'true';
+    const result = await downloadSessionChatMedia(req.params.sessionId, chatId, msgId);
+    if (!result.ok || !result.buffer) {
+      return res.status(404).json({ ok: false, error: result.error || 'Media unavailable.' });
+    }
+    return sendSafeMediaBuffer(
+      req,
+      res,
+      result.buffer,
+      result.mimetype || 'application/octet-stream',
+      result.fileName || 'whatsapp-media.bin',
+      forceDownload
+    );
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/send-media', requireAdmin, async (req, res) => {
+    const target = String(req.body?.target || '').trim();
+    const base64Data = String(req.body?.base64Data || '');
+    const mimeType = String(req.body?.mimeType || 'application/octet-stream');
+    const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
+    const caption = typeof req.body?.caption === 'string' ? req.body.caption : undefined;
+    const asVoiceNote = Boolean(req.body?.asVoiceNote);
+    if (!target || !base64Data) {
+      return res.status(400).json({ ok: false, error: 'target and base64Data are required.' });
+    }
+    const result = await sendSessionLiveMedia(req.params.sessionId, target, {
+      base64Data,
+      mimeType,
+      fileName,
+      caption,
+      asVoiceNote,
+    });
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/share', requireAdmin, async (req, res) => {
+    const target = String(req.body?.target || '').trim();
+    if (!target) {
+      return res.status(400).json({ ok: false, error: 'Target chat or phone number is required.' });
+    }
+    const result = await shareLiveItemToChat(req.params.sessionId, target, {
+      statusId: typeof req.body?.statusId === 'string' ? req.body.statusId : undefined,
+      sourceSessionId:
+        typeof req.body?.sourceSessionId === 'string' ? req.body.sourceSessionId : undefined,
+      sourceChatId:
+        typeof req.body?.sourceChatId === 'string' ? req.body.sourceChatId : undefined,
+      sourceMsgId: typeof req.body?.sourceMsgId === 'string' ? req.body.sourceMsgId : undefined,
+      caption: typeof req.body?.caption === 'string' ? req.body.caption : undefined,
+      text: typeof req.body?.text === 'string' ? req.body.text : undefined,
+    });
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.get('/api/live-chat/statuses', requireAdmin, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const sessionId =
+      typeof req.query?.sessionId === 'string' ? req.query.sessionId.trim() : undefined;
+    const data = listLiveStatuses(sessionId || undefined);
+    res.json({ ok: true, ...data });
+  });
+
+  app.get('/api/live-chat/statuses/:statusId/media', requireAdmin, async (req, res) => {
+    const sessionId =
+      typeof req.query?.sessionId === 'string' ? req.query.sessionId.trim() : undefined;
+    const forceDownload = req.query?.download === '1' || req.query?.download === 'true';
+    const result = await getLiveStatusMedia(req.params.statusId, sessionId || undefined);
+    if (!result.ok || !result.buffer) {
+      return res.status(404).json({ ok: false, error: result.error || 'Status media unavailable.' });
+    }
+    return sendSafeMediaBuffer(
+      req,
+      res,
+      result.buffer,
+      result.mimetype || 'application/octet-stream',
+      result.fileName || 'whatsapp-status.bin',
+      forceDownload
+    );
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/post-status', requireAdmin, async (req, res) => {
+    const result = await postSessionLiveStatus(req.params.sessionId, {
+      text: typeof req.body?.text === 'string' ? req.body.text : undefined,
+      base64Data: typeof req.body?.base64Data === 'string' ? req.body.base64Data : undefined,
+      mimeType: typeof req.body?.mimeType === 'string' ? req.body.mimeType : undefined,
+      caption: typeof req.body?.caption === 'string' ? req.body.caption : undefined,
+      backgroundColor:
+        typeof req.body?.backgroundColor === 'string' ? req.body.backgroundColor : undefined,
     });
     return res.status(result.ok ? 200 : 400).json(result);
   });

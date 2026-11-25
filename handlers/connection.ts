@@ -61,6 +61,8 @@ import {
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
 import {
+  convertWebAudioToWhatsAppVoice,
+  downloadMessageMedia,
   getUnavailableViewOnceRecord,
   precacheViewOnceMedia,
   recordUnavailableViewOnceKey,
@@ -69,7 +71,15 @@ import {
 } from '../utils/mediaHelper.ts';
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { startReminderScheduler } from '../utils/reminderStore.ts';
-import { hasGroupStatusMedia, recordBroadcastStatus } from '../utils/statusStore.ts';
+import {
+  getOrDownloadStatusBuffer,
+  getStatusById,
+  hasGroupStatusMedia,
+  listStatusesForDashboard,
+  recordBroadcastStatus,
+  type CachedStatusEntry,
+  type DashboardStatusItem,
+} from '../utils/statusStore.ts';
 import { vipStore, type GroupConfig, type VipTier } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
 import { handleIncomingMessage } from './message.ts';
@@ -578,35 +588,141 @@ async function handleIncomingCalls(
   }
 }
 
-function detectLiveMediaSummary(
-  message: WAMessage['message']
-): { mediaType: LiveChatMediaType; displayText: string } {
+interface LiveMediaSummary {
+  mediaType: LiveChatMediaType;
+  displayText: string;
+  mimetype?: string;
+  fileName?: string;
+  hasMedia?: boolean;
+  ptt?: boolean;
+  seconds?: number;
+  locationLat?: number;
+  locationLng?: number;
+  locationName?: string;
+}
+
+const liveMediaBufferCache = new Map<
+  string,
+  { buffer: Buffer; mimetype: string; fileName: string; cachedAt: number }
+>();
+
+function cacheLiveMediaBuffer(
+  cacheKey: string,
+  buffer: Buffer,
+  mimetype: string,
+  fileName: string
+): void {
+  if (!cacheKey || !buffer || buffer.length === 0 || buffer.length > 16 * 1024 * 1024) return;
+  liveMediaBufferCache.delete(cacheKey);
+  liveMediaBufferCache.set(cacheKey, {
+    buffer,
+    mimetype,
+    fileName,
+    cachedAt: Date.now(),
+  });
+  let totalBytes = 0;
+  for (const item of liveMediaBufferCache.values()) {
+    totalBytes += item.buffer.length;
+  }
+  while (liveMediaBufferCache.size > 40 || totalBytes > 42 * 1024 * 1024) {
+    const oldestKey = liveMediaBufferCache.keys().next().value;
+    if (!oldestKey) break;
+    const evicted = liveMediaBufferCache.get(oldestKey);
+    totalBytes -= evicted?.buffer.length || 0;
+    liveMediaBufferCache.delete(oldestKey);
+  }
+}
+
+function sanitizeDownloadFilename(name: string, fallbackExt = 'bin'): string {
+  const cleaned = String(name || '')
+    .replace(/[/\\?%*:|"<>]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cleaned) return cleaned.slice(0, 120);
+  return `whatsapp-media.${fallbackExt}`;
+}
+
+function extensionFromMime(mime: string): string {
+  const m = String(mime || '').toLowerCase().split(';')[0].trim();
+  if (m === 'image/jpeg' || m === 'image/jpg') return 'jpg';
+  if (m === 'image/png') return 'png';
+  if (m === 'image/webp') return 'webp';
+  if (m === 'image/gif') return 'gif';
+  if (m === 'video/mp4') return 'mp4';
+  if (m === 'video/webm') return 'webm';
+  if (m === 'audio/ogg' || m === 'application/ogg') return 'ogg';
+  if (m === 'audio/mpeg') return 'mp3';
+  if (m === 'audio/mp4' || m === 'audio/aac') return 'm4a';
+  if (m === 'audio/wav') return 'wav';
+  if (m === 'application/pdf') return 'pdf';
+  if (m.includes('zip')) return 'zip';
+  return 'bin';
+}
+
+function detectLiveMediaSummary(message: WAMessage['message']): LiveMediaSummary {
   const inner = unwrapMessage(message);
   if (!inner) return { mediaType: 'other', displayText: '' };
 
   const text = extractBodyText(message).trim();
   if (inner.imageMessage) {
-    return { mediaType: 'image', displayText: text ? `[Photo] ${text}` : '[Photo]' };
+    return {
+      mediaType: 'image',
+      displayText: text || '[Photo]',
+      mimetype: inner.imageMessage.mimetype || 'image/jpeg',
+      hasMedia: true,
+    };
   }
   if (inner.videoMessage || inner.ptvMessage) {
-    return { mediaType: 'video', displayText: text ? `[Video] ${text}` : '[Video]' };
+    const v = inner.videoMessage || inner.ptvMessage;
+    return {
+      mediaType: 'video',
+      displayText: text || '[Video]',
+      mimetype: v?.mimetype || 'video/mp4',
+      seconds: v?.seconds ?? undefined,
+      hasMedia: true,
+    };
   }
   if (inner.audioMessage) {
-    const label = inner.audioMessage.ptt ? '[Voice Note]' : '[Audio]';
-    return { mediaType: 'audio', displayText: text ? `${label} ${text}` : label };
+    const isPtt = Boolean(inner.audioMessage.ptt);
+    return {
+      mediaType: 'audio',
+      displayText: text || (isPtt ? '[Voice Note]' : '[Audio]'),
+      mimetype: inner.audioMessage.mimetype || 'audio/ogg; codecs=opus',
+      ptt: isPtt,
+      seconds: inner.audioMessage.seconds ?? undefined,
+      hasMedia: true,
+    };
   }
   if (inner.stickerMessage) {
-    return { mediaType: 'sticker', displayText: '[Sticker]' };
+    return {
+      mediaType: 'sticker',
+      displayText: '[Sticker]',
+      mimetype: inner.stickerMessage.mimetype || 'image/webp',
+      hasMedia: true,
+    };
   }
   if (inner.documentMessage) {
     const fileName = inner.documentMessage.fileName || 'Document';
     return {
       mediaType: 'document',
-      displayText: text ? `[File: ${fileName}] ${text}` : `[File: ${fileName}]`,
+      displayText: text || fileName,
+      mimetype: inner.documentMessage.mimetype || 'application/octet-stream',
+      fileName,
+      hasMedia: true,
     };
   }
   if (inner.locationMessage || inner.liveLocationMessage) {
-    return { mediaType: 'location', displayText: text || '[Shared Location]' };
+    const loc = inner.locationMessage || inner.liveLocationMessage;
+    const lat = typeof loc?.degreesLatitude === 'number' ? loc.degreesLatitude : undefined;
+    const lng = typeof loc?.degreesLongitude === 'number' ? loc.degreesLongitude : undefined;
+    const locName = inner.locationMessage?.name || inner.locationMessage?.address || undefined;
+    return {
+      mediaType: 'location',
+      displayText: text || locName || '[Shared Location]',
+      locationLat: lat,
+      locationLng: lng,
+      locationName: locName,
+    };
   }
   if (inner.contactMessage || inner.contactsArrayMessage) {
     const cName = inner.contactMessage?.displayName || 'Contact';
@@ -642,8 +758,8 @@ async function recordSocketMessageToLiveStore(
     const chatId = normalizeBareJid(rawChatId);
     if (!chatId || chatId === 'status@broadcast') return;
 
-    const { mediaType, displayText } = detectLiveMediaSummary(msg.message);
-    if (!displayText) return;
+    const mediaSummary = detectLiveMediaSummary(msg.message);
+    if (!mediaSummary.displayText) return;
 
     const isGroup = chatId.endsWith('@g.us');
     const fromMe = Boolean(msg.key?.fromMe);
@@ -683,8 +799,16 @@ async function recordSocketMessageToLiveStore(
       senderNumber: senderNumber || normalizePhone(jidUserPart(chatId)),
       senderName,
       fromMe,
-      text: displayText,
-      mediaType,
+      text: mediaSummary.displayText,
+      mediaType: mediaSummary.mediaType,
+      mimetype: mediaSummary.mimetype,
+      fileName: mediaSummary.fileName,
+      hasMedia: mediaSummary.hasMedia,
+      ptt: mediaSummary.ptt,
+      seconds: mediaSummary.seconds,
+      locationLat: mediaSummary.locationLat,
+      locationLng: mediaSummary.locationLng,
+      locationName: mediaSummary.locationName,
       timestamp,
       key: msg.key?.id
         ? {
@@ -709,7 +833,7 @@ async function processSocketUpsertMessages(
   for (const msg of messages) {
     try {
       if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
-        void recordBroadcastStatus(sock, msg);
+        void recordBroadcastStatus(sock, msg, sessionKey);
       }
       if (
         msg.key?.id &&
@@ -761,7 +885,7 @@ function processSocketMessageUpdates(
           }
         }
         if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
-          void recordBroadcastStatus(sock, synthetic);
+          void recordBroadcastStatus(sock, synthetic, sessionKey);
         }
         cacheMessage(synthetic);
         void precacheViewOnceMedia(sock, synthetic);
@@ -1116,7 +1240,7 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
             }
           }
           if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
-            void recordBroadcastStatus(sock, msg);
+            void recordBroadcastStatus(sock, msg, 'main');
           }
           cacheMessage(msg);
           void precacheViewOnceMedia(sock, msg);
@@ -1469,7 +1593,7 @@ async function connectSubSession(params: {
           }
         }
         if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
-          void recordBroadcastStatus(sock, m);
+          void recordBroadcastStatus(sock, m, sessionId);
         }
         cacheMessage(m);
         void precacheViewOnceMedia(sock, m);
@@ -2746,5 +2870,473 @@ export async function executeSessionAccountAction(
     return { ok: false, error: 'Unsupported account control action.' };
   } catch (err) {
     return { ok: false, error: (err as Error).message || 'Session action failed.' };
+  }
+}
+
+export async function downloadSessionChatMedia(
+  sessionId: string,
+  chatId: string,
+  msgId: string
+): Promise<{
+  ok: boolean;
+  error?: string;
+  buffer?: Buffer;
+  mimetype?: string;
+  fileName?: string;
+}> {
+  const cleanChatId = normalizeBareJid(chatId);
+  const cleanMsgId = String(msgId || '').trim();
+  if (!cleanChatId || !cleanMsgId) {
+    return { ok: false, error: 'chatId and msgId are required.' };
+  }
+
+  const cacheKey = `${cleanChatId}:${cleanMsgId}`;
+  const cachedBuf = liveMediaBufferCache.get(cacheKey);
+  if (cachedBuf && cachedBuf.buffer.length > 0) {
+    return {
+      ok: true,
+      buffer: cachedBuf.buffer,
+      mimetype: cachedBuf.mimetype,
+      fileName: cachedBuf.fileName,
+    };
+  }
+
+  const cachedMsg = getCachedMessage(cleanChatId, cleanMsgId);
+  if (!cachedMsg || !cachedMsg.message) {
+    return {
+      ok: false,
+      error: 'Media payload is no longer in live cache (only active session media can be downloaded).',
+    };
+  }
+
+  const { sock } = getLiveSessionSocket(sessionId);
+  const activeSock = sock || getPreferredActiveSocket();
+  if (!activeSock) {
+    return { ok: false, error: 'No active WhatsApp socket available to decrypt media.' };
+  }
+
+  try {
+    const summary = detectLiveMediaSummary(cachedMsg.message);
+    const buffer = await downloadMessageMedia(activeSock, cachedMsg);
+    if (!buffer || buffer.length === 0) {
+      return { ok: false, error: 'Downloaded media buffer is empty.' };
+    }
+    const mimetype = summary.mimetype || 'application/octet-stream';
+    const ext = extensionFromMime(mimetype);
+    const fileName = sanitizeDownloadFilename(
+      summary.fileName || `chat_${cleanMsgId.slice(-8)}.${ext}`,
+      ext
+    );
+    cacheLiveMediaBuffer(cacheKey, buffer, mimetype, fileName);
+    return { ok: true, buffer, mimetype, fileName };
+  } catch (err) {
+    return {
+      ok: false,
+      error: (err as Error).message || 'Failed to download media from WhatsApp.',
+    };
+  }
+}
+
+export async function sendSessionLiveMedia(
+  sessionId: string,
+  targetJidOrPhone: string,
+  payload: {
+    base64Data: string;
+    mimeType: string;
+    fileName?: string;
+    caption?: string;
+    asVoiceNote?: boolean;
+  }
+): Promise<{ ok: boolean; error?: string; chatId?: string; message?: LiveChatMessage }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+
+  let targetJid = String(targetJidOrPhone || '').trim();
+  if (!targetJid.includes('@')) {
+    const cleanPhone = normalizePhone(targetJid);
+    if (!isValidPhone(cleanPhone)) {
+      return { ok: false, error: 'Enter a valid WhatsApp phone number or JID.' };
+    }
+    targetJid = `${cleanPhone}@s.whatsapp.net`;
+  } else {
+    targetJid = normalizeBareJid(targetJid);
+  }
+
+  const rawData = String(payload?.base64Data || '').trim();
+  const base64Clean = rawData.includes(',') ? rawData.split(',').slice(1).join(',') : rawData;
+  if (!base64Clean) {
+    return { ok: false, error: 'Empty media payload.' };
+  }
+
+  const rawBuffer = Buffer.from(base64Clean, 'base64');
+  if (!rawBuffer || rawBuffer.length === 0) {
+    return { ok: false, error: 'Invalid base64 media payload.' };
+  }
+  if (rawBuffer.length > 24 * 1024 * 1024) {
+    return { ok: false, error: 'Media exceeds 24 MB size limit.' };
+  }
+
+  const cleanMime = String(payload.mimeType || 'application/octet-stream')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  const caption = String(payload.caption || '').trim();
+  const safeFileName = sanitizeDownloadFilename(
+    payload.fileName || `attachment.${extensionFromMime(cleanMime)}`,
+    extensionFromMime(cleanMime)
+  );
+
+  try {
+    let sent: WAMessage | undefined;
+    let finalBuffer: Buffer = rawBuffer;
+    let finalMime = cleanMime;
+    let finalMediaType: LiveChatMediaType = 'document';
+    let finalSeconds: number | undefined;
+    let isPtt = false;
+    let displayText = caption || safeFileName;
+
+    if (payload.asVoiceNote) {
+      const converted = await convertWebAudioToWhatsAppVoice(rawBuffer, payload.mimeType || cleanMime);
+      finalBuffer = converted.buffer;
+      finalMime = 'audio/ogg; codecs=opus';
+      finalMediaType = 'audio';
+      finalSeconds = converted.seconds;
+      isPtt = true;
+      displayText = '[Voice Note]';
+      sent = await sock.sendMessage(targetJid, {
+        audio: converted.buffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+        ...(typeof converted.seconds === 'number' ? { seconds: converted.seconds } : {}),
+        ...(converted.waveform ? { waveform: converted.waveform } : {}),
+      } as Parameters<typeof sock.sendMessage>[1]);
+    } else if (cleanMime.startsWith('image/')) {
+      finalMediaType = 'image';
+      displayText = caption || '[Photo]';
+      sent = await sock.sendMessage(targetJid, {
+        image: rawBuffer,
+        mimetype: cleanMime,
+        ...(caption ? { caption } : {}),
+      });
+    } else if (cleanMime.startsWith('video/')) {
+      finalMediaType = 'video';
+      displayText = caption || '[Video]';
+      sent = await sock.sendMessage(targetJid, {
+        video: rawBuffer,
+        mimetype: cleanMime,
+        ...(caption ? { caption } : {}),
+      });
+    } else if (cleanMime.startsWith('audio/')) {
+      finalMediaType = 'audio';
+      displayText = caption || '[Audio]';
+      sent = await sock.sendMessage(targetJid, {
+        audio: rawBuffer,
+        mimetype: cleanMime,
+        ptt: false,
+      });
+    } else {
+      finalMediaType = 'document';
+      displayText = caption || safeFileName;
+      sent = await sock.sendMessage(targetJid, {
+        document: rawBuffer,
+        mimetype: cleanMime || 'application/octet-stream',
+        fileName: safeFileName,
+        ...(caption ? { caption } : {}),
+      });
+    }
+
+    if (sent) {
+      cacheMessage(sent);
+    }
+
+    const now = Date.now();
+    const msgId = sent?.key?.id || `out_${now}_${Math.random().toString(36).slice(2, 6)}`;
+    cacheLiveMediaBuffer(`${targetJid}:${msgId}`, finalBuffer, finalMime, safeFileName);
+
+    const myJid = normalizeBareJid(sock.user?.id || '');
+    const myPhone = normalizePhone(jidUserPart(myJid));
+    const entry: LiveChatMessage = {
+      id: msgId,
+      chatId: targetJid,
+      senderJid: myJid || targetJid,
+      senderNumber: myPhone,
+      senderName: sock.user?.name || 'You',
+      fromMe: true,
+      text: displayText,
+      mediaType: finalMediaType,
+      mimetype: finalMime,
+      fileName: finalMediaType === 'document' ? safeFileName : undefined,
+      hasMedia: true,
+      ptt: isPtt || undefined,
+      seconds: finalSeconds,
+      timestamp: now,
+      key: sent?.key?.id
+        ? {
+            remoteJid: targetJid,
+            id: sent.key.id,
+            fromMe: true,
+          }
+        : undefined,
+    };
+
+    recordSessionChatMessage(sessionId, {
+      ...entry,
+      chatName: lookupKnownUserName(targetJid) || undefined,
+    });
+
+    logger.info('liveChat', `Admin sent ${finalMediaType} via ${sessionId} to ${targetJid}`);
+    return { ok: true, chatId: targetJid, message: entry };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Failed to send media message.' };
+  }
+}
+
+export function listLiveStatuses(sessionId?: string): {
+  statuses: DashboardStatusItem[];
+  totalAllSessions: number;
+} {
+  const cleanSession = String(sessionId || '').trim();
+  const all = listStatusesForDashboard(120);
+  const filtered = cleanSession ? listStatusesForDashboard(120, cleanSession) : all;
+  return {
+    statuses: filtered,
+    totalAllSessions: all.length,
+  };
+}
+
+export async function getLiveStatusMedia(
+  statusId: string,
+  preferredSessionId?: string
+): Promise<{
+  ok: boolean;
+  error?: string;
+  entry?: CachedStatusEntry;
+  buffer?: Buffer;
+  mimetype?: string;
+  fileName?: string;
+}> {
+  const entry = getStatusById(String(statusId || '').trim());
+  if (!entry) {
+    return { ok: false, error: 'Status not found or expired.' };
+  }
+  if (entry.mediaType === 'text') {
+    const txtBuf = Buffer.from(entry.textBody || entry.caption || '', 'utf-8');
+    return {
+      ok: true,
+      entry,
+      buffer: txtBuf,
+      mimetype: 'text/plain; charset=utf-8',
+      fileName: `status_${entry.senderPhone || 'text'}_${entry.id.slice(-6)}.txt`,
+    };
+  }
+
+  let buf: Buffer | null = entry.cachedBuffer && entry.cachedBuffer.length > 0 ? entry.cachedBuffer : null;
+  if (!buf) {
+    const candidateSockets: WASocket[] = [];
+    if (preferredSessionId) {
+      const s = getLiveSessionSocket(preferredSessionId);
+      if (s.sock && s.status === 'connected') candidateSockets.push(s.sock);
+    }
+    for (const sk of entry.sessionKeys || []) {
+      const s = getLiveSessionSocket(sk);
+      if (s.sock && s.status === 'connected' && !candidateSockets.includes(s.sock)) {
+        candidateSockets.push(s.sock);
+      }
+    }
+    const fallback = getPreferredActiveSocket();
+    if (fallback && !candidateSockets.includes(fallback)) {
+      candidateSockets.push(fallback);
+    }
+    for (const sock of candidateSockets) {
+      buf = await getOrDownloadStatusBuffer(sock, entry);
+      if (buf && buf.length > 0) break;
+    }
+  }
+
+  if (!buf || buf.length === 0) {
+    return { ok: false, error: 'Status media is not available yet. Try syncing again shortly.' };
+  }
+
+  const mimetype = entry.mimetype || (entry.mediaType === 'video' ? 'video/mp4' : entry.mediaType === 'audio' ? 'audio/ogg' : 'image/jpeg');
+  const ext = extensionFromMime(mimetype);
+  const label = entry.senderPhone || 'contact';
+  const fileName = sanitizeDownloadFilename(`status_${label}_${entry.id.slice(-6)}.${ext}`, ext);
+
+  return {
+    ok: true,
+    entry,
+    buffer: buf,
+    mimetype,
+    fileName,
+  };
+}
+
+export async function postSessionLiveStatus(
+  sessionId: string,
+  payload: {
+    text?: string;
+    base64Data?: string;
+    mimeType?: string;
+    caption?: string;
+    backgroundColor?: string;
+  }
+): Promise<{ ok: boolean; error?: string; statusId?: string }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+
+  const myJid = normalizeBareJid(sock.user?.id || '');
+  const dmJids = listSessionChats(sessionId)
+    .filter((c) => c.chatType === 'dm' && c.chatId.endsWith('@s.whatsapp.net'))
+    .slice(0, 60)
+    .map((c) => c.chatId);
+  const statusJidList = Array.from(new Set([myJid, ...dmJids].filter(Boolean)));
+
+  const caption = String(payload.caption || '').trim();
+  const text = String(payload.text || '').trim();
+  const rawData = String(payload.base64Data || '').trim();
+  const base64Clean = rawData.includes(',') ? rawData.split(',').slice(1).join(',') : rawData;
+
+  try {
+    let sent: WAMessage | undefined;
+    if (base64Clean) {
+      const rawBuffer = Buffer.from(base64Clean, 'base64');
+      if (rawBuffer.length === 0 || rawBuffer.length > 24 * 1024 * 1024) {
+        return { ok: false, error: 'Status media must be between 1 byte and 24 MB.' };
+      }
+      const cleanMime = String(payload.mimeType || 'image/jpeg').split(';')[0].trim().toLowerCase();
+      if (cleanMime.startsWith('image/')) {
+        sent = await sock.sendMessage(
+          'status@broadcast',
+          { image: rawBuffer, mimetype: cleanMime, ...(caption ? { caption } : {}) },
+          { statusJidList }
+        );
+      } else if (cleanMime.startsWith('video/')) {
+        sent = await sock.sendMessage(
+          'status@broadcast',
+          { video: rawBuffer, mimetype: cleanMime, ...(caption ? { caption } : {}) },
+          { statusJidList }
+        );
+      } else if (cleanMime.startsWith('audio/')) {
+        const converted = await convertWebAudioToWhatsAppVoice(rawBuffer, payload.mimeType || cleanMime);
+        sent = await sock.sendMessage(
+          'status@broadcast',
+          {
+            audio: converted.buffer,
+            mimetype: 'audio/ogg; codecs=opus',
+            ptt: true,
+            ...(typeof converted.seconds === 'number' ? { seconds: converted.seconds } : {}),
+            ...(converted.waveform ? { waveform: converted.waveform } : {}),
+          } as Parameters<typeof sock.sendMessage>[1],
+          { statusJidList }
+        );
+      } else {
+        return { ok: false, error: 'WhatsApp statuses only support image, video, audio, or text.' };
+      }
+    } else if (text) {
+      const bg = /^#[0-9a-fA-F]{6}$/.test(String(payload.backgroundColor || ''))
+        ? String(payload.backgroundColor)
+        : '#3B1D6E';
+      sent = await sock.sendMessage(
+        'status@broadcast',
+        { text },
+        { statusJidList, backgroundColor: bg, font: 1 }
+      );
+    } else {
+      return { ok: false, error: 'Provide status text or media.' };
+    }
+
+    if (sent) {
+      await recordBroadcastStatus(sock, sent, sessionId);
+    }
+    return { ok: true, statusId: sent?.key?.id || undefined };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Failed to post WhatsApp status.' };
+  }
+}
+
+export async function shareLiveItemToChat(
+  sessionId: string,
+  targetJidOrPhone: string,
+  opts: {
+    statusId?: string;
+    sourceSessionId?: string;
+    sourceChatId?: string;
+    sourceMsgId?: string;
+    caption?: string;
+    text?: string;
+  }
+): Promise<{ ok: boolean; error?: string; chatId?: string }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+
+  let targetJid = String(targetJidOrPhone || '').trim();
+  if (!targetJid.includes('@')) {
+    const cleanPhone = normalizePhone(targetJid);
+    if (!isValidPhone(cleanPhone)) {
+      return { ok: false, error: 'Enter a valid WhatsApp phone number or JID.' };
+    }
+    targetJid = `${cleanPhone}@s.whatsapp.net`;
+  } else {
+    targetJid = normalizeBareJid(targetJid);
+  }
+
+  const caption = String(opts.caption || '').trim();
+
+  try {
+    if (opts.statusId) {
+      const media = await getLiveStatusMedia(opts.statusId, sessionId);
+      if (!media.ok || !media.entry) {
+        return { ok: false, error: media.error || 'Status unavailable.' };
+      }
+      if (media.entry.mediaType === 'text') {
+        const txt = caption || media.entry.textBody || media.entry.caption || '';
+        const res = await sendSessionLiveMessage(sessionId, targetJid, txt);
+        return { ok: res.ok, error: res.error, chatId: targetJid };
+      }
+      if (!media.buffer) {
+        return { ok: false, error: 'Status media buffer unavailable.' };
+      }
+      const b64 = media.buffer.toString('base64');
+      const res = await sendSessionLiveMedia(sessionId, targetJid, {
+        base64Data: b64,
+        mimeType: media.mimetype || 'application/octet-stream',
+        fileName: media.fileName,
+        caption: caption || media.entry.caption || '',
+        asVoiceNote: media.entry.mediaType === 'audio' && Boolean(media.entry.ptt),
+      });
+      return { ok: res.ok, error: res.error, chatId: targetJid };
+    }
+
+    if (opts.sourceChatId && opts.sourceMsgId) {
+      const media = await downloadSessionChatMedia(
+        opts.sourceSessionId || sessionId,
+        opts.sourceChatId,
+        opts.sourceMsgId
+      );
+      if (media.ok && media.buffer) {
+        const res = await sendSessionLiveMedia(sessionId, targetJid, {
+          base64Data: media.buffer.toString('base64'),
+          mimeType: media.mimetype || 'application/octet-stream',
+          fileName: media.fileName,
+          caption,
+        });
+        return { ok: res.ok, error: res.error, chatId: targetJid };
+      }
+    }
+
+    const fallbackText = String(opts.text || caption || '').trim();
+    if (!fallbackText) {
+      return { ok: false, error: 'Nothing selected to share.' };
+    }
+    const res = await sendSessionLiveMessage(sessionId, targetJid, fallbackText);
+    return { ok: res.ok, error: res.error, chatId: targetJid };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Failed to share item.' };
   }
 }

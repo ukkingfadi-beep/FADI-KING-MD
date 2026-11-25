@@ -40,6 +40,14 @@ export interface LiveChatMessage {
   fromMe: boolean;
   text: string;
   mediaType: LiveChatMediaType;
+  mimetype?: string;
+  fileName?: string;
+  hasMedia?: boolean;
+  ptt?: boolean;
+  seconds?: number;
+  locationLat?: number;
+  locationLng?: number;
+  locationName?: string;
   timestamp: number;
   key?: LiveChatMessageKey;
 }
@@ -308,6 +316,14 @@ export function recordSessionChatMessage(
     fromMe: Boolean(entry.fromMe),
     text: cleanText.slice(0, 2000),
     mediaType: entry.mediaType || 'text',
+    ...(entry.mimetype ? { mimetype: entry.mimetype } : {}),
+    ...(entry.fileName ? { fileName: entry.fileName } : {}),
+    ...(entry.hasMedia ? { hasMedia: true } : {}),
+    ...(entry.ptt ? { ptt: true } : {}),
+    ...(typeof entry.seconds === 'number' && entry.seconds > 0 ? { seconds: entry.seconds } : {}),
+    ...(typeof entry.locationLat === 'number' ? { locationLat: entry.locationLat } : {}),
+    ...(typeof entry.locationLng === 'number' ? { locationLng: entry.locationLng } : {}),
+    ...(entry.locationName ? { locationName: entry.locationName } : {}),
     timestamp: entry.timestamp || Date.now(),
     key: entry.key,
   };

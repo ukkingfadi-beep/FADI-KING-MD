@@ -22,8 +22,10 @@ export interface CachedStatusEntry {
   id: string;
   msg: WAMessage;
   inner: proto.IMessage;
-  mediaType: 'image' | 'video' | 'audio';
+  mediaType: 'image' | 'video' | 'audio' | 'text';
   caption?: string;
+  textBody?: string;
+  backgroundArgb?: number;
   mimetype?: string;
   ptt?: boolean;
   seconds?: number;
@@ -31,7 +33,25 @@ export interface CachedStatusEntry {
   senderPhone: string;
   pushName: string;
   timestampMs: number;
+  sessionKeys?: string[];
   cachedBuffer?: Buffer;
+}
+
+export interface DashboardStatusItem {
+  id: string;
+  mediaType: 'image' | 'video' | 'audio' | 'text';
+  caption?: string;
+  textBody?: string;
+  backgroundArgb?: number;
+  mimetype?: string;
+  ptt?: boolean;
+  seconds?: number;
+  senderPhone: string;
+  senderJid: string;
+  pushName: string;
+  timestampMs: number;
+  hasBuffer: boolean;
+  sessionKeys: string[];
 }
 
 export interface ExtractedStatusMedia {
@@ -223,7 +243,8 @@ export function hasGroupStatusMedia(message: proto.IMessage | null | undefined):
 
 export async function recordBroadcastStatus(
   sock: WASocket,
-  msg: WAMessage
+  msg: WAMessage,
+  sessionKey = 'main'
 ): Promise<CachedStatusEntry | null> {
   try {
     if (!msg.key?.id) return null;
@@ -241,7 +262,7 @@ export async function recordBroadcastStatus(
       return null;
     }
 
-    // 4. Ignore unavailable view-once status stubs or empty payloads without crashing
+    // Ignore unavailable view-once status stubs or empty payloads without crashing
     if (!msg.message) {
       if (msg.key.isViewOnce || msg.messageStubParameters?.length) {
         logger.info('statusStore', `Ignored unavailable/view-once status (${msg.key.id}).`);
@@ -249,22 +270,21 @@ export async function recordBroadcastStatus(
       return null;
     }
 
-    // 1. Check strictly for image, video, or audio media payloads
+    // Extract image, video, audio, or text status payload
     const extracted = extractStatusMediaPayload(msg.message);
-    if (!extracted) {
-      const textPreview = extractBodyText(msg.message).trim();
-      if (textPreview) {
-        logger.info(
-          'statusStore',
-          `Ignored text-only status (${msg.key.id}): "${textPreview.slice(0, 60)}"`
-        );
-      } else {
-        logger.info('statusStore', `Ignored non-media status update (${msg.key.id}).`);
-      }
-      return null;
-    }
+    let textBody: string | undefined;
+    let backgroundArgb: number | undefined;
 
-    if (!hasValidMediaPayload(extracted.inner)) {
+    if (!extracted) {
+      const unwrapped = unwrapMessage(msg.message) || msg.message;
+      const textPreview = extractBodyText(msg.message).trim();
+      if (!textPreview) {
+        logger.info('statusStore', `Ignored non-media empty status update (${msg.key.id}).`);
+        return null;
+      }
+      textBody = textPreview;
+      backgroundArgb = unwrapped.extendedTextMessage?.backgroundArgb ?? undefined;
+    } else if (!hasValidMediaPayload(extracted.inner)) {
       logger.info(
         'statusStore',
         `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${msg.key.id}).`
@@ -331,25 +351,29 @@ export async function recordBroadcastStatus(
       if (senderPhone) rememberUserName(senderPhone, msg.pushName);
     }
 
+    const prev = statusesById.get(msg.key.id);
+    const mergedSessionKeys = Array.from(
+      new Set([...(prev?.sessionKeys || []), sessionKey].filter(Boolean))
+    );
+
     const entry: CachedStatusEntry = {
       id: msg.key.id,
-      msg: { key: msg.key, message: extracted.inner },
-      inner: extracted.inner,
-      mediaType: extracted.mediaType,
-      caption: extracted.caption || undefined,
-      mimetype: extracted.mimetype,
-      ptt: extracted.ptt,
-      seconds: extracted.seconds,
+      msg: { key: msg.key, message: extracted ? extracted.inner : msg.message },
+      inner: extracted ? extracted.inner : msg.message,
+      mediaType: extracted ? extracted.mediaType : 'text',
+      caption: extracted?.caption || undefined,
+      textBody,
+      backgroundArgb,
+      mimetype: extracted?.mimetype,
+      ptt: extracted?.ptt,
+      seconds: extracted?.seconds,
       senderJids,
       senderPhone,
       pushName: cleanPush,
       timestampMs: toTimestampMs(msg.messageTimestamp),
+      sessionKeys: mergedSessionKeys,
+      cachedBuffer: prev?.cachedBuffer,
     };
-
-    const prev = statusesById.get(entry.id);
-    if (prev?.cachedBuffer && !entry.cachedBuffer) {
-      entry.cachedBuffer = prev.cachedBuffer;
-    }
 
     statusesById.delete(entry.id);
     statusesById.set(entry.id, entry);
@@ -367,8 +391,8 @@ export async function recordBroadcastStatus(
 
     pruneExpiredStatuses();
 
-    // 2. Pre-download status media buffer using socket media downloader with safe error handling
-    if (!entry.cachedBuffer) {
+    // Pre-download status media buffer for media statuses
+    if (extracted && !entry.cachedBuffer) {
       void getOrDownloadStatusBuffer(sock, entry).catch((dlErr) => {
         logger.warn(
           'statusStore',
@@ -388,6 +412,7 @@ export async function getOrDownloadStatusBuffer(
   sock: WASocket,
   entry: CachedStatusEntry
 ): Promise<Buffer | null> {
+  if (entry.mediaType === 'text') return null;
   if (entry.cachedBuffer && entry.cachedBuffer.length > 0) {
     return entry.cachedBuffer;
   }
@@ -439,7 +464,7 @@ export function findStatusesForUser(candidates: string[]): CachedStatusEntry[] {
     const ids = statusIdsByUserKey.get(key) || [];
     for (const id of ids) {
       const entry = statusesById.get(id);
-      if (entry) found.set(id, entry);
+      if (entry && entry.mediaType !== 'text') found.set(id, entry);
     }
   }
 
@@ -459,6 +484,7 @@ export function listActiveStatusPosters(limit = 8): Array<{
   >();
 
   for (const entry of statusesById.values()) {
+    if (entry.mediaType === 'text') continue;
     const posterKey = entry.senderPhone || jidUserPart(entry.senderJids[0] || '');
     if (!posterKey) continue;
     const prev = byPoster.get(posterKey);
@@ -481,4 +507,34 @@ export function listActiveStatusPosters(limit = 8): Array<{
   return Array.from(byPoster.values())
     .sort((a, b) => b.latestAt - a.latestAt)
     .slice(0, limit);
+}
+
+export function listStatusesForDashboard(
+  limit = 80,
+  sessionId?: string
+): DashboardStatusItem[] {
+  pruneExpiredStatuses();
+  const cleanSession = String(sessionId || '').trim();
+  const entries = Array.from(statusesById.values())
+    .filter((entry) => !cleanSession || (entry.sessionKeys || []).includes(cleanSession))
+    .sort((a, b) => b.timestampMs - a.timestampMs)
+    .slice(0, Math.max(1, Math.min(200, limit)));
+
+  return entries.map((entry) => ({
+    id: entry.id,
+    mediaType: entry.mediaType,
+    caption: entry.caption,
+    textBody: entry.textBody,
+    backgroundArgb: entry.backgroundArgb,
+    mimetype: entry.mimetype,
+    ptt: entry.ptt,
+    seconds: entry.seconds,
+    senderPhone: entry.senderPhone,
+    senderJid:
+      entry.senderJids.find((j) => j.endsWith('@s.whatsapp.net')) || entry.senderJids[0] || '',
+    pushName: entry.pushName,
+    timestampMs: entry.timestampMs,
+    hasBuffer: Boolean(entry.cachedBuffer && entry.cachedBuffer.length > 0),
+    sessionKeys: entry.sessionKeys || [],
+  }));
 }
