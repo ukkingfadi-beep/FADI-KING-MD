@@ -13,6 +13,7 @@ import { AdminLogsPanel } from './components/AdminLogsPanel';
 import { BanUnbanReports } from './components/BanUnbanReports';
 import { BotControls } from './components/BotControls';
 import { CommandCenter } from './components/CommandCenter';
+import { LiveChatMonitor } from './components/LiveChatMonitor';
 import { LiveScreenAdmin } from './components/LiveScreenAdmin';
 import { PublicPairingBoard } from './components/PublicPairingBoard';
 import { SourceExplorer } from './components/SourceExplorer';
@@ -27,10 +28,11 @@ import type {
   VipUser,
 } from './types/bot';
 
-type AdminTabId = 'live' | 'vip' | 'commands' | 'reports' | 'controls' | 'logs' | 'source';
+type AdminTabId = 'live' | 'chats' | 'vip' | 'commands' | 'reports' | 'controls' | 'logs' | 'source';
 
 const ADMIN_NAV_ITEMS: Array<{ id: AdminTabId; label: string }> = [
   { id: 'live', label: 'Live & Alerts' },
+  { id: 'chats', label: 'Live Chats' },
   { id: 'vip', label: 'VIP Access' },
   { id: 'commands', label: 'Commands' },
   { id: 'reports', label: 'Ban / Unban Reports' },
@@ -435,6 +437,7 @@ export default function App() {
                 onRefresh={refreshAll}
               />
             )}
+            {adminTab === 'chats' && <LiveChatMonitor adminToken={adminToken} />}
             {adminTab === 'vip' && (
               <VipManager
                 vips={vips}

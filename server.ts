@@ -12,6 +12,8 @@ import {
   getBotSnapshot,
   getPreferredActiveSocket,
   initializeSavedSessionOnBoot,
+  listAllMonitorSessions,
+  refreshSessionMonitorData,
   requestVipSubPairingCode,
   resolveNewsletterMetadataFromActiveSockets,
   restartMainBot,
@@ -30,6 +32,7 @@ import {
 } from './utils/adminAuth.ts';
 import { liveStore, type AlertLevel } from './utils/liveStore.ts';
 import { anticallStore } from './utils/anticallStore.ts';
+import { sessionChatMonitor } from './utils/chatHistoryStore.ts';
 import { crashGuardStore } from './utils/crashGuard.ts';
 import { initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
@@ -778,6 +781,57 @@ async function startServer(): Promise<void> {
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });
     res.json({ ok: true, group: updated });
+  });
+
+  // Paired Users, Joined Groups & Live Chatting Monitor (Admin Only)
+  app.get('/api/sessions/monitor', requireAdmin, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    return res.json({
+      ok: true,
+      sessions: listAllMonitorSessions(),
+    });
+  });
+
+  app.get('/api/sessions/:sessionId/chats', requireAdmin, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const sessionId = decodeURIComponent(req.params.sessionId || '').trim() || 'main';
+    let synced = false;
+    if (req.query.refresh === '1') {
+      synced = await refreshSessionMonitorData(sessionId);
+    }
+    const { groups, dms, all } = sessionChatMonitor.listChats(sessionId);
+    const liveFeed = sessionChatMonitor.getLiveFeed(sessionId, 120);
+    const stats = sessionChatMonitor.getStats(sessionId);
+    return res.json({
+      ok: true,
+      sessionId,
+      synced,
+      groups,
+      dms,
+      all,
+      liveFeed,
+      stats,
+    });
+  });
+
+  app.get('/api/sessions/:sessionId/messages', requireAdmin, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const sessionId = decodeURIComponent(req.params.sessionId || '').trim() || 'main';
+    const chatId = String(req.query.chatId || '').trim();
+    if (!chatId) {
+      return res.json({
+        ok: true,
+        sessionId,
+        chatId: '',
+        messages: sessionChatMonitor.getLiveFeed(sessionId, 120),
+      });
+    }
+    return res.json({
+      ok: true,
+      sessionId,
+      chatId,
+      messages: sessionChatMonitor.getChatMessages(sessionId, chatId, 120),
+    });
   });
 
   // Anti-Virus & Zero-Day Crash Shield Registry (Admin Only)

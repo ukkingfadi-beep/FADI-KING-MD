@@ -280,3 +280,61 @@ export interface ReportExecutionLog {
   summary: string;
   timestamp: string;
 }
+
+export type MonitorMediaType =
+  | 'text'
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'sticker'
+  | 'document'
+  | 'contact'
+  | 'location'
+  | 'poll'
+  | 'other';
+
+export interface MonitorSessionEntry {
+  sessionId: string;
+  phone: string;
+  name: string;
+  tier: 'main' | 'owner' | 'diamond' | 'gold' | 'paired';
+  status: ConnectionStatus | 'offline' | 'not_paired';
+  isMain: boolean;
+  isPaidVip: boolean;
+  pairingCount: number;
+  lastPairedAt?: string;
+  totalGroups: number;
+  totalDms: number;
+  totalMessages: number;
+}
+
+export interface SessionChatSummary {
+  sessionId: string;
+  chatId: string;
+  isGroup: boolean;
+  title: string;
+  phone?: string;
+  participantCount?: number;
+  isAdmin?: boolean;
+  announce?: boolean;
+  lastMessage: string;
+  lastSender: string;
+  lastFromMe: boolean;
+  lastTimestamp: number;
+  messageCount: number;
+}
+
+export interface SessionLiveMessage {
+  id: string;
+  sessionId: string;
+  chatId: string;
+  chatTitle: string;
+  isGroup: boolean;
+  fromMe: boolean;
+  senderJid: string;
+  senderPhone: string;
+  senderName: string;
+  mediaType: MonitorMediaType;
+  text: string;
+  timestamp: number;
+}
