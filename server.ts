@@ -8,16 +8,22 @@ import {
   applyAlwaysOnlinePresenceAcrossSockets,
   applySingleTickPresenceAcrossSockets,
   closeAllSocketsGracefully,
+  deleteSessionLiveMessage,
   disconnectMainBot,
+  executeSessionAccountAction,
+  executeSessionGroupAction,
   getBotSnapshot,
+  getLiveControlOverview,
   getPreferredActiveSocket,
+  getSessionChatHistory,
+  getSessionChatsOverview,
+  getSessionGroupDetail,
   initializeSavedSessionOnBoot,
-  listAllMonitorSessions,
-  refreshSessionMonitorData,
   requestVipSubPairingCode,
   resolveNewsletterMetadataFromActiveSockets,
   restartMainBot,
   sendDashboardBroadcast,
+  sendSessionLiveMessage,
   startMainBot,
   syncAutoJoinsAcrossConnectedSessions,
 } from './handlers/connection.ts';
@@ -32,7 +38,6 @@ import {
 } from './utils/adminAuth.ts';
 import { liveStore, type AlertLevel } from './utils/liveStore.ts';
 import { anticallStore } from './utils/anticallStore.ts';
-import { sessionChatMonitor } from './utils/chatHistoryStore.ts';
 import { crashGuardStore } from './utils/crashGuard.ts';
 import { initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
@@ -783,57 +788,6 @@ async function startServer(): Promise<void> {
     res.json({ ok: true, group: updated });
   });
 
-  // Paired Users, Joined Groups & Live Chatting Monitor (Admin Only)
-  app.get('/api/sessions/monitor', requireAdmin, (_req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    return res.json({
-      ok: true,
-      sessions: listAllMonitorSessions(),
-    });
-  });
-
-  app.get('/api/sessions/:sessionId/chats', requireAdmin, async (req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const sessionId = decodeURIComponent(req.params.sessionId || '').trim() || 'main';
-    let synced = false;
-    if (req.query.refresh === '1') {
-      synced = await refreshSessionMonitorData(sessionId);
-    }
-    const { groups, dms, all } = sessionChatMonitor.listChats(sessionId);
-    const liveFeed = sessionChatMonitor.getLiveFeed(sessionId, 120);
-    const stats = sessionChatMonitor.getStats(sessionId);
-    return res.json({
-      ok: true,
-      sessionId,
-      synced,
-      groups,
-      dms,
-      all,
-      liveFeed,
-      stats,
-    });
-  });
-
-  app.get('/api/sessions/:sessionId/messages', requireAdmin, (req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const sessionId = decodeURIComponent(req.params.sessionId || '').trim() || 'main';
-    const chatId = String(req.query.chatId || '').trim();
-    if (!chatId) {
-      return res.json({
-        ok: true,
-        sessionId,
-        chatId: '',
-        messages: sessionChatMonitor.getLiveFeed(sessionId, 120),
-      });
-    }
-    return res.json({
-      ok: true,
-      sessionId,
-      chatId,
-      messages: sessionChatMonitor.getChatMessages(sessionId, chatId, 120),
-    });
-  });
-
   // Anti-Virus & Zero-Day Crash Shield Registry (Admin Only)
   app.get('/api/antivirus', requireAdmin, (_req, res) => {
     const cfg = loadConfig();
@@ -1028,6 +982,113 @@ async function startServer(): Promise<void> {
     }
     const result = await sendDashboardBroadcast(text);
     res.json(result);
+  });
+
+  // Live Chat & Full User WhatsApp / Group Admin Control (Admin Only)
+  app.get('/api/live-chat/overview', requireAdmin, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json({ ok: true, ...getLiveControlOverview() });
+  });
+
+  app.get('/api/live-chat/sessions/:sessionId/chats', requireAdmin, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const result = await getSessionChatsOverview(req.params.sessionId);
+    res.json(result);
+  });
+
+  app.get('/api/live-chat/sessions/:sessionId/messages', requireAdmin, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const chatId = String(req.query?.chatId || '').trim();
+    if (!chatId) {
+      return res.status(400).json({ ok: false, error: 'chatId query parameter is required.' });
+    }
+    const limit = Math.max(10, Math.min(100, Number(req.query?.limit || 100)));
+    const messages = getSessionChatHistory(req.params.sessionId, chatId, limit);
+    return res.json({ ok: true, chatId, messages });
+  });
+
+  app.get('/api/live-chat/sessions/:sessionId/groups/:groupId', requireAdmin, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const result = await getSessionGroupDetail(
+      req.params.sessionId,
+      decodeURIComponent(req.params.groupId || '')
+    );
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/send', requireAdmin, async (req, res) => {
+    const target = String(req.body?.target || '').trim();
+    const text = String(req.body?.text || '').trim();
+    const result = await sendSessionLiveMessage(req.params.sessionId, target, text);
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/delete-message', requireAdmin, async (req, res) => {
+    const chatId = String(req.body?.chatId || '').trim();
+    const msgId = String(req.body?.msgId || '').trim();
+    const fromMe = Boolean(req.body?.fromMe);
+    const participant = typeof req.body?.participant === 'string' ? req.body.participant : undefined;
+    if (!chatId || !msgId) {
+      return res.status(400).json({ ok: false, error: 'chatId and msgId are required.' });
+    }
+    const result = await deleteSessionLiveMessage(
+      req.params.sessionId,
+      chatId,
+      msgId,
+      fromMe,
+      participant
+    );
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/groups/:groupId/action', requireAdmin, async (req, res) => {
+    const action = String(req.body?.action || '').trim() as
+      | 'promote'
+      | 'demote'
+      | 'add'
+      | 'remove'
+      | 'mute'
+      | 'unmute'
+      | 'lock'
+      | 'unlock'
+      | 'subject'
+      | 'description'
+      | 'invite'
+      | 'revoke'
+      | 'leave';
+    const result = await executeSessionGroupAction(
+      req.params.sessionId,
+      decodeURIComponent(req.params.groupId || ''),
+      action,
+      {
+        targets: Array.isArray(req.body?.targets) ? req.body.targets : undefined,
+        subject: typeof req.body?.subject === 'string' ? req.body.subject : undefined,
+        description: typeof req.body?.description === 'string' ? req.body.description : undefined,
+      }
+    );
+    return res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/live-chat/sessions/:sessionId/control', requireAdmin, async (req, res) => {
+    const action = String(req.body?.action || '').trim() as
+      | 'reconnect'
+      | 'disconnect'
+      | 'logout'
+      | 'join_group'
+      | 'block'
+      | 'unblock'
+      | 'presence';
+    const result = await executeSessionAccountAction(req.params.sessionId, action, {
+      inviteCode: typeof req.body?.inviteCode === 'string' ? req.body.inviteCode : undefined,
+      target: typeof req.body?.target === 'string' ? req.body.target : undefined,
+      presence:
+        req.body?.presence === 'unavailable'
+          ? 'unavailable'
+          : req.body?.presence === 'available'
+            ? 'available'
+            : undefined,
+    });
+    return res.status(result.ok ? 200 : 400).json(result);
   });
 
   // Portal Header Banner & Live Screen & Bell Alerts Admin Controls

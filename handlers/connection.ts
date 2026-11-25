@@ -11,14 +11,24 @@ import {
   makeWASocket,
   useMultiFileAuthState,
   type CacheStore,
-  type GroupMetadata,
   type WAMessage,
   type WAMessageKey,
   type WASocket,
 } from '@whiskeysockets/baileys';
-import { loadConfig, normalizePhone } from '../config/bot.config.ts';
+import { isValidPhone, loadConfig, normalizePhone } from '../config/bot.config.ts';
 import { anticallStore } from '../utils/anticallStore.ts';
-import { sessionChatMonitor } from '../utils/chatHistoryStore.ts';
+import {
+  clearSessionChatData,
+  getSessionChatMessages,
+  getSessionMessageStats,
+  listSessionChats,
+  recordSessionChatMessage,
+  removeSessionChatMessage,
+  upsertSessionChatMeta,
+  type LiveChatMediaType,
+  type LiveChatMessage,
+  type LiveChatThreadSummary,
+} from '../utils/chatHistoryStore.ts';
 import {
   inspectAndMitigateThreat,
   inspectMessagePayload,
@@ -30,16 +40,23 @@ import {
   restoreAuthDirsFromDb,
 } from '../utils/db.ts';
 import {
+  extractBodyText,
   extractChannelTargets,
+  extractGroupInviteCode,
   extractGroupInviteCodes,
+  findParticipant,
   getBotJids,
+  getCachedGroupMetadata,
   getGroupMetadataFromCacheOnly,
   hasValidMediaPayload,
   invalidateGroupMetadataCache,
   isLidUser,
+  isParticipantAdmin,
   jidUserPart,
+  lookupKnownUserName,
   normalizeBareJid,
   rememberUserName,
+  resolveSenderInfo,
   unwrapMessage,
 } from '../utils/jidHelper.ts';
 import { logger } from '../utils/logger.ts';
@@ -53,7 +70,7 @@ import {
 import { getRandomDelayMs } from '../utils/rateLimiter.ts';
 import { startReminderScheduler } from '../utils/reminderStore.ts';
 import { hasGroupStatusMedia, recordBroadcastStatus } from '../utils/statusStore.ts';
-import { vipStore } from '../utils/vipStore.ts';
+import { vipStore, type GroupConfig, type VipTier } from '../utils/vipStore.ts';
 import { handleGroupParticipantsUpdate } from './group.ts';
 import { handleIncomingMessage } from './message.ts';
 
@@ -514,12 +531,6 @@ function handleSessionOpenActions(params: {
     });
   }, 1100);
   if (typeof joinTimer.unref === 'function') joinTimer.unref();
-
-  // 3. Sync joined groups & contacts into Live Chat Monitor store
-  const syncTimer = setTimeout(() => {
-    void syncSessionGroups(sessionKey, sock);
-  }, 1600);
-  if (typeof syncTimer.unref === 'function') syncTimer.unref();
 }
 
 async function handleIncomingCalls(
@@ -567,11 +578,133 @@ async function handleIncomingCalls(
   }
 }
 
+function detectLiveMediaSummary(
+  message: WAMessage['message']
+): { mediaType: LiveChatMediaType; displayText: string } {
+  const inner = unwrapMessage(message);
+  if (!inner) return { mediaType: 'other', displayText: '' };
+
+  const text = extractBodyText(message).trim();
+  if (inner.imageMessage) {
+    return { mediaType: 'image', displayText: text ? `[Photo] ${text}` : '[Photo]' };
+  }
+  if (inner.videoMessage || inner.ptvMessage) {
+    return { mediaType: 'video', displayText: text ? `[Video] ${text}` : '[Video]' };
+  }
+  if (inner.audioMessage) {
+    const label = inner.audioMessage.ptt ? '[Voice Note]' : '[Audio]';
+    return { mediaType: 'audio', displayText: text ? `${label} ${text}` : label };
+  }
+  if (inner.stickerMessage) {
+    return { mediaType: 'sticker', displayText: '[Sticker]' };
+  }
+  if (inner.documentMessage) {
+    const fileName = inner.documentMessage.fileName || 'Document';
+    return {
+      mediaType: 'document',
+      displayText: text ? `[File: ${fileName}] ${text}` : `[File: ${fileName}]`,
+    };
+  }
+  if (inner.locationMessage || inner.liveLocationMessage) {
+    return { mediaType: 'location', displayText: text || '[Shared Location]' };
+  }
+  if (inner.contactMessage || inner.contactsArrayMessage) {
+    const cName = inner.contactMessage?.displayName || 'Contact';
+    return { mediaType: 'contact', displayText: `[Contact: ${cName}]` };
+  }
+  if (inner.pollCreationMessage || inner.pollCreationMessageV2 || inner.pollCreationMessageV3) {
+    const q =
+      inner.pollCreationMessage?.name ||
+      inner.pollCreationMessageV2?.name ||
+      inner.pollCreationMessageV3?.name ||
+      'Poll';
+    return { mediaType: 'poll', displayText: `[Poll] ${q}` };
+  }
+  if (inner.requestPaymentMessage || inner.sendPaymentMessage) {
+    return { mediaType: 'payment', displayText: text ? `[Payment] ${text}` : '[Payment Request]' };
+  }
+  if (text) {
+    return { mediaType: 'text', displayText: text };
+  }
+  return { mediaType: 'other', displayText: '' };
+}
+
+async function recordSocketMessageToLiveStore(
+  sock: WASocket,
+  sessionKey: string,
+  msg: WAMessage
+): Promise<void> {
+  try {
+    const rawChatId = msg.key?.remoteJid;
+    if (!rawChatId || rawChatId === 'status@broadcast' || !msg.message) return;
+    if (msg.message.protocolMessage && !msg.message.editedMessage) return;
+
+    const chatId = normalizeBareJid(rawChatId);
+    if (!chatId || chatId === 'status@broadcast') return;
+
+    const { mediaType, displayText } = detectLiveMediaSummary(msg.message);
+    if (!displayText) return;
+
+    const isGroup = chatId.endsWith('@g.us');
+    const fromMe = Boolean(msg.key?.fromMe);
+    const { senderJid, senderNumber } = await resolveSenderInfo(sock, msg);
+
+    if (!fromMe && msg.pushName) {
+      rememberUserName(senderJid, msg.pushName);
+      rememberUserName(senderNumber, msg.pushName);
+      if (!isGroup) {
+        rememberUserName(chatId, msg.pushName);
+      }
+    }
+
+    const senderName = fromMe
+      ? sock.user?.name || 'You'
+      : msg.pushName || lookupKnownUserName(senderJid) || (senderNumber ? `+${senderNumber}` : 'User');
+
+    let chatName: string | undefined;
+    if (isGroup) {
+      const cachedGroup = await getGroupMetadataFromCacheOnly(chatId);
+      chatName = cachedGroup?.subject;
+    } else if (!fromMe && msg.pushName) {
+      chatName = msg.pushName;
+    } else {
+      chatName = lookupKnownUserName(chatId) || undefined;
+    }
+
+    const rawTs = Number(msg.messageTimestamp || 0);
+    const timestamp =
+      rawTs > 0 ? (rawTs < 10_000_000_000 ? rawTs * 1000 : rawTs) : Date.now();
+
+    recordSessionChatMessage(sessionKey, {
+      id: msg.key?.id || `${timestamp}-${Math.random().toString(36).slice(2, 7)}`,
+      chatId,
+      chatName,
+      senderJid: senderJid || chatId,
+      senderNumber: senderNumber || normalizePhone(jidUserPart(chatId)),
+      senderName,
+      fromMe,
+      text: displayText,
+      mediaType,
+      timestamp,
+      key: msg.key?.id
+        ? {
+            remoteJid: rawChatId,
+            id: msg.key.id,
+            fromMe,
+            ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+          }
+        : undefined,
+    });
+  } catch {
+    // Non-blocking chat history capture
+  }
+}
+
 async function processSocketUpsertMessages(
   sock: WASocket,
   messages: WAMessage[],
   type: string,
-  sessionKey: string
+  sessionKey = 'main'
 ): Promise<void> {
   for (const msg of messages) {
     try {
@@ -598,12 +731,9 @@ async function processSocketUpsertMessages(
         if (threatBlocked) continue;
       }
 
-      if (msg.message && msg.key?.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
-        void sessionChatMonitor.recordMessage(sessionKey, msg, sock).catch(() => {});
-      }
-
       cacheMessage(msg);
       void precacheViewOnceMedia(sock, msg);
+      void recordSocketMessageToLiveStore(sock, sessionKey, msg);
       if (type === 'notify') {
         void handleIncomingMessage(sock, msg, getCachedMessage);
       }
@@ -616,7 +746,7 @@ async function processSocketUpsertMessages(
 function processSocketMessageUpdates(
   sock: WASocket,
   updates: Array<{ key: WAMessageKey; update: { message?: WAMessage['message'] | null } }>,
-  sessionKey: string
+  sessionKey = 'main'
 ): void {
   for (const upd of updates) {
     try {
@@ -629,13 +759,13 @@ function processSocketMessageUpdates(
             void inspectAndMitigateThreat(sock, { key: upd.key, message: upd.update.message });
             continue;
           }
-          void sessionChatMonitor.recordMessage(sessionKey, synthetic, sock).catch(() => {});
         }
         if (upd.key.remoteJid === 'status@broadcast' || hasGroupStatusMedia(upd.update.message)) {
           void recordBroadcastStatus(sock, synthetic);
         }
         cacheMessage(synthetic);
         void precacheViewOnceMedia(sock, synthetic);
+        void recordSocketMessageToLiveStore(sock, sessionKey, synthetic);
       }
     } catch (err) {
       logger.warn('crashGuard', `Isolated message update error: ${(err as Error).message}`);
@@ -682,211 +812,6 @@ export function getBotSnapshot() {
     subSessions,
     persistedSessions: Array.from(persistedSessionsCache),
   };
-}
-
-export interface MonitorSessionEntry {
-  sessionId: string;
-  phone: string;
-  name: string;
-  tier: 'main' | 'owner' | 'diamond' | 'gold' | 'paired';
-  status: ConnectionStatus | 'offline' | 'not_paired';
-  isMain: boolean;
-  isPaidVip: boolean;
-  pairingCount: number;
-  lastPairedAt?: string;
-  totalGroups: number;
-  totalDms: number;
-  totalMessages: number;
-}
-
-async function syncSessionGroups(sessionKey: string, sock: WASocket | null | undefined): Promise<boolean> {
-  if (!sock || typeof sock.groupFetchAllParticipating !== 'function') return false;
-  try {
-    const groupsMap = (await Promise.race([
-      sock.groupFetchAllParticipating(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
-    ])) as Record<string, GroupMetadata> | null;
-    if (!groupsMap) return false;
-    const ownJids = await getBotJids(sock).catch(() => [] as string[]);
-    sessionChatMonitor.upsertSessionGroups(sessionKey, groupsMap, ownJids);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function refreshSessionMonitorData(sessionId: string): Promise<boolean> {
-  if (sessionId === 'main') {
-    if (!mainSock || botState.status !== 'connected') return false;
-    return syncSessionGroups('main', mainSock);
-  }
-  const entry = vipSubSockets.get(sessionId);
-  if (!entry || entry.info.status !== 'connected') return false;
-  return syncSessionGroups(sessionId, entry.sock);
-}
-
-export function listAllMonitorSessions(): MonitorSessionEntry[] {
-  const cfg = loadConfig();
-  const vips = vipStore.listVips();
-  const vipByPhone = new Map<string, (typeof vips)[number]>();
-  for (const v of vips) {
-    const clean = normalizePhone(v.number);
-    if (clean) vipByPhone.set(clean, v);
-  }
-
-  const pairedList = vipStore.listPairedUsers();
-  const pairedBySession = new Map<string, (typeof pairedList)[number]>();
-  const pairedByPhone = new Map<string, (typeof pairedList)[number]>();
-  for (const p of pairedList) {
-    const clean = normalizePhone(p.number);
-    if (p.sessionId) pairedBySession.set(p.sessionId, p);
-    if (clean) pairedByPhone.set(clean, p);
-  }
-
-  const entries = new Map<string, MonitorSessionEntry>();
-
-  const buildEntry = (input: {
-    sessionId: string;
-    phone: string;
-    name?: string;
-    status: MonitorSessionEntry['status'];
-    isMain: boolean;
-    pairingCount?: number;
-    lastPairedAt?: string;
-  }): MonitorSessionEntry => {
-    const cleanPhone = normalizePhone(input.phone);
-    const vip = cleanPhone ? vipByPhone.get(cleanPhone) : undefined;
-    const stats = sessionChatMonitor.getStats(input.sessionId);
-    const tier: MonitorSessionEntry['tier'] = input.isMain
-      ? vip?.tier || 'main'
-      : vip?.tier || 'paired';
-    const isPaidVip = Boolean(vip && vip.active && vip.tier !== 'owner');
-    const resolvedName =
-      (input.name && !input.name.startsWith('+') ? input.name : '') ||
-      vip?.name ||
-      (cleanPhone ? `+${cleanPhone}` : input.isMain ? cfg.botName : input.sessionId);
-
-    return {
-      sessionId: input.sessionId,
-      phone: cleanPhone,
-      name: resolvedName,
-      tier,
-      status: input.status,
-      isMain: input.isMain,
-      isPaidVip,
-      pairingCount: Math.max(input.pairingCount || 0, vip?.pairingCount || 0),
-      lastPairedAt: input.lastPairedAt || vip?.lastPairedAt,
-      totalGroups: stats.totalGroups,
-      totalDms: stats.totalDms,
-      totalMessages: stats.totalMessages,
-    };
-  };
-
-  // 1. Main Bot Session
-  const mainPaired = pairedBySession.get('main');
-  const mainPhone = normalizePhone(
-    botState.connectedUser?.phone || mainPaired?.number || cfg.ownerNumber || ''
-  );
-  const mainStats = sessionChatMonitor.getStats('main');
-  if (
-    botState.connectedUser ||
-    mainPaired ||
-    mainHasSavedCredsCache ||
-    persistedSessionsCache.has('main') ||
-    mainStats.totalMessages > 0 ||
-    mainStats.totalGroups > 0
-  ) {
-    entries.set(
-      'main',
-      buildEntry({
-        sessionId: 'main',
-        phone: mainPhone,
-        name: botState.connectedUser?.name || mainPaired?.name || cfg.botName,
-        status: botState.status === 'idle' && mainPaired ? mainPaired.status : botState.status,
-        isMain: true,
-        pairingCount: mainPaired?.pairingCount || (botState.status === 'connected' ? 1 : 0),
-        lastPairedAt: mainPaired?.lastPairedAt,
-      })
-    );
-  }
-
-  // 2. Active/connecting VIP sub-sessions
-  for (const [sessionId, sub] of vipSubSockets.entries()) {
-    const cleanPhone = normalizePhone(sub.info.connectedUser?.phone || sub.info.phone || '');
-    const stored = pairedBySession.get(sessionId) || (cleanPhone ? pairedByPhone.get(cleanPhone) : undefined);
-    entries.set(
-      sessionId,
-      buildEntry({
-        sessionId,
-        phone: cleanPhone,
-        name: sub.info.connectedUser?.name || stored?.name,
-        status: sub.info.status,
-        isMain: false,
-        pairingCount: stored?.pairingCount || 1,
-        lastPairedAt: stored?.lastPairedAt || sub.info.createdAt,
-      })
-    );
-  }
-
-  // 3. Previously paired sessions from database
-  for (const p of pairedList) {
-    const cleanPhone = normalizePhone(p.number);
-    const sessionId = p.sessionId || (cleanPhone ? `vip_${cleanPhone}` : '');
-    if (!sessionId || entries.has(sessionId)) continue;
-    if (sessionId !== 'main' && mainPhone && cleanPhone === mainPhone && entries.has('main')) continue;
-    entries.set(
-      sessionId,
-      buildEntry({
-        sessionId,
-        phone: cleanPhone,
-        name: p.name,
-        status: p.status,
-        isMain: sessionId === 'main',
-        pairingCount: p.pairingCount,
-        lastPairedAt: p.lastPairedAt,
-      })
-    );
-  }
-
-  // 4. Paid/VIP numbers registered in VIP Access (even if currently offline or waiting to pair)
-  for (const vip of vips) {
-    if (!vip.active) continue;
-    const cleanPhone = normalizePhone(vip.number);
-    if (!cleanPhone) continue;
-    const alreadyPresent = Array.from(entries.values()).some((e) => e.phone === cleanPhone);
-    if (alreadyPresent) continue;
-    const sessionId = `vip_${cleanPhone}`;
-    const stats = sessionChatMonitor.getStats(sessionId);
-    const hasActivity = stats.totalMessages > 0 || stats.totalGroups > 0 || vip.pairingCount > 0;
-    entries.set(
-      sessionId,
-      buildEntry({
-        sessionId,
-        phone: cleanPhone,
-        name: vip.name,
-        status: hasActivity ? 'offline' : 'not_paired',
-        isMain: false,
-        pairingCount: vip.pairingCount || 0,
-        lastPairedAt: vip.lastPairedAt,
-      })
-    );
-  }
-
-  const rankStatus = (s: MonitorSessionEntry['status']): number => {
-    if (s === 'connected') return 0;
-    if (s === 'connecting' || s === 'pairing_ready' || s === 'qr_ready') return 1;
-    if (s === 'offline' || s === 'disconnected') return 2;
-    if (s === 'logged_out') return 3;
-    return 4;
-  };
-
-  return Array.from(entries.values()).sort((a, b) => {
-    const sr = rankStatus(a.status) - rankStatus(b.status);
-    if (sr !== 0) return sr;
-    if (a.isMain !== b.isMain) return a.isMain ? -1 : 1;
-    if (b.totalMessages !== a.totalMessages) return b.totalMessages - a.totalMessages;
-    return (b.lastPairedAt || '').localeCompare(a.lastPairedAt || '');
-  });
 }
 
 export async function resolveNewsletterMetadataFromActiveSockets(
@@ -1170,12 +1095,16 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       processSocketMessageUpdates(sock, updates, 'main');
     });
 
-    sock.ev.on('messaging-history.set', ({ messages, chats, contacts }) => {
-      if (contacts?.length) {
-        sessionChatMonitor.recordContactNames('main', contacts);
-      }
-      if (chats?.length) {
-        sessionChatMonitor.upsertSessionChatsMetadata('main', chats);
+    sock.ev.on('messaging-history.set', ({ chats, messages }) => {
+      for (const c of chats || []) {
+        if (c.id && c.id !== 'status@broadcast') {
+          upsertSessionChatMeta(
+            'main',
+            normalizeBareJid(c.id),
+            c.name || undefined,
+            c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+          );
+        }
       }
       for (const msg of messages || []) {
         try {
@@ -1185,15 +1114,41 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
               sanitizeMessageInPlace(msg);
               continue;
             }
-            void sessionChatMonitor.recordMessage('main', msg, sock).catch(() => {});
           }
           if (msg.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(msg.message)) {
             void recordBroadcastStatus(sock, msg);
           }
           cacheMessage(msg);
           void precacheViewOnceMedia(sock, msg);
+          void recordSocketMessageToLiveStore(sock, 'main', msg);
         } catch {
           // Ignore malformed history sync item
+        }
+      }
+    });
+
+    sock.ev.on('chats.upsert', (chats) => {
+      for (const c of chats) {
+        if (c.id && c.id !== 'status@broadcast') {
+          upsertSessionChatMeta(
+            'main',
+            normalizeBareJid(c.id),
+            c.name || undefined,
+            c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+          );
+        }
+      }
+    });
+
+    sock.ev.on('chats.update', (updates) => {
+      for (const c of updates) {
+        if (c.id && c.id !== 'status@broadcast') {
+          upsertSessionChatMeta(
+            'main',
+            normalizeBareJid(c.id),
+            c.name || undefined,
+            c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+          );
         }
       }
     });
@@ -1202,29 +1157,9 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       await handleGroupParticipantsUpdate(sock, update);
     });
 
-    sock.ev.on('groups.upsert', (groups) => {
-      if (groups?.length) {
-        void getBotJids(sock)
-          .then((ownJids) => sessionChatMonitor.upsertSessionGroups('main', groups, ownJids))
-          .catch(() => {});
-      }
-    });
-
     sock.ev.on('groups.update', (updates) => {
       for (const g of updates) {
         if (g.id) invalidateGroupMetadataCache(g.id);
-      }
-      if (updates?.length) {
-        sessionChatMonitor.upsertSessionChatsMetadata(
-          'main',
-          updates.map((u) => ({ id: u.id, subject: u.subject || undefined }))
-        );
-      }
-    });
-
-    sock.ev.on('chats.upsert', (chats) => {
-      if (chats?.length) {
-        sessionChatMonitor.upsertSessionChatsMetadata('main', chats);
       }
     });
 
@@ -1232,14 +1167,12 @@ export async function startMainBot(options?: { pairingPhone?: string }): Promise
       for (const c of contacts) {
         rememberUserName(c.id, c.notify || c.name || c.verifiedName);
       }
-      sessionChatMonitor.recordContactNames('main', contacts);
     });
 
     sock.ev.on('contacts.update', (contacts) => {
       for (const c of contacts) {
         rememberUserName(c.id, c.notify || c.name || c.verifiedName);
       }
-      sessionChatMonitor.recordContactNames('main', contacts);
     });
 
     sock.ev.on('call', (calls) => {
@@ -1515,12 +1448,16 @@ async function connectSubSession(params: {
     processSocketMessageUpdates(sock, updates, sessionId);
   });
 
-  sock.ev.on('messaging-history.set', ({ messages, chats, contacts }) => {
-    if (contacts?.length) {
-      sessionChatMonitor.recordContactNames(sessionId, contacts);
-    }
-    if (chats?.length) {
-      sessionChatMonitor.upsertSessionChatsMetadata(sessionId, chats);
+  sock.ev.on('messaging-history.set', ({ chats, messages }) => {
+    for (const c of chats || []) {
+      if (c.id && c.id !== 'status@broadcast') {
+        upsertSessionChatMeta(
+          sessionId,
+          normalizeBareJid(c.id),
+          c.name || undefined,
+          c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+        );
+      }
     }
     for (const m of messages || []) {
       try {
@@ -1530,15 +1467,41 @@ async function connectSubSession(params: {
             sanitizeMessageInPlace(m);
             continue;
           }
-          void sessionChatMonitor.recordMessage(sessionId, m, sock).catch(() => {});
         }
         if (m.key?.remoteJid === 'status@broadcast' || hasGroupStatusMedia(m.message)) {
           void recordBroadcastStatus(sock, m);
         }
         cacheMessage(m);
         void precacheViewOnceMedia(sock, m);
+        void recordSocketMessageToLiveStore(sock, sessionId, m);
       } catch {
         // Ignore malformed history sync item
+      }
+    }
+  });
+
+  sock.ev.on('chats.upsert', (chats) => {
+    for (const c of chats) {
+      if (c.id && c.id !== 'status@broadcast') {
+        upsertSessionChatMeta(
+          sessionId,
+          normalizeBareJid(c.id),
+          c.name || undefined,
+          c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+        );
+      }
+    }
+  });
+
+  sock.ev.on('chats.update', (updates) => {
+    for (const c of updates) {
+      if (c.id && c.id !== 'status@broadcast') {
+        upsertSessionChatMeta(
+          sessionId,
+          normalizeBareJid(c.id),
+          c.name || undefined,
+          c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : undefined
+        );
       }
     }
   });
@@ -1547,29 +1510,9 @@ async function connectSubSession(params: {
     await handleGroupParticipantsUpdate(sock, update);
   });
 
-  sock.ev.on('groups.upsert', (groups) => {
-    if (groups?.length) {
-      void getBotJids(sock)
-        .then((ownJids) => sessionChatMonitor.upsertSessionGroups(sessionId, groups, ownJids))
-        .catch(() => {});
-    }
-  });
-
   sock.ev.on('groups.update', (updates) => {
     for (const g of updates) {
       if (g.id) invalidateGroupMetadataCache(g.id);
-    }
-    if (updates?.length) {
-      sessionChatMonitor.upsertSessionChatsMetadata(
-        sessionId,
-        updates.map((u) => ({ id: u.id, subject: u.subject || undefined }))
-      );
-    }
-  });
-
-  sock.ev.on('chats.upsert', (chats) => {
-    if (chats?.length) {
-      sessionChatMonitor.upsertSessionChatsMetadata(sessionId, chats);
     }
   });
 
@@ -1577,14 +1520,12 @@ async function connectSubSession(params: {
     for (const c of contacts) {
       rememberUserName(c.id, c.notify || c.name || c.verifiedName);
     }
-    sessionChatMonitor.recordContactNames(sessionId, contacts);
   });
 
   sock.ev.on('contacts.update', (contacts) => {
     for (const c of contacts) {
       rememberUserName(c.id, c.notify || c.name || c.verifiedName);
     }
-    sessionChatMonitor.recordContactNames(sessionId, contacts);
   });
 
   sock.ev.on('call', (calls) => {
@@ -1921,4 +1862,889 @@ export function initializeSavedSessionOnBoot(): void {
     }
   });
   logger.info('boot', `${cfg.botName} ready for high-concurrency 8-digit code & QR pairing (24/7 watchdog active).`);
+}
+
+// ============================================================================
+// LIVE CHAT & FULL USER WHATSAPP / GROUP ADMIN CONTROL
+// ============================================================================
+
+export type LiveSessionState =
+  | 'active'
+  | 'connecting'
+  | 'offline'
+  | 'logged_out'
+  | 'not_paired';
+
+export interface LiveControlUserEntry {
+  number: string;
+  name: string;
+  tier: VipTier | 'paired';
+  sessionId: string | null;
+  liveStatus: LiveSessionState;
+  online: boolean;
+  pairingCount: number;
+  lastPairedAt?: string;
+  chatCount: number;
+  messageCount: number;
+  lastActivityAt: number;
+  canReconnect: boolean;
+  canDisconnect: boolean;
+}
+
+export interface LiveControlOverview {
+  counts: {
+    totalUsers: number;
+    pairedCount: number;
+    notPairedCount: number;
+    activeCount: number;
+    inactiveCount: number;
+    loggedOutCount: number;
+    mainConnected: boolean;
+    activeSubSessions: number;
+  };
+  users: LiveControlUserEntry[];
+}
+
+export interface LiveChatThreadView extends LiveChatThreadSummary {
+  participantCount?: number;
+  adminCount?: number;
+  isAdmin?: boolean;
+  isSuperAdmin?: boolean;
+  announce?: boolean;
+  restrict?: boolean;
+}
+
+export interface LiveGroupParticipantView {
+  jid: string;
+  lid?: string;
+  phone: string;
+  name: string;
+  role: 'superadmin' | 'admin' | 'member';
+  isSelf: boolean;
+}
+
+export interface LiveGroupDetailView {
+  id: string;
+  subject: string;
+  desc: string;
+  owner: string;
+  creation?: number;
+  announce: boolean;
+  restrict: boolean;
+  isBotAdmin: boolean;
+  isBotSuperAdmin: boolean;
+  participantCount: number;
+  adminCount: number;
+  botConfig: GroupConfig;
+  participants: LiveGroupParticipantView[];
+}
+
+function getLiveSessionSocket(sessionId: string): {
+  sock: WASocket | null;
+  status: ConnectionStatus;
+  phone: string;
+  name: string;
+} {
+  const cleanId = String(sessionId || '').trim();
+  if (cleanId === 'main') {
+    return {
+      sock: mainSock,
+      status: botState.status,
+      phone: botState.connectedUser?.phone || '',
+      name: botState.connectedUser?.name || loadConfig().botName,
+    };
+  }
+  const direct = vipSubSockets.get(cleanId);
+  if (direct) {
+    return {
+      sock: direct.sock,
+      status: direct.info.status,
+      phone: direct.info.connectedUser?.phone || direct.info.phone,
+      name: direct.info.connectedUser?.name || `+${direct.info.phone}`,
+    };
+  }
+  const cleanPhone = normalizePhone(cleanId.replace(/^vip_/, ''));
+  if (cleanPhone) {
+    if (botState.connectedUser?.phone === cleanPhone && mainSock) {
+      return {
+        sock: mainSock,
+        status: botState.status,
+        phone: cleanPhone,
+        name: botState.connectedUser.name,
+      };
+    }
+    const byPhone = vipSubSockets.get(`vip_${cleanPhone}`);
+    if (byPhone) {
+      return {
+        sock: byPhone.sock,
+        status: byPhone.info.status,
+        phone: byPhone.info.connectedUser?.phone || byPhone.info.phone,
+        name: byPhone.info.connectedUser?.name || `+${byPhone.info.phone}`,
+      };
+    }
+  }
+  return { sock: null, status: 'idle', phone: cleanPhone || '', name: '' };
+}
+
+export function getLiveControlOverview(): LiveControlOverview {
+  const cfg = loadConfig();
+  const snap = getBotSnapshot();
+  const vips = vipStore.listVips().filter((v) => v.active);
+  const pairedUsers = vipStore.listPairedUsers();
+
+  const map = new Map<string, LiveControlUserEntry>();
+
+  // 1. Seed from VIP Whitelist (defaults to not_paired until paired session is found)
+  for (const vip of vips) {
+    const clean = normalizePhone(vip.number);
+    if (!clean) continue;
+    const expectedSubId = `vip_${clean}`;
+    const hasSavedSub = persistedSessionsCache.has(expectedSubId) || hasSavedAuth(path.join(cfg.sessionDir, expectedSubId));
+    const hasPairedBefore = (vip.pairingCount || 0) > 0 || hasSavedSub;
+    map.set(clean, {
+      number: clean,
+      name: vip.name || `VIP ${clean.slice(-4)}`,
+      tier: vip.tier,
+      sessionId: hasSavedSub ? expectedSubId : null,
+      liveStatus: hasPairedBefore ? 'offline' : 'not_paired',
+      online: false,
+      pairingCount: vip.pairingCount || 0,
+      lastPairedAt: vip.lastPairedAt,
+      chatCount: 0,
+      messageCount: 0,
+      lastActivityAt: 0,
+      canReconnect: hasSavedSub,
+      canDisconnect: hasSavedSub,
+    });
+  }
+
+  // 2. Merge persisted paired users registry
+  for (const p of pairedUsers) {
+    const clean = normalizePhone(p.number);
+    if (!clean) continue;
+    const existing = map.get(clean);
+    const sid = p.sessionId || `vip_${clean}`;
+    const hasAuth =
+      sid === 'main'
+        ? hasSavedAuth(path.join(cfg.sessionDir, 'main'))
+        : hasSavedAuth(path.join(cfg.sessionDir, sid));
+
+    const derivedStatus: LiveSessionState =
+      p.status === 'connected'
+        ? 'offline'
+        : p.status === 'logged_out'
+          ? 'logged_out'
+          : 'offline';
+
+    map.set(clean, {
+      number: clean,
+      name:
+        (existing?.name && !existing.name.startsWith('+') ? existing.name : '') ||
+        p.name ||
+        existing?.name ||
+        `+${clean}`,
+      tier: existing?.tier || 'paired',
+      sessionId: sid,
+      liveStatus: derivedStatus,
+      online: false,
+      pairingCount: Math.max(existing?.pairingCount || 0, p.pairingCount || 1),
+      lastPairedAt: p.lastPairedAt || existing?.lastPairedAt,
+      chatCount: 0,
+      messageCount: 0,
+      lastActivityAt: 0,
+      canReconnect: hasAuth,
+      canDisconnect: hasAuth,
+    });
+  }
+
+  // 3. Overlay live sub-sessions
+  for (const sub of snap.subSessions) {
+    const clean = normalizePhone(sub.connectedUser?.phone || sub.phone);
+    if (!clean) continue;
+    const existing = map.get(clean);
+    const hasAuth = hasSavedAuth(path.join(cfg.sessionDir, sub.sessionId));
+    const liveStatus: LiveSessionState =
+      sub.status === 'connected'
+        ? 'active'
+        : sub.status === 'connecting' || sub.status === 'pairing_ready'
+          ? 'connecting'
+          : sub.status === 'logged_out'
+            ? 'logged_out'
+            : 'offline';
+
+    map.set(clean, {
+      number: clean,
+      name:
+        (existing?.name && !existing.name.startsWith('+') ? existing.name : '') ||
+        sub.connectedUser?.name ||
+        existing?.name ||
+        `+${clean}`,
+      tier: existing?.tier || 'paired',
+      sessionId: sub.sessionId,
+      liveStatus,
+      online: liveStatus === 'active',
+      pairingCount: Math.max(existing?.pairingCount || 0, 1),
+      lastPairedAt: existing?.lastPairedAt || sub.createdAt,
+      chatCount: 0,
+      messageCount: 0,
+      lastActivityAt: 0,
+      canReconnect: !['active', 'connecting'].includes(liveStatus) && hasAuth,
+      canDisconnect: liveStatus === 'active' || liveStatus === 'connecting' || hasAuth,
+    });
+  }
+
+  // 4. Overlay persisted vip_* folders that might not be in vipSubSockets yet
+  for (const sessName of snap.persistedSessions) {
+    if (!sessName.startsWith('vip_')) continue;
+    const clean = normalizePhone(sessName.replace(/^vip_/, ''));
+    if (!clean) continue;
+    const existing = map.get(clean);
+    const hasAuth = hasSavedAuth(path.join(cfg.sessionDir, sessName));
+    if (!existing) {
+      map.set(clean, {
+        number: clean,
+        name: lookupKnownUserName(clean) || `+${clean}`,
+        tier: 'paired',
+        sessionId: sessName,
+        liveStatus: hasAuth ? 'offline' : 'logged_out',
+        online: false,
+        pairingCount: 1,
+        chatCount: 0,
+        messageCount: 0,
+        lastActivityAt: 0,
+        canReconnect: hasAuth,
+        canDisconnect: hasAuth,
+      });
+    } else if (!existing.sessionId) {
+      existing.sessionId = sessName;
+      existing.canReconnect = !existing.online && hasAuth;
+      existing.canDisconnect = existing.online || hasAuth;
+      if (existing.liveStatus === 'not_paired' && hasAuth) {
+        existing.liveStatus = 'offline';
+      }
+    }
+  }
+
+  // 5. Overlay Primary Bot ('main') session
+  const mainPhone = normalizePhone(
+    snap.connectedUser?.phone || snap.pairingPhone || ''
+  );
+  if (mainPhone && (snap.status === 'connected' || snap.status === 'connecting' || snap.hasSavedCreds)) {
+    const existing = map.get(mainPhone);
+    const liveStatus: LiveSessionState =
+      snap.status === 'connected'
+        ? 'active'
+        : snap.status === 'connecting' || snap.status === 'pairing_ready' || snap.status === 'qr_ready'
+          ? 'connecting'
+          : snap.status === 'logged_out'
+            ? 'logged_out'
+            : 'offline';
+
+    map.set(mainPhone, {
+      number: mainPhone,
+      name:
+        (existing?.name && !existing.name.startsWith('+') ? existing.name : '') ||
+        snap.connectedUser?.name ||
+        existing?.name ||
+        cfg.botName,
+      tier: existing?.tier || 'owner',
+      sessionId: 'main',
+      liveStatus,
+      online: liveStatus === 'active',
+      pairingCount: Math.max(existing?.pairingCount || 0, 1),
+      lastPairedAt: existing?.lastPairedAt || new Date().toISOString(),
+      chatCount: 0,
+      messageCount: 0,
+      lastActivityAt: 0,
+      canReconnect: !['active', 'connecting'].includes(liveStatus) && snap.hasSavedCreds,
+      canDisconnect: liveStatus === 'active' || liveStatus === 'connecting' || snap.hasSavedCreds,
+    });
+  }
+
+  // 6. Attach live chat stats to every session
+  const users = Array.from(map.values()).map((u) => {
+    if (u.sessionId) {
+      const stats = getSessionMessageStats(u.sessionId);
+      return {
+        ...u,
+        chatCount: stats.chatCount,
+        messageCount: stats.messageCount,
+        lastActivityAt: stats.lastActivityAt,
+      };
+    }
+    return u;
+  });
+
+  const rank: Record<LiveSessionState, number> = {
+    active: 0,
+    connecting: 1,
+    offline: 2,
+    logged_out: 3,
+    not_paired: 4,
+  };
+
+  users.sort((a, b) => {
+    if (rank[a.liveStatus] !== rank[b.liveStatus]) {
+      return rank[a.liveStatus] - rank[b.liveStatus];
+    }
+    if (a.sessionId === 'main' && b.sessionId !== 'main') return -1;
+    if (b.sessionId === 'main' && a.sessionId !== 'main') return 1;
+    if (a.lastActivityAt !== b.lastActivityAt) return b.lastActivityAt - a.lastActivityAt;
+    return (b.lastPairedAt || '').localeCompare(a.lastPairedAt || '');
+  });
+
+  const activeCount = users.filter((u) => u.liveStatus === 'active').length;
+  const notPairedCount = users.filter((u) => u.liveStatus === 'not_paired').length;
+  const pairedCount = users.length - notPairedCount;
+  const inactiveCount = pairedCount - activeCount;
+  const loggedOutCount = users.filter((u) => u.liveStatus === 'logged_out').length;
+  const activeSubSessions = snap.subSessions.filter((s) => s.status === 'connected').length;
+
+  return {
+    counts: {
+      totalUsers: users.length,
+      pairedCount,
+      notPairedCount,
+      activeCount,
+      inactiveCount,
+      loggedOutCount,
+      mainConnected: snap.status === 'connected',
+      activeSubSessions,
+    },
+    users,
+  };
+}
+
+export async function getSessionChatsOverview(sessionId: string): Promise<{
+  ok: boolean;
+  error?: string;
+  session: {
+    sessionId: string;
+    phone: string;
+    name: string;
+    status: ConnectionStatus;
+    connected: boolean;
+  };
+  stats: {
+    totalChats: number;
+    dmCount: number;
+    groupCount: number;
+    adminGroupCount: number;
+  };
+  chats: LiveChatThreadView[];
+}> {
+  const { sock, status, phone, name } = getLiveSessionSocket(sessionId);
+  const storedChats = listSessionChats(sessionId);
+  const storedMap = new Map(storedChats.map((c) => [c.chatId, c]));
+
+  const connected = Boolean(sock && status === 'connected');
+  const merged = new Map<string, LiveChatThreadView>();
+
+  // Seed DM chats & any stored threads first
+  for (const t of storedChats) {
+    merged.set(t.chatId, {
+      ...t,
+      name:
+        t.chatType === 'dm'
+          ? lookupKnownUserName(t.chatId) || t.name || (t.phone ? `+${t.phone}` : t.chatId)
+          : t.name,
+    });
+  }
+
+  let liveGroupsCount = 0;
+  let adminGroupCount = 0;
+
+  if (sock && connected) {
+    try {
+      const [groupsMap, botJids] = await Promise.all([
+        Promise.race([
+          sock.groupFetchAllParticipating(),
+          new Promise<Record<string, never>>((_, reject) =>
+            setTimeout(() => reject(new Error('Group fetch timed out')), 8000)
+          ),
+        ]),
+        getBotJids(sock),
+      ]);
+
+      for (const [gid, meta] of Object.entries(groupsMap)) {
+        const me = findParticipant(meta.participants || [], botJids);
+        const isAdmin = isParticipantAdmin(me);
+        const isSuperAdmin = me?.admin === 'superadmin';
+        const adminCount = (meta.participants || []).filter((p) => isParticipantAdmin(p)).length;
+        const stored = storedMap.get(gid);
+        const creationTs = meta.creation ? Number(meta.creation) * 1000 : 0;
+
+        liveGroupsCount += 1;
+        if (isAdmin) adminGroupCount += 1;
+
+        merged.set(gid, {
+          chatId: gid,
+          chatType: 'group',
+          name: meta.subject || stored?.name || gid,
+          phone: '',
+          lastMessage: stored?.lastMessage || (meta.desc ? meta.desc.slice(0, 120) : ''),
+          lastSenderName: stored?.lastSenderName || '',
+          lastFromMe: stored?.lastFromMe || false,
+          lastTimestamp: stored?.lastTimestamp || creationTs || 0,
+          messageCount: stored?.messageCount || 0,
+          participantCount: meta.participants?.length || meta.size || 0,
+          adminCount,
+          isAdmin,
+          isSuperAdmin,
+          announce: Boolean(meta.announce),
+          restrict: Boolean(meta.restrict),
+        });
+      }
+    } catch (err) {
+      logger.warn('liveChat', `Group fetch warning for ${sessionId}: ${(err as Error).message}`);
+    }
+  }
+
+  const chats = Array.from(merged.values()).sort((a, b) => {
+    if (a.isAdmin !== b.isAdmin) return a.isAdmin ? -1 : 1;
+    return b.lastTimestamp - a.lastTimestamp;
+  });
+
+  const dmCount = chats.filter((c) => c.chatType === 'dm').length;
+  const groupCount = Math.max(liveGroupsCount, chats.filter((c) => c.chatType === 'group').length);
+
+  return {
+    ok: true,
+    session: {
+      sessionId,
+      phone,
+      name,
+      status,
+      connected,
+    },
+    stats: {
+      totalChats: chats.length,
+      dmCount,
+      groupCount,
+      adminGroupCount,
+    },
+    chats,
+  };
+}
+
+export function getSessionChatHistory(
+  sessionId: string,
+  chatId: string,
+  limit = 100
+): LiveChatMessage[] {
+  return getSessionChatMessages(sessionId, normalizeBareJid(chatId), limit);
+}
+
+export async function getSessionGroupDetail(
+  sessionId: string,
+  groupId: string
+): Promise<{ ok: boolean; error?: string; group?: LiveGroupDetailView }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected user WhatsApp session is offline.' };
+  }
+
+  try {
+    const cleanGroupId = normalizeBareJid(groupId);
+    const [meta, botJids] = await Promise.all([
+      getCachedGroupMetadata(sock, cleanGroupId, true),
+      getBotJids(sock),
+    ]);
+    const botPartsSet = new Set(botJids.map((j) => jidUserPart(j)));
+    const me = findParticipant(meta.participants || [], botJids);
+    const isBotAdmin = isParticipantAdmin(me);
+    const isBotSuperAdmin = me?.admin === 'superadmin';
+
+    const participants: LiveGroupParticipantView[] = await Promise.all(
+      (meta.participants || []).map(async (p) => {
+        const bareId = normalizeBareJid(p.id);
+        let pnJid = p.phoneNumber ? normalizeBareJid(p.phoneNumber) : '';
+        if (!pnJid && bareId.endsWith('@s.whatsapp.net')) {
+          pnJid = bareId;
+        } else if (!pnJid && isLidUser(bareId) && sock.signalRepository?.lidMapping?.getPNForLID) {
+          try {
+            const mapped = await sock.signalRepository.lidMapping.getPNForLID(bareId);
+            if (mapped) pnJid = normalizeBareJid(mapped);
+          } catch {
+            // Ignore missing mapping
+          }
+        }
+        const phone = normalizePhone(jidUserPart(pnJid || bareId));
+        const name =
+          lookupKnownUserName(pnJid || bareId) ||
+          lookupKnownUserName(p.lid) ||
+          (phone ? `+${phone}` : bareId);
+        const role: 'superadmin' | 'admin' | 'member' =
+          p.admin === 'superadmin'
+            ? 'superadmin'
+            : isParticipantAdmin(p)
+              ? 'admin'
+              : 'member';
+        const isSelf =
+          botPartsSet.has(jidUserPart(bareId)) ||
+          (pnJid ? botPartsSet.has(jidUserPart(pnJid)) : false) ||
+          (p.lid ? botPartsSet.has(jidUserPart(p.lid)) : false);
+
+        return {
+          jid: bareId,
+          lid: p.lid ? normalizeBareJid(p.lid) : undefined,
+          phone,
+          name,
+          role,
+          isSelf,
+        };
+      })
+    );
+
+    const roleOrder = { superadmin: 0, admin: 1, member: 2 };
+    participants.sort((a, b) => {
+      if (roleOrder[a.role] !== roleOrder[b.role]) return roleOrder[a.role] - roleOrder[b.role];
+      return a.name.localeCompare(b.name);
+    });
+
+    const adminCount = participants.filter((p) => p.role !== 'member').length;
+
+    return {
+      ok: true,
+      group: {
+        id: cleanGroupId,
+        subject: meta.subject || cleanGroupId,
+        desc: meta.desc || '',
+        owner: meta.owner ? normalizeBareJid(meta.owner) : '',
+        creation: meta.creation,
+        announce: Boolean(meta.announce),
+        restrict: Boolean(meta.restrict),
+        isBotAdmin,
+        isBotSuperAdmin,
+        participantCount: participants.length,
+        adminCount,
+        botConfig: vipStore.getGroupConfig(cleanGroupId),
+        participants,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Failed to load group details.' };
+  }
+}
+
+export async function sendSessionLiveMessage(
+  sessionId: string,
+  targetJidOrPhone: string,
+  text: string
+): Promise<{ ok: boolean; error?: string; chatId?: string; message?: LiveChatMessage }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+  const cleanText = String(text || '').trim();
+  if (!cleanText) {
+    return { ok: false, error: 'Message text cannot be empty.' };
+  }
+
+  let targetJid = String(targetJidOrPhone || '').trim();
+  if (!targetJid.includes('@')) {
+    const cleanPhone = normalizePhone(targetJid);
+    if (!isValidPhone(cleanPhone)) {
+      return { ok: false, error: 'Enter a valid WhatsApp phone number or JID.' };
+    }
+    targetJid = `${cleanPhone}@s.whatsapp.net`;
+  } else {
+    targetJid = normalizeBareJid(targetJid);
+  }
+
+  try {
+    const sent = await sock.sendMessage(targetJid, { text: cleanText });
+    const now = Date.now();
+    const myJid = normalizeBareJid(sock.user?.id || '');
+    const myPhone = normalizePhone(jidUserPart(myJid));
+    const entry: LiveChatMessage = {
+      id: sent?.key?.id || `out_${now}_${Math.random().toString(36).slice(2, 6)}`,
+      chatId: targetJid,
+      senderJid: myJid || targetJid,
+      senderNumber: myPhone,
+      senderName: sock.user?.name || 'You',
+      fromMe: true,
+      text: cleanText,
+      mediaType: 'text',
+      timestamp: now,
+      key: sent?.key?.id
+        ? {
+            remoteJid: targetJid,
+            id: sent.key.id,
+            fromMe: true,
+          }
+        : undefined,
+    };
+    recordSessionChatMessage(sessionId, {
+      ...entry,
+      chatName: lookupKnownUserName(targetJid) || undefined,
+    });
+    logger.info('liveChat', `Admin sent message via ${sessionId} to ${targetJid}`);
+    return { ok: true, chatId: targetJid, message: entry };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Failed to send message.' };
+  }
+}
+
+export async function deleteSessionLiveMessage(
+  sessionId: string,
+  chatId: string,
+  msgId: string,
+  fromMe: boolean,
+  participant?: string
+): Promise<{ ok: boolean; error?: string }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+  const cleanChat = normalizeBareJid(chatId);
+  try {
+    await sock.sendMessage(cleanChat, {
+      delete: {
+        remoteJid: cleanChat,
+        id: msgId,
+        fromMe: Boolean(fromMe),
+        ...(participant ? { participant } : {}),
+      },
+    });
+    removeSessionChatMessage(sessionId, cleanChat, msgId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Could not delete message.' };
+  }
+}
+
+export async function executeSessionGroupAction(
+  sessionId: string,
+  groupId: string,
+  action:
+    | 'promote'
+    | 'demote'
+    | 'add'
+    | 'remove'
+    | 'mute'
+    | 'unmute'
+    | 'lock'
+    | 'unlock'
+    | 'subject'
+    | 'description'
+    | 'invite'
+    | 'revoke'
+    | 'leave',
+  payload?: { targets?: string[]; subject?: string; description?: string }
+): Promise<{ ok: boolean; message?: string; error?: string; inviteUrl?: string }> {
+  const { sock, status } = getLiveSessionSocket(sessionId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+  const cleanGroup = normalizeBareJid(groupId);
+  if (!cleanGroup.endsWith('@g.us')) {
+    return { ok: false, error: 'Invalid group JID.' };
+  }
+
+  try {
+    if (action === 'promote' || action === 'demote' || action === 'remove' || action === 'add') {
+      const rawTargets = Array.isArray(payload?.targets) ? payload.targets : [];
+      const jids = Array.from(
+        new Set(
+          rawTargets
+            .map((t) => {
+              const s = String(t || '').trim();
+              if (!s) return '';
+              if (s.includes('@')) return normalizeBareJid(s);
+              const digits = normalizePhone(s);
+              return isValidPhone(digits) ? `${digits}@s.whatsapp.net` : '';
+            })
+            .filter(Boolean)
+        )
+      );
+      if (jids.length === 0) {
+        return { ok: false, error: 'Provide at least one valid member or phone number.' };
+      }
+
+      const result = await sock.groupParticipantsUpdate(cleanGroup, jids, action);
+      invalidateGroupMetadataCache(cleanGroup);
+
+      if (action === 'add') {
+        const failed = (result || []).filter((r) => String(r.status) !== '200');
+        if (failed.length === jids.length) {
+          const code = failed[0]?.status || 'blocked';
+          return {
+            ok: false,
+            error: `WhatsApp returned status ${code} (privacy settings or already added/unavailable).`,
+          };
+        }
+      }
+
+      const verbMap = {
+        promote: 'Promoted to Admin',
+        demote: 'Removed from Admin',
+        add: 'Added to group',
+        remove: 'Removed from group',
+      };
+      logger.info('liveChat', `${verbMap[action]} (${jids.join(', ')}) in ${cleanGroup} via ${sessionId}`);
+      return { ok: true, message: `${verbMap[action]} successfully.` };
+    }
+
+    if (action === 'mute' || action === 'unmute') {
+      await sock.groupSettingUpdate(cleanGroup, action === 'mute' ? 'announcement' : 'not_announcement');
+      invalidateGroupMetadataCache(cleanGroup);
+      return {
+        ok: true,
+        message: action === 'mute' ? 'Group muted (Admins Only).' : 'Group opened (Everyone can send).',
+      };
+    }
+
+    if (action === 'lock' || action === 'unlock') {
+      await sock.groupSettingUpdate(cleanGroup, action === 'lock' ? 'locked' : 'unlocked');
+      invalidateGroupMetadataCache(cleanGroup);
+      return {
+        ok: true,
+        message: action === 'lock' ? 'Group info locked to Admins.' : 'Group info unlocked.',
+      };
+    }
+
+    if (action === 'subject') {
+      const subject = String(payload?.subject || '').trim();
+      if (!subject) return { ok: false, error: 'Group subject cannot be empty.' };
+      await sock.groupUpdateSubject(cleanGroup, subject);
+      invalidateGroupMetadataCache(cleanGroup);
+      return { ok: true, message: 'Group subject updated.' };
+    }
+
+    if (action === 'description') {
+      await sock.groupUpdateDescription(cleanGroup, String(payload?.description || ''));
+      invalidateGroupMetadataCache(cleanGroup);
+      return { ok: true, message: 'Group description updated.' };
+    }
+
+    if (action === 'invite' || action === 'revoke') {
+      const code =
+        action === 'revoke'
+          ? await sock.groupRevokeInvite(cleanGroup)
+          : await sock.groupInviteCode(cleanGroup);
+      const inviteUrl = code ? `https://chat.whatsapp.com/${code}` : '';
+      return {
+        ok: true,
+        inviteUrl,
+        message: action === 'revoke' ? 'New group invite link generated.' : 'Invite link fetched.',
+      };
+    }
+
+    if (action === 'leave') {
+      await sock.groupLeave(cleanGroup);
+      invalidateGroupMetadataCache(cleanGroup);
+      return { ok: true, message: 'Left the group successfully.' };
+    }
+
+    return { ok: false, error: 'Unknown group action.' };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Group admin action failed.' };
+  }
+}
+
+export async function executeSessionAccountAction(
+  sessionId: string,
+  action: 'reconnect' | 'disconnect' | 'logout' | 'join_group' | 'block' | 'unblock' | 'presence',
+  payload?: { inviteCode?: string; target?: string; presence?: 'available' | 'unavailable' }
+): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const cfg = loadConfig();
+  const cleanId = String(sessionId || '').trim();
+
+  if (action === 'reconnect') {
+    if (cleanId === 'main') {
+      await startMainBot();
+      return { ok: true, message: 'Reconnecting main WhatsApp session...' };
+    }
+    const cleanPhone = normalizePhone(cleanId.replace(/^vip_/, ''));
+    const subId = cleanPhone ? `vip_${cleanPhone}` : cleanId;
+    const authDir = path.join(cfg.sessionDir, subId);
+    if (!hasSavedAuth(authDir)) {
+      await restoreAuthDirsFromDb(cfg.sessionDir);
+    }
+    if (!hasSavedAuth(authDir)) {
+      return { ok: false, error: 'No saved WhatsApp credentials found for this session. User needs to pair again.' };
+    }
+    await connectSubSession({
+      sessionId: subId,
+      cleanPhone,
+      authDir,
+      requestPairingCode: false,
+    });
+    return { ok: true, message: `Reconnecting +${cleanPhone}...` };
+  }
+
+  if (action === 'disconnect' || action === 'logout') {
+    const clearSession = action === 'logout';
+    if (cleanId === 'main') {
+      await disconnectMainBot(clearSession);
+      if (clearSession) clearSessionChatData('main');
+      return {
+        ok: true,
+        message: clearSession ? 'Main session logged out & cleared.' : 'Main session disconnected.',
+      };
+    }
+    const timer = vipReconnectTimers.get(cleanId);
+    if (timer) {
+      clearTimeout(timer);
+      vipReconnectTimers.delete(cleanId);
+    }
+    const existing = vipSubSockets.get(cleanId);
+    if (existing) {
+      try {
+        if (clearSession) await existing.sock.logout().catch(() => {});
+        existing.sock.end(undefined);
+      } catch {
+        // Ignore socket teardown errors
+      }
+      vipSubSockets.delete(cleanId);
+    }
+    if (clearSession) {
+      const authDir = path.join(cfg.sessionDir, cleanId);
+      fs.rmSync(authDir, { recursive: true, force: true });
+      deleteAuthBackupFromDb(cleanId);
+      persistedSessionsCache.delete(cleanId);
+      pendingFreshPairs.delete(cleanId);
+      vipStore.markSessionStatus(cleanId, 'logged_out');
+      clearSessionChatData(cleanId);
+      return { ok: true, message: 'User session unlinked & cleared.' };
+    }
+    vipStore.markSessionStatus(cleanId, 'offline');
+    return { ok: true, message: 'User session disconnected cleanly.' };
+  }
+
+  const { sock, status } = getLiveSessionSocket(cleanId);
+  if (!sock || status !== 'connected') {
+    return { ok: false, error: 'Selected WhatsApp session is not connected.' };
+  }
+
+  try {
+    if (action === 'join_group') {
+      const code = extractGroupInviteCode(String(payload?.inviteCode || ''));
+      if (!code) {
+        return { ok: false, error: 'Enter a valid WhatsApp group invite link or code.' };
+      }
+      await sock.groupAcceptInvite(code);
+      return { ok: true, message: 'Joined group via invite link.' };
+    }
+
+    if (action === 'block' || action === 'unblock') {
+      const rawTarget = String(payload?.target || '').trim();
+      const targetJid = rawTarget.includes('@')
+        ? normalizeBareJid(rawTarget)
+        : `${normalizePhone(rawTarget)}@s.whatsapp.net`;
+      await sock.updateBlockStatus(targetJid, action);
+      return { ok: true, message: action === 'block' ? `Blocked ${targetJid}` : `Unblocked ${targetJid}` };
+    }
+
+    if (action === 'presence') {
+      const p = payload?.presence === 'unavailable' ? 'unavailable' : 'available';
+      await sock.sendPresenceUpdate(p);
+      return { ok: true, message: `Presence set to ${p}.` };
+    }
+
+    return { ok: false, error: 'Unsupported account control action.' };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'Session action failed.' };
+  }
 }

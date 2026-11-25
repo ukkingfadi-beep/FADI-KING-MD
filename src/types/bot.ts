@@ -281,60 +281,112 @@ export interface ReportExecutionLog {
   timestamp: string;
 }
 
-export type MonitorMediaType =
-  | 'text'
-  | 'image'
-  | 'video'
-  | 'audio'
-  | 'sticker'
-  | 'document'
-  | 'contact'
-  | 'location'
-  | 'poll'
-  | 'other';
+export type LiveSessionState =
+  | 'active'
+  | 'connecting'
+  | 'offline'
+  | 'logged_out'
+  | 'not_paired';
 
-export interface MonitorSessionEntry {
-  sessionId: string;
-  phone: string;
+export interface LiveControlUserEntry {
+  number: string;
   name: string;
-  tier: 'main' | 'owner' | 'diamond' | 'gold' | 'paired';
-  status: ConnectionStatus | 'offline' | 'not_paired';
-  isMain: boolean;
-  isPaidVip: boolean;
+  tier: VipTier | 'paired';
+  sessionId: string | null;
+  liveStatus: LiveSessionState;
+  online: boolean;
   pairingCount: number;
   lastPairedAt?: string;
-  totalGroups: number;
-  totalDms: number;
-  totalMessages: number;
+  chatCount: number;
+  messageCount: number;
+  lastActivityAt: number;
+  canReconnect: boolean;
+  canDisconnect: boolean;
 }
 
-export interface SessionChatSummary {
-  sessionId: string;
+export interface LiveControlOverview {
+  counts: {
+    totalUsers: number;
+    pairedCount: number;
+    notPairedCount: number;
+    activeCount: number;
+    inactiveCount: number;
+    loggedOutCount: number;
+    mainConnected: boolean;
+    activeSubSessions: number;
+  };
+  users: LiveControlUserEntry[];
+}
+
+export interface LiveChatThreadItem {
   chatId: string;
-  isGroup: boolean;
-  title: string;
-  phone?: string;
-  participantCount?: number;
-  isAdmin?: boolean;
-  announce?: boolean;
+  chatType: 'dm' | 'group';
+  name: string;
+  phone: string;
   lastMessage: string;
-  lastSender: string;
+  lastSenderName: string;
   lastFromMe: boolean;
   lastTimestamp: number;
   messageCount: number;
+  participantCount?: number;
+  adminCount?: number;
+  isAdmin?: boolean;
+  isSuperAdmin?: boolean;
+  announce?: boolean;
+  restrict?: boolean;
 }
 
-export interface SessionLiveMessage {
+export interface LiveChatMessageItem {
   id: string;
-  sessionId: string;
   chatId: string;
-  chatTitle: string;
-  isGroup: boolean;
-  fromMe: boolean;
   senderJid: string;
-  senderPhone: string;
+  senderNumber: string;
   senderName: string;
-  mediaType: MonitorMediaType;
+  fromMe: boolean;
   text: string;
+  mediaType:
+    | 'text'
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'sticker'
+    | 'document'
+    | 'location'
+    | 'contact'
+    | 'poll'
+    | 'payment'
+    | 'other';
   timestamp: number;
+  key?: {
+    remoteJid: string;
+    id: string;
+    fromMe: boolean;
+    participant?: string;
+  };
 }
+
+export interface LiveGroupParticipantItem {
+  jid: string;
+  lid?: string;
+  phone: string;
+  name: string;
+  role: 'superadmin' | 'admin' | 'member';
+  isSelf: boolean;
+}
+
+export interface LiveGroupDetailItem {
+  id: string;
+  subject: string;
+  desc: string;
+  owner: string;
+  creation?: number;
+  announce: boolean;
+  restrict: boolean;
+  isBotAdmin: boolean;
+  isBotSuperAdmin: boolean;
+  participantCount: number;
+  adminCount: number;
+  botConfig: GroupConfig;
+  participants: LiveGroupParticipantItem[];
+}
+

@@ -13,7 +13,7 @@ import { AdminLogsPanel } from './components/AdminLogsPanel';
 import { BanUnbanReports } from './components/BanUnbanReports';
 import { BotControls } from './components/BotControls';
 import { CommandCenter } from './components/CommandCenter';
-import { LiveChatMonitor } from './components/LiveChatMonitor';
+import { LiveChatControl } from './components/LiveChatControl';
 import { LiveScreenAdmin } from './components/LiveScreenAdmin';
 import { PublicPairingBoard } from './components/PublicPairingBoard';
 import { SourceExplorer } from './components/SourceExplorer';
@@ -28,16 +28,16 @@ import type {
   VipUser,
 } from './types/bot';
 
-type AdminTabId = 'live' | 'chats' | 'vip' | 'commands' | 'reports' | 'controls' | 'logs' | 'source';
+type AdminTabId = 'live' | 'livechat' | 'vip' | 'commands' | 'reports' | 'controls' | 'logs' | 'source';
 
 const ADMIN_NAV_ITEMS: Array<{ id: AdminTabId; label: string }> = [
-  { id: 'live', label: 'Live & Alerts' },
-  { id: 'chats', label: 'Live Chats' },
+  { id: 'live', label: 'Live Screen' },
+  { id: 'livechat', label: 'Live Chat' },
   { id: 'vip', label: 'VIP Access' },
   { id: 'commands', label: 'Commands' },
-  { id: 'reports', label: 'Ban / Unban Reports' },
+  { id: 'reports', label: 'Ban / Unban' },
   { id: 'controls', label: 'Control' },
-  { id: 'logs', label: 'Logs & Health' },
+  { id: 'logs', label: 'Logs' },
   { id: 'source', label: 'Source' },
 ];
 
@@ -329,7 +329,7 @@ export default function App() {
               </a>
             </nav>
           ) : (
-            <nav className="hidden md:flex items-center gap-5">
+            <nav className="hidden md:flex items-center gap-4 overflow-x-auto">
               {ADMIN_NAV_ITEMS.map((item) => (
                 <button
                   key={item.id}
@@ -437,7 +437,12 @@ export default function App() {
                 onRefresh={refreshAll}
               />
             )}
-            {adminTab === 'chats' && <LiveChatMonitor adminToken={adminToken} />}
+            {adminTab === 'livechat' && (
+              <LiveChatControl
+                adminToken={adminToken}
+                onRefreshParent={refreshAll}
+              />
+            )}
             {adminTab === 'vip' && (
               <VipManager
                 vips={vips}
