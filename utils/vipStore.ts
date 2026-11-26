@@ -74,6 +74,8 @@ export interface GroupConfig {
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
   gcStatusWarnings?: Record<string, number>;
+  knownAdmins?: string[];
+  knownAdminPns?: Record<string, string>;
 }
 
 export interface CommandTimingRule {
@@ -565,6 +567,8 @@ export const vipStore = {
         welcome: false,
         welcomeImg: false,
         goodbye: false,
+        knownAdmins: [],
+        knownAdminPns: {},
       };
     }
     return {
@@ -593,6 +597,11 @@ export const vipStore = {
       welcome: Boolean(found.welcome),
       welcomeImg: Boolean(found.welcomeImg),
       goodbye: Boolean(found.goodbye),
+      knownAdmins: Array.isArray(found.knownAdmins) ? found.knownAdmins : [],
+      knownAdminPns:
+        found.knownAdminPns && typeof found.knownAdminPns === 'object'
+          ? found.knownAdminPns
+          : {},
     };
   },
 
@@ -624,6 +633,9 @@ export const vipStore = {
       welcome: Boolean(g.welcome),
       welcomeImg: Boolean(g.welcomeImg),
       goodbye: Boolean(g.goodbye),
+      knownAdmins: Array.isArray(g.knownAdmins) ? g.knownAdmins : [],
+      knownAdminPns:
+        g.knownAdminPns && typeof g.knownAdminPns === 'object' ? g.knownAdminPns : {},
     }));
   },
 
@@ -680,6 +692,20 @@ export const vipStore = {
     if (patch.gcStatusWarnings && typeof patch.gcStatusWarnings === 'object') {
       cleanPatch.gcStatusWarnings = patch.gcStatusWarnings;
     }
+    if (Array.isArray(patch.knownAdmins)) {
+      cleanPatch.knownAdmins = Array.from(
+        new Set(patch.knownAdmins.map((v) => String(v || '').trim()).filter(Boolean))
+      );
+    }
+    if (patch.knownAdminPns && typeof patch.knownAdminPns === 'object') {
+      const nextMap: Record<string, string> = {};
+      for (const [k, v] of Object.entries(patch.knownAdminPns)) {
+        const ck = String(k || '').trim();
+        const cv = String(v || '').trim();
+        if (ck && cv) nextMap[ck] = cv;
+      }
+      cleanPatch.knownAdminPns = nextMap;
+    }
 
     const updated: GroupConfig = { ...current, ...cleanPatch, groupId };
     groups[groupId] = updated;
@@ -718,6 +744,8 @@ export const vipStore = {
       warnings: {},
       antiScamWarnings: {},
       gcStatusWarnings: {},
+      knownAdmins: [],
+      knownAdminPns: {},
     };
     groups[groupId] = defaults;
     groupsCache = groups;

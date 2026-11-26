@@ -33,6 +33,7 @@ import {
   startMainBot,
   syncAutoJoinsAcrossConnectedSessions,
 } from './handlers/connection.ts';
+import { syncGroupAdminSnapshot } from './handlers/group.ts';
 import { executeConsoleCommand } from './handlers/message.ts';
 import {
   createAdminSession,
@@ -797,6 +798,12 @@ async function startServer(): Promise<void> {
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
     });
+    if (updated.antiAdminKick && req.params.groupId.endsWith('@g.us')) {
+      const activeSock = getPreferredActiveSocket();
+      if (activeSock) {
+        void syncGroupAdminSnapshot(activeSock, req.params.groupId, true);
+      }
+    }
     res.json({ ok: true, group: updated });
   });
 

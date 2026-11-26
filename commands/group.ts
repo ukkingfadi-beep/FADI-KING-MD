@@ -8,7 +8,7 @@ import {
   type WAMessage,
 } from '@whiskeysockets/baileys';
 import { isValidPhone, loadConfig, normalizePhone, saveConfig } from '../config/bot.config.ts';
-import { normalizeFileSha256 } from '../handlers/group.ts';
+import { normalizeFileSha256, recordKnownGroupAdmins } from '../handlers/group.ts';
 import {
   extractBodyText,
   extractContextInfo,
@@ -97,8 +97,19 @@ async function verifyGroupAdmins(
   }
 
   const botJids = await getBotJids(ctx.sock);
-  const botParticipant = findParticipant(participants, botJids);
-  const botIsAdmin = isParticipantAdmin(botParticipant);
+  let botParticipant = findParticipant(participants, botJids);
+  let botIsAdmin = isParticipantAdmin(botParticipant);
+
+  if (options.requireBotAdmin !== false && !botIsAdmin) {
+    try {
+      const freshMeta = await getCachedGroupMetadata(ctx.sock, groupId, true);
+      participants = freshMeta.participants || participants;
+      botParticipant = findParticipant(participants, botJids);
+      botIsAdmin = isParticipantAdmin(botParticipant);
+    } catch {
+      // Keep initial participants snapshot
+    }
+  }
 
   const senderCandidates =
     ctx.senderCandidates && ctx.senderCandidates.length > 0
@@ -2578,6 +2589,15 @@ async function togglePerGroupProtection(
 
   const enabled = arg === 'on';
   vipStore.updateGroupConfig(ctx.chatId, { [field]: enabled });
+
+  if (field === 'antiAdminKick' && enabled && ctx.sock && !ctx.isSimulated) {
+    try {
+      const freshMeta = await getCachedGroupMetadata(ctx.sock, ctx.chatId, true);
+      recordKnownGroupAdmins(ctx.chatId, freshMeta.participants || check.participants, true);
+    } catch {
+      recordKnownGroupAdmins(ctx.chatId, check.participants, true);
+    }
+  }
 
   let adminHint = '';
   if (

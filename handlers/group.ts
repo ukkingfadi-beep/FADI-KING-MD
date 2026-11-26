@@ -36,6 +36,7 @@ const stickerFloodTracker = new Map<string, number[]>();
 const msgFloodTracker = new Map<string, number[]>();
 const kickAllTracker = new Map<string, number[]>();
 const knownGroupAdminsCache = new Map<string, Set<string>>();
+const groupParticipantQueue = new Map<string, Promise<void>>();
 
 export function recordKnownGroupAdmins(
   groupId: string,
@@ -46,10 +47,13 @@ export function recordKnownGroupAdmins(
     admin?: string | null;
     isAdmin?: boolean;
     isSuperAdmin?: boolean;
-  }>
+  }>,
+  forcePersist = false
 ): void {
   if (!groupId || !Array.isArray(participants)) return;
   const adminKeys = new Set<string>();
+  const adminPnMap: Record<string, string> = {};
+
   for (const p of participants) {
     if (
       p.admin === 'admin' ||
@@ -57,24 +61,55 @@ export function recordKnownGroupAdmins(
       p.isAdmin ||
       p.isSuperAdmin
     ) {
+      const pnJidRaw = [p.phoneNumber, p.id, p.lid]
+        .map((v) => normalizeBareJid(v))
+        .find((v) => v && v.endsWith('@s.whatsapp.net'));
+
       for (const raw of [p.id, p.lid, p.phoneNumber]) {
         const part = jidUserPart(raw);
-        if (part) adminKeys.add(part);
+        if (part) {
+          adminKeys.add(part);
+          if (pnJidRaw) adminPnMap[part] = pnJidRaw;
+        }
       }
     }
   }
+
   knownGroupAdminsCache.set(groupId, adminKeys);
   if (knownGroupAdminsCache.size > 2500) {
     const oldest = knownGroupAdminsCache.keys().next().value;
     if (oldest) knownGroupAdminsCache.delete(oldest);
   }
+
+  const groupCfg = vipStore.getGroupConfig(groupId);
+  if (forcePersist || groupCfg.antiAdminKick) {
+    const nextAdmins = Array.from(adminKeys).sort();
+    const prevAdmins = [...(groupCfg.knownAdmins || [])].sort();
+    const mergedPns = { ...(groupCfg.knownAdminPns || {}), ...adminPnMap };
+    const adminsChanged =
+      nextAdmins.length !== prevAdmins.length ||
+      nextAdmins.some((val, idx) => val !== prevAdmins[idx]);
+    const pnsChanged = Object.entries(adminPnMap).some(
+      ([k, v]) => groupCfg.knownAdminPns?.[k] !== v
+    );
+    if (adminsChanged || pnsChanged) {
+      vipStore.updateGroupConfig(groupId, {
+        knownAdmins: nextAdmins,
+        knownAdminPns: mergedPns,
+      });
+    }
+  }
 }
 
-export async function syncGroupAdminSnapshot(sock: WASocket, groupId: string): Promise<void> {
+export async function syncGroupAdminSnapshot(
+  sock: WASocket,
+  groupId: string,
+  forceRefresh = false
+): Promise<void> {
   if (!groupId.endsWith('@g.us')) return;
   try {
-    const meta = await getCachedGroupMetadata(sock, groupId);
-    recordKnownGroupAdmins(groupId, meta.participants || []);
+    const meta = await getCachedGroupMetadata(sock, groupId, forceRefresh);
+    recordKnownGroupAdmins(groupId, meta.participants || [], forceRefresh);
   } catch {
     // Ignore transient group metadata error
   }
@@ -138,40 +173,85 @@ export async function handleGroupParticipantsUpdate(
   sock: WASocket,
   update: BaileysEventMap['group-participants.update']
 ): Promise<void> {
+  const groupId = update?.id;
+  if (!groupId) return;
+  const previous = groupParticipantQueue.get(groupId) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => processGroupParticipantsUpdate(sock, update))
+    .finally(() => {
+      if (groupParticipantQueue.get(groupId) === next) {
+        groupParticipantQueue.delete(groupId);
+      }
+    });
+  groupParticipantQueue.set(groupId, next);
+  return next;
+}
+
+async function processGroupParticipantsUpdate(
+  sock: WASocket,
+  update: BaileysEventMap['group-participants.update']
+): Promise<void> {
   try {
     const groupId = update.id;
     // Snapshot prior admins BEFORE invalidating cache so removed admins are still known
-    const priorMeta = await getGroupMetadataFromCacheOnly(groupId);
-    const priorAdminKeys = new Set<string>(knownGroupAdminsCache.get(groupId) || []);
+    // even if the 60s metadata TTL already expired or server restarted.
+    const priorMeta = await getGroupMetadataFromCacheOnly(groupId, true);
+    const groupCfg = vipStore.getGroupConfig(groupId);
+    const priorAdminKeys = new Set<string>([
+      ...(knownGroupAdminsCache.get(groupId) || []),
+      ...(groupCfg.knownAdmins || []),
+    ]);
+    const priorAdminPnMap: Record<string, string> = { ...(groupCfg.knownAdminPns || {}) };
     if (priorMeta?.participants) {
       for (const p of priorMeta.participants) {
         if (isParticipantAdmin(p)) {
+          const pnJidRaw = [p.phoneNumber, p.id, p.lid]
+            .map((v) => normalizeBareJid(v))
+            .find((v) => v && v.endsWith('@s.whatsapp.net'));
           for (const raw of [p.id, p.lid, p.phoneNumber]) {
             const u = jidUserPart(raw);
-            if (u) priorAdminKeys.add(u);
+            if (u) {
+              priorAdminKeys.add(u);
+              if (pnJidRaw) priorAdminPnMap[u] = pnJidRaw;
+            }
           }
         }
       }
     }
 
     invalidateGroupMetadataCache(groupId);
-    const groupCfg = vipStore.getGroupConfig(groupId);
     const cfg = loadConfig();
 
     const updateExtra = update as { author?: string; authorPn?: string };
     const authorRaw = updateExtra.author || '';
     const authorPnRaw = updateExtra.authorPn || '';
+    const restoredUserParts = new Set<string>();
 
     if (update.action === 'promote') {
-      const adminSet = new Set<string>(knownGroupAdminsCache.get(groupId) || priorAdminKeys);
+      const adminSet = new Set<string>(priorAdminKeys);
       for (const participant of update.participants) {
         const pObj = typeof participant === 'string' ? { id: participant } : participant;
-        const rawJid = pObj.id;
-        const pnJid = (pObj as { phoneNumber?: string }).phoneNumber;
-        if (jidUserPart(rawJid)) adminSet.add(jidUserPart(rawJid));
-        if (jidUserPart(pnJid)) adminSet.add(jidUserPart(pnJid));
+        const rawJid = normalizeBareJid(pObj.id);
+        const pnJid = normalizeBareJid((pObj as { phoneNumber?: string }).phoneNumber);
+        const lidJid = normalizeBareJid((pObj as { lid?: string }).lid);
+        const pnResolved =
+          (pnJid && pnJid.endsWith('@s.whatsapp.net') ? pnJid : '') ||
+          (rawJid && rawJid.endsWith('@s.whatsapp.net') ? rawJid : '');
+        for (const u of [jidUserPart(rawJid), jidUserPart(pnJid), jidUserPart(lidJid)]) {
+          if (u) {
+            adminSet.add(u);
+            if (pnResolved) priorAdminPnMap[u] = pnResolved;
+          }
+        }
       }
       knownGroupAdminsCache.set(groupId, adminSet);
+      if (groupCfg.antiAdminKick) {
+        vipStore.updateGroupConfig(groupId, {
+          knownAdmins: Array.from(adminSet),
+          knownAdminPns: priorAdminPnMap,
+        });
+      }
     }
 
     // 1. Anti-Add & Anti-Bot check on newly added participants
@@ -326,20 +406,28 @@ export async function handleGroupParticipantsUpdate(
     }
 
     // 2b. Anti-Admin-Kick Guard (.antiadminkick):
-    // If any admin (except Bot, Bot Owner, or Group Creator) removes or demotes another admin,
-    // immediately re-add + re-promote the kicked admin back to Admin and demote the offending admin.
-    if (
-      (update.action === 'remove' || update.action === 'demote') &&
-      groupCfg.antiAdminKick &&
-      cfg.mode !== 'self' &&
-      authorRaw
-    ) {
+    // If any admin (except the Bot itself) removes or demotes another admin,
+    // immediately re-add + re-promote the kicked admin back to Admin (with privacy invite fallback)
+    // and demote the offending non-creator admin.
+    if ((update.action === 'remove' || update.action === 'demote') && groupCfg.antiAdminKick) {
+      let protectedHandled = false;
       try {
-        const meta = await getCachedGroupMetadata(sock, groupId, true);
+        let meta;
+        try {
+          meta = await getCachedGroupMetadata(sock, groupId, true);
+        } catch {
+          await new Promise((r) => setTimeout(r, 500));
+          meta = await getCachedGroupMetadata(sock, groupId, true);
+        }
         const botJids = await getBotJids(sock);
         const botParticipant = findParticipant(meta.participants, botJids);
-        if (isParticipantAdmin(botParticipant)) {
-          const ownerNum = normalizePhone(cfg.ownerNumber);
+
+        if (!isParticipantAdmin(botParticipant)) {
+          logger.warn(
+            'antiAdminKick',
+            `Event '${update.action}' in ${groupId} skipped: bot (${botJids[0] || 'unknown'}) is not Group Admin.`
+          );
+        } else {
           const actorCandidates = await expandActorKeys(sock, authorRaw, authorPnRaw);
           const actorParticipant = actorCandidates.length
             ? findParticipant(meta.participants, actorCandidates)
@@ -348,6 +436,7 @@ export async function handleGroupParticipantsUpdate(
             [
               ...actorCandidates.map((c) => jidUserPart(c)),
               jidUserPart(actorParticipant?.id),
+              jidUserPart(actorParticipant?.lid),
               jidUserPart(actorParticipant?.phoneNumber),
             ].filter(Boolean)
           );
@@ -358,115 +447,341 @@ export async function handleGroupParticipantsUpdate(
               jidUserPart(meta.ownerPn),
               ...meta.participants
                 .filter((p) => p.admin === 'superadmin')
-                .flatMap((p) => [jidUserPart(p.id), jidUserPart(p.phoneNumber)]),
+                .flatMap((p) => [
+                  jidUserPart(p.id),
+                  jidUserPart(p.lid),
+                  jidUserPart(p.phoneNumber),
+                ]),
             ].filter(Boolean)
           );
 
           const actorIsBot = botJids.some((b) => actorParts.has(jidUserPart(b)));
-          const actorIsOwner = Boolean(
-            ownerNum && Array.from(actorParts).some((u) => normalizePhone(u) === ownerNum)
-          );
           const actorIsCreator =
             actorParticipant?.admin === 'superadmin' ||
             Array.from(actorParts).some((u) => creatorParts.has(u));
 
-          if (!actorIsBot && !actorIsOwner && !actorIsCreator) {
-            const kickedAdminsToRestore: string[] = [];
+          if (!actorIsBot) {
+            interface KickedAdminTarget {
+              rawJid: string;
+              pnJid: string;
+              userParts: string[];
+            }
+            const kickedAdminsToRestore: KickedAdminTarget[] = [];
+
             for (const participant of update.participants) {
               const pObj = typeof participant === 'string' ? { id: participant } : participant;
-              const rawJid = pObj.id;
-              const pnFromObj = (pObj as { phoneNumber?: string }).phoneNumber;
+              const rawJid = normalizeBareJid(pObj.id);
+              if (!rawJid) continue;
+              const pnFromObj = normalizeBareJid((pObj as { phoneNumber?: string }).phoneNumber);
+              const lidFromObj = normalizeBareJid((pObj as { lid?: string }).lid);
               const tUser = jidUserPart(rawJid);
               const tPn = jidUserPart(pnFromObj);
+              const tLid = jidUserPart(lidFromObj);
 
-              // Ignore voluntary self-leave or bot itself
-              if (actorParts.has(tUser) || (tPn && actorParts.has(tPn))) continue;
+              // Ignore voluntary self-leave (actor === target) or bot itself
+              if (
+                (tUser && actorParts.has(tUser)) ||
+                (tPn && actorParts.has(tPn)) ||
+                (tLid && actorParts.has(tLid))
+              ) {
+                continue;
+              }
               if (
                 botJids.some((b) => {
                   const bu = jidUserPart(b);
-                  return (bu && bu === tUser) || (tPn && bu === tPn);
+                  return Boolean(bu) && (bu === tUser || bu === tPn || bu === tLid);
                 })
               ) {
                 continue;
               }
 
-              let mappedPnPart = '';
-              if (isLidUser(rawJid) && sock.signalRepository?.lidMapping?.getPNForLID) {
+              let resolvedPnJid =
+                (pnFromObj && pnFromObj.endsWith('@s.whatsapp.net') ? pnFromObj : '') ||
+                (rawJid.endsWith('@s.whatsapp.net') ? rawJid : '') ||
+                priorAdminPnMap[tUser] ||
+                priorAdminPnMap[tLid] ||
+                '';
+
+              if (!resolvedPnJid && isLidUser(rawJid) && sock.signalRepository?.lidMapping?.getPNForLID) {
                 try {
                   const mapped = await sock.signalRepository.lidMapping.getPNForLID(rawJid);
-                  if (mapped) mappedPnPart = jidUserPart(mapped);
+                  if (mapped) resolvedPnJid = normalizeBareJid(mapped);
                 } catch {
                   // Ignore unavailable LID mapping
                 }
               }
 
-              const roleFromEvent = (pObj as { admin?: string | null }).admin;
-              const wasAdminInPriorMeta = Boolean(
-                priorMeta?.participants &&
-                  isParticipantAdmin(
-                    findParticipant(
-                      priorMeta.participants,
-                      [rawJid, pnFromObj || '', mappedPnPart ? `${mappedPnPart}@s.whatsapp.net` : ''].filter(Boolean)
-                    )
+              const priorMatch = priorMeta?.participants
+                ? findParticipant(
+                    priorMeta.participants,
+                    [rawJid, pnFromObj, lidFromObj, resolvedPnJid].filter(Boolean)
                   )
-              );
+                : undefined;
+
+              if (!resolvedPnJid && priorMatch) {
+                const matchPn = [priorMatch.phoneNumber, priorMatch.id]
+                  .map((v) => normalizeBareJid(v))
+                  .find((v) => v && v.endsWith('@s.whatsapp.net'));
+                if (matchPn) resolvedPnJid = matchPn;
+              }
+
+              const mappedPnPart = jidUserPart(resolvedPnJid);
+              const roleFromEvent = (pObj as { admin?: string | null }).admin;
               const wasAdmin =
                 roleFromEvent === 'admin' ||
                 roleFromEvent === 'superadmin' ||
-                wasAdminInPriorMeta ||
+                isParticipantAdmin(priorMatch) ||
                 Boolean(tUser && priorAdminKeys.has(tUser)) ||
                 Boolean(tPn && priorAdminKeys.has(tPn)) ||
+                Boolean(tLid && priorAdminKeys.has(tLid)) ||
                 Boolean(mappedPnPart && priorAdminKeys.has(mappedPnPart));
 
               if (wasAdmin) {
-                kickedAdminsToRestore.push(rawJid);
+                const userParts = Array.from(
+                  new Set([tUser, tPn, tLid, mappedPnPart].filter(Boolean))
+                );
+                kickedAdminsToRestore.push({
+                  rawJid,
+                  pnJid: resolvedPnJid,
+                  userParts,
+                });
               }
             }
 
             if (kickedAdminsToRestore.length > 0) {
+              protectedHandled = true;
+              const readdedTargets: KickedAdminTarget[] = [];
+              const privacyFallbackTargets: KickedAdminTarget[] = [];
+
               if (update.action === 'remove') {
-                await sock.groupParticipantsUpdate(groupId, kickedAdminsToRestore, 'add').catch(() => {});
-                await new Promise((r) => setTimeout(r, 450));
+                for (const target of kickedAdminsToRestore) {
+                  for (const part of target.userParts) {
+                    restoredUserParts.add(part);
+                  }
+                  const addCandidates = Array.from(
+                    new Set([target.pnJid, target.rawJid].filter(Boolean))
+                  );
+                  let added = false;
+                  let privacyBlocked = false;
+
+                  for (const jidCandidate of addCandidates) {
+                    try {
+                      const addRes = await sock.groupParticipantsUpdate(
+                        groupId,
+                        [jidCandidate],
+                        'add'
+                      );
+                      const status = String(
+                        (addRes?.[0] as { status?: string | number } | undefined)?.status ?? '200'
+                      );
+                      if (status === '200' || status === '201' || status === '409') {
+                        added = true;
+                        break;
+                      }
+                      if (status === '403' || status === '408') {
+                        privacyBlocked = true;
+                        break;
+                      }
+                      logger.warn(
+                        'antiAdminKick',
+                        `Add returned status ${status} for ${jidCandidate} in ${groupId}`
+                      );
+                    } catch (addErr) {
+                      logger.warn(
+                        'antiAdminKick',
+                        `Add failed for ${jidCandidate} in ${groupId}: ${(addErr as Error).message}`
+                      );
+                    }
+                  }
+
+                  if (added) {
+                    readdedTargets.push(target);
+                  } else {
+                    privacyFallbackTargets.push(target);
+                    try {
+                      const inviteCode = await sock.groupInviteCode(groupId);
+                      if (inviteCode) {
+                        const inviteLink = `https://chat.whatsapp.com/${inviteCode}`;
+                        const dmCandidates = Array.from(
+                          new Set([target.pnJid, target.rawJid].filter(Boolean))
+                        );
+                        for (const dmJid of dmCandidates) {
+                          try {
+                            await sock.sendMessage(dmJid, {
+                              text: `🛡️ *Anti-Admin-Kick Shield*\nYou were removed from the group${privacyBlocked ? ' (direct re-add blocked by your group privacy settings)' : ''}.\nRejoin using this official group invite link:\n${inviteLink}`,
+                            });
+                            break;
+                          } catch {
+                            // Try alternate JID
+                          }
+                        }
+                      }
+                    } catch (inviteErr) {
+                      logger.warn(
+                        'antiAdminKick',
+                        `Invite link fallback failed in ${groupId}: ${(inviteErr as Error).message}`
+                      );
+                    }
+                  }
+                }
+              } else {
+                // Action === 'demote' -> target is still in group, promote immediately
+                readdedTargets.push(...kickedAdminsToRestore);
               }
-              await sock.groupParticipantsUpdate(groupId, kickedAdminsToRestore, 'promote').catch(() => {});
+
+              if (readdedTargets.length > 0) {
+                if (update.action === 'remove') {
+                  await new Promise((r) => setTimeout(r, 1200));
+                }
+                const freshMeta = await getCachedGroupMetadata(sock, groupId, true).catch(() => null);
+                const resolvePromoteJids = (
+                  targets: KickedAdminTarget[],
+                  groupMeta: typeof freshMeta
+                ) =>
+                  targets.map((t) => {
+                    if (groupMeta?.participants) {
+                      const found = findParticipant(
+                        groupMeta.participants,
+                        [t.rawJid, t.pnJid, ...t.userParts.map((u) => `${u}@s.whatsapp.net`)].filter(Boolean)
+                      );
+                      if (found?.id) return found.id;
+                    }
+                    return t.rawJid || t.pnJid;
+                  });
+
+                const promoteJids = resolvePromoteJids(readdedTargets, freshMeta);
+                try {
+                  await sock.groupParticipantsUpdate(groupId, promoteJids, 'promote');
+                } catch (promoteErr) {
+                  logger.warn(
+                    'antiAdminKick',
+                    `Initial promote failed in ${groupId}: ${(promoteErr as Error).message}`
+                  );
+                }
+
+                // Verify promotion after short settle delay and retry once if needed
+                await new Promise((r) => setTimeout(r, 850));
+                const verifyMeta = await getCachedGroupMetadata(sock, groupId, true).catch(() => null);
+                if (verifyMeta?.participants) {
+                  const stillNotAdmin = readdedTargets.filter((t) => {
+                    const p = findParticipant(
+                      verifyMeta.participants,
+                      [t.rawJid, t.pnJid].filter(Boolean)
+                    );
+                    return Boolean(p && !isParticipantAdmin(p));
+                  });
+                  if (stillNotAdmin.length > 0) {
+                    const retryJids = resolvePromoteJids(stillNotAdmin, verifyMeta);
+                    await sock
+                      .groupParticipantsUpdate(groupId, retryJids, 'promote')
+                      .catch((retryErr) => {
+                        logger.warn(
+                          'antiAdminKick',
+                          `Retry promote failed in ${groupId}: ${(retryErr as Error).message}`
+                        );
+                      });
+                  }
+                }
+              }
 
               const actorTargetJid = actorParticipant?.id || actorCandidates[0] || authorRaw;
-              if (actorTargetJid && isParticipantAdmin(actorParticipant)) {
-                await sock.groupParticipantsUpdate(groupId, [actorTargetJid], 'demote').catch(() => {});
+              let offendingDemoted = false;
+              if (!actorIsCreator && actorTargetJid && isParticipantAdmin(actorParticipant)) {
+                try {
+                  await sock.groupParticipantsUpdate(groupId, [actorTargetJid], 'demote');
+                  offendingDemoted = true;
+                } catch (demoteErr) {
+                  logger.warn(
+                    'antiAdminKick',
+                    `Failed to demote offending admin ${actorTargetJid} in ${groupId}: ${(demoteErr as Error).message}`
+                  );
+                }
               }
 
               invalidateGroupMetadataCache(groupId);
               const updatedAdminSet = new Set<string>(priorAdminKeys);
-              if (actorTargetJid) updatedAdminSet.delete(jidUserPart(actorTargetJid));
-              for (const k of kickedAdminsToRestore) {
-                if (jidUserPart(k)) updatedAdminSet.add(jidUserPart(k));
+              if (offendingDemoted && actorTargetJid) {
+                updatedAdminSet.delete(jidUserPart(actorTargetJid));
+                if (actorParticipant?.phoneNumber) {
+                  updatedAdminSet.delete(jidUserPart(actorParticipant.phoneNumber));
+                }
+              }
+              for (const t of kickedAdminsToRestore) {
+                for (const part of t.userParts) {
+                  updatedAdminSet.add(part);
+                  if (t.pnJid) priorAdminPnMap[part] = t.pnJid;
+                }
               }
               knownGroupAdminsCache.set(groupId, updatedAdminSet);
+              vipStore.updateGroupConfig(groupId, {
+                knownAdmins: Array.from(updatedAdminSet),
+                knownAdminPns: priorAdminPnMap,
+              });
 
               const actorJid = actorTargetJid || '';
               const actorTag = actorJid ? `@${jidUserPart(actorJid)}` : 'An admin';
-              const targetTags = kickedAdminsToRestore.map((t) => `@${jidUserPart(t)}`).join(', ');
+              const allTargets = kickedAdminsToRestore.map((t) => t.rawJid || t.pnJid).filter(Boolean);
+              const targetTags = allTargets.map((t) => `@${jidUserPart(t)}`).join(', ');
               const mentions = Array.from(
-                new Set([...kickedAdminsToRestore, ...(actorJid ? [actorJid] : [])])
+                new Set([...allTargets, ...(actorJid ? [actorJid] : [])])
               );
+
+              const statusLines: string[] = [];
+              if (readdedTargets.length > 0) {
+                statusLines.push(
+                  update.action === 'remove'
+                    ? `• Auto Re-Added & Restored as Admin: ${readdedTargets.map((t) => `@${jidUserPart(t.rawJid || t.pnJid)}`).join(', ')}`
+                    : `• Restored as Admin: ${readdedTargets.map((t) => `@${jidUserPart(t.rawJid || t.pnJid)}`).join(', ')}`
+                );
+              }
+              if (privacyFallbackTargets.length > 0) {
+                statusLines.push(
+                  `• Direct add blocked by privacy — Invite link sent via DM to: ${privacyFallbackTargets.map((t) => `@${jidUserPart(t.rawJid || t.pnJid)}`).join(', ')}`
+                );
+              }
+              if (offendingDemoted && actorJid) {
+                statusLines.push(`• Offending admin demoted: ${actorTag}`);
+              }
+
               await sock
                 .sendMessage(groupId, {
                   text:
                     update.action === 'remove'
-                      ? `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot remove other admins here!\n• Unauthorized removal by: ${actorTag}\n• Auto Re-Added & Restored as Admin: ${targetTags}${actorJid ? `\n• Offending admin demoted: ${actorTag}` : ''}`
-                      : `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot demote other admins here!\n• Unauthorized demotion by: ${actorTag}\n• Restored as Admin: ${targetTags}${actorJid ? `\n• Offending admin demoted: ${actorTag}` : ''}`,
+                      ? `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot remove other admins here!\n• Unauthorized removal by: ${actorTag}\n${statusLines.join('\n')}`
+                      : `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot demote other admins here!\n• Unauthorized demotion by: ${actorTag}\n${statusLines.join('\n')}`,
                   mentions,
                 })
                 .catch(() => {});
               logger.security(
                 'antiAdminKick',
-                `Restored admin(s) [${kickedAdminsToRestore.join(', ')}] after ${update.action} by ${actorJid || 'unknown'} in ${groupId}`
+                `Restored admin(s) [${targetTags}] (readded=${readdedTargets.length}, privacyInvite=${privacyFallbackTargets.length}) after ${update.action} by ${actorJid || 'unknown'} in ${groupId}`
               );
             }
           }
         }
       } catch (err) {
-        logger.warn('antiAdminKick', `Anti-Admin-Kick check failed in ${groupId}: ${(err as Error).message}`);
+        logger.warn(
+          'antiAdminKick',
+          `Anti-Admin-Kick check failed in ${groupId}: ${(err as Error).message}`
+        );
+      }
+
+      // If this removal/demotion was authorized (bot itself) or antiAdminKick wasn't protecting a kicked admin,
+      // refresh persisted admin list from live metadata so legitimate demotions/removals stay clean.
+      if (!protectedHandled) {
+        void syncGroupAdminSnapshot(sock, groupId, true);
+      }
+    } else if (update.action === 'remove' || update.action === 'demote') {
+      const nextAdminSet = new Set<string>(priorAdminKeys);
+      for (const participant of update.participants) {
+        const pObj = typeof participant === 'string' ? { id: participant } : participant;
+        nextAdminSet.delete(jidUserPart(pObj.id));
+        nextAdminSet.delete(jidUserPart((pObj as { phoneNumber?: string }).phoneNumber));
+        nextAdminSet.delete(jidUserPart((pObj as { lid?: string }).lid));
+      }
+      knownGroupAdminsCache.set(groupId, nextAdminSet);
+      if (groupCfg.antiAdminKick) {
+        vipStore.updateGroupConfig(groupId, { knownAdmins: Array.from(nextAdminSet) });
       }
     }
 
@@ -659,7 +974,12 @@ export async function handleGroupParticipantsUpdate(
             mentions: [rawJid],
           })
           .catch(() => {});
-      } else if (update.action === 'remove' && groupCfg.goodbye) {
+      } else if (
+        update.action === 'remove' &&
+        groupCfg.goodbye &&
+        !restoredUserParts.has(jidUserPart(rawJid)) &&
+        !restoredUserParts.has(num)
+      ) {
         await sock.sendMessage(groupId, {
           text: `*Goodbye @${mentionUser || num}*\nWishing you all the best ahead.`,
           mentions: [rawJid],

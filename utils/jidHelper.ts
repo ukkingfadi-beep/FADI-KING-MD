@@ -59,10 +59,11 @@ export async function getCachedGroupMetadata(
 }
 
 export async function getGroupMetadataFromCacheOnly(
-  groupId: string
+  groupId: string,
+  allowExpired = false
 ): Promise<GroupMetadata | undefined> {
   const cached = groupMetaCache.get(groupId);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (cached && (allowExpired || cached.expiresAt > Date.now())) {
     return cached.meta;
   }
   return undefined;
