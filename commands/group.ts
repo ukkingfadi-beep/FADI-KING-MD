@@ -996,6 +996,72 @@ export const groupCommands: BotCommand[] = [
     },
   },
   {
+    name: 'setwelcome',
+    category: 'group',
+    description: 'Group ke liye custom welcome message set kare ({user}, {group}, {count})',
+    usage: 'setwelcome <message|reset>',
+    groupOnly: true,
+    execute: async (ctx) => {
+      if (!ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          await ctx.reply(check.reason!);
+          return check.reason!;
+        }
+      }
+      const rawText = ctx.text.trim();
+      if (!rawText) {
+        const current = vipStore.getGroupConfig(ctx.chatId).welcomeMessage || '(default)';
+        const msg = `Current Welcome Message:\n${current}\n\nUsage: \`${ctx.prefix}setwelcome Welcome {user} to {group}!\`\nReset: \`${ctx.prefix}setwelcome reset\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      if (rawText.toLowerCase() === 'reset' || rawText.toLowerCase() === 'default' || rawText.toLowerCase() === 'off') {
+        vipStore.updateGroupConfig(ctx.chatId, { welcomeMessage: '' });
+        const msg = 'Custom Welcome message reset to default.';
+        await ctx.reply(msg);
+        return msg;
+      }
+      vipStore.updateGroupConfig(ctx.chatId, { welcome: true, welcomeMessage: rawText });
+      const msg = `Custom Welcome message saved to database & enabled for this group.\n\nPreview:\n${rawText}`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
+    name: 'setgoodbye',
+    category: 'group',
+    description: 'Group ke liye custom goodbye message set kare ({user}, {group}, {count})',
+    usage: 'setgoodbye <message|reset>',
+    groupOnly: true,
+    execute: async (ctx) => {
+      if (!ctx.isSimulated) {
+        const check = await verifyGroupAdmins(ctx, { requireBotAdmin: false });
+        if (!check.ok) {
+          await ctx.reply(check.reason!);
+          return check.reason!;
+        }
+      }
+      const rawText = ctx.text.trim();
+      if (!rawText) {
+        const current = vipStore.getGroupConfig(ctx.chatId).goodbyeMessage || '(default)';
+        const msg = `Current Goodbye Message:\n${current}\n\nUsage: \`${ctx.prefix}setgoodbye Goodbye {user} from {group}!\`\nReset: \`${ctx.prefix}setgoodbye reset\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      if (rawText.toLowerCase() === 'reset' || rawText.toLowerCase() === 'default' || rawText.toLowerCase() === 'off') {
+        vipStore.updateGroupConfig(ctx.chatId, { goodbyeMessage: '' });
+        const msg = 'Custom Goodbye message reset to default.';
+        await ctx.reply(msg);
+        return msg;
+      }
+      vipStore.updateGroupConfig(ctx.chatId, { goodbye: true, goodbyeMessage: rawText });
+      const msg = `Custom Goodbye message saved to database & enabled for this group.\n\nPreview:\n${rawText}`;
+      await ctx.reply(msg);
+      return msg;
+    },
+  },
+  {
     name: 'group',
     aliases: ['gc'],
     category: 'group',

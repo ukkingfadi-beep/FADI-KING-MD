@@ -100,6 +100,8 @@ export interface BotConfigView {
   menuChannelJid: string;
   menuChannelName: string;
   menuChannelUrl: string;
+  welcomeMessage?: string;
+  goodbyeMessage?: string;
 }
 
 export interface BlockedCallerEntry {
@@ -161,6 +163,14 @@ export interface BotStatusResponse {
     persistedSessions: string[];
   };
   config: BotConfigView;
+  database?: {
+    engine: 'mongodb+sqlite' | 'postgres+sqlite' | 'sqlite';
+    dataDir: string;
+    sessionDir: string;
+    persistentVolumeMounted: boolean;
+    mongoConfigured: boolean;
+    postgresConfigured: boolean;
+  };
   stats: {
     serverOnline: boolean;
     botOnline: boolean;
@@ -231,7 +241,9 @@ export interface GroupConfig {
   slowModeSeconds?: number;
   aiEnabled?: boolean;
   welcome: boolean;
+  welcomeMessage?: string;
   goodbye: boolean;
+  goodbyeMessage?: string;
 }
 
 export interface SourceFileEntry {

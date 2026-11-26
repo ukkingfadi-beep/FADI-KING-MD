@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { loadConfig, normalizePhone } from '../config/bot.config.ts';
 import {
   dbGetSync,
+  dbSeedSync,
   dbSetSync,
   migrateLegacyJsonIfMissing,
   registerDbHydrationHook,
@@ -70,7 +71,9 @@ export interface GroupConfig {
   aiEnabled?: boolean;
   welcome: boolean;
   welcomeImg?: boolean;
+  welcomeMessage?: string;
   goodbye: boolean;
+  goodbyeMessage?: string;
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
   gcStatusWarnings?: Record<string, number>;
@@ -154,7 +157,7 @@ registerDbHydrationHook(() => {
 function readStoreKey<T>(key: string, legacyPath: string, fallback: T): T {
   const fromDb = dbGetSync<T>(key) ?? migrateLegacyJsonIfMissing<T>(key, legacyPath);
   if (fromDb !== null) return fromDb;
-  dbSetSync(key, fallback);
+  dbSeedSync(key, fallback);
   return fallback;
 }
 
@@ -202,7 +205,7 @@ export const vipStore = {
         pairingCount: 0,
         active: true,
       });
-      dbSetSync('vips', vips);
+      dbSeedSync('vips', vips);
     }
     vipsCache = vips;
     return vips;
@@ -566,7 +569,9 @@ export const vipStore = {
         aiEnabled: false,
         welcome: false,
         welcomeImg: false,
+        welcomeMessage: '',
         goodbye: false,
+        goodbyeMessage: '',
         knownAdmins: [],
         knownAdminPns: {},
       };
@@ -596,7 +601,9 @@ export const vipStore = {
       aiEnabled: Boolean(found.aiEnabled),
       welcome: Boolean(found.welcome),
       welcomeImg: Boolean(found.welcomeImg),
+      welcomeMessage: typeof found.welcomeMessage === 'string' ? found.welcomeMessage : '',
       goodbye: Boolean(found.goodbye),
+      goodbyeMessage: typeof found.goodbyeMessage === 'string' ? found.goodbyeMessage : '',
       knownAdmins: Array.isArray(found.knownAdmins) ? found.knownAdmins : [],
       knownAdminPns:
         found.knownAdminPns && typeof found.knownAdminPns === 'object'
@@ -632,7 +639,9 @@ export const vipStore = {
       aiEnabled: Boolean(g.aiEnabled),
       welcome: Boolean(g.welcome),
       welcomeImg: Boolean(g.welcomeImg),
+      welcomeMessage: typeof g.welcomeMessage === 'string' ? g.welcomeMessage : '',
       goodbye: Boolean(g.goodbye),
+      goodbyeMessage: typeof g.goodbyeMessage === 'string' ? g.goodbyeMessage : '',
       knownAdmins: Array.isArray(g.knownAdmins) ? g.knownAdmins : [],
       knownAdminPns:
         g.knownAdminPns && typeof g.knownAdminPns === 'object' ? g.knownAdminPns : {},
@@ -684,7 +693,13 @@ export const vipStore = {
     if (typeof patch.aiEnabled === 'boolean') cleanPatch.aiEnabled = patch.aiEnabled;
     if (typeof patch.welcome === 'boolean') cleanPatch.welcome = patch.welcome;
     if (typeof patch.welcomeImg === 'boolean') cleanPatch.welcomeImg = patch.welcomeImg;
+    if (typeof patch.welcomeMessage === 'string') {
+      cleanPatch.welcomeMessage = patch.welcomeMessage.trim();
+    }
     if (typeof patch.goodbye === 'boolean') cleanPatch.goodbye = patch.goodbye;
+    if (typeof patch.goodbyeMessage === 'string') {
+      cleanPatch.goodbyeMessage = patch.goodbyeMessage.trim();
+    }
     if (patch.warnings && typeof patch.warnings === 'object') cleanPatch.warnings = patch.warnings;
     if (patch.antiScamWarnings && typeof patch.antiScamWarnings === 'object') {
       cleanPatch.antiScamWarnings = patch.antiScamWarnings;
@@ -740,7 +755,9 @@ export const vipStore = {
       aiEnabled: false,
       welcome: false,
       welcomeImg: false,
+      welcomeMessage: '',
       goodbye: false,
+      goodbyeMessage: '',
       warnings: {},
       antiScamWarnings: {},
       gcStatusWarnings: {},

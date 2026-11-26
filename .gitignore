@@ -8,7 +8,10 @@ coverage/
 !.env.example
 database/sessions/*
 !database/sessions/.gitkeep
+database/auth_info_baileys/
+auth_info_baileys/
 sessions/
 database/media/*
 database/*.json
+database/fadi_bot.db*
 

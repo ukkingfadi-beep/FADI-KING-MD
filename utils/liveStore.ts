@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   dbGetSync,
+  dbSeedSync,
   dbSetSync,
   migrateLegacyJsonIfMissing,
   registerDbHydrationHook,
@@ -93,7 +94,7 @@ export const liveStore = {
       return liveScreenCache;
     }
     liveScreenCache = { ...defaultLiveScreen };
-    dbSetSync('live_screen', liveScreenCache);
+    dbSeedSync('live_screen', liveScreenCache);
     return liveScreenCache;
   },
 
@@ -127,7 +128,7 @@ export const liveStore = {
       return portalBannerCache;
     }
     portalBannerCache = { ...defaultPortalBanner };
-    dbSetSync('portal_banner', portalBannerCache);
+    dbSeedSync('portal_banner', portalBannerCache);
     return portalBannerCache;
   },
 
@@ -162,7 +163,7 @@ export const liveStore = {
       return alertsCache.slice(0, limit);
     }
     alertsCache = [];
-    dbSetSync('alerts', alertsCache);
+    dbSeedSync('alerts', alertsCache);
     return [];
   },
 

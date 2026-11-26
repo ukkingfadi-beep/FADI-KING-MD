@@ -2,6 +2,7 @@ import path from 'path';
 import { normalizePhone } from '../config/bot.config.ts';
 import {
   dbGetSync,
+  dbSeedSync,
   dbSetSync,
   migrateLegacyJsonIfMissing,
   registerDbHydrationHook,
@@ -33,7 +34,7 @@ function readEntries(): BlockedCallerEntry[] {
     return cache;
   }
   cache = [];
-  dbSetSync('anticall', cache);
+  dbSeedSync('anticall', cache);
   return cache;
 }
 

@@ -59,6 +59,8 @@ const DEFAULT_BOT_CONFIG_FORM: BotConfigView = {
   menuChannelJid: '',
   menuChannelName: 'FADI KING MD OFFICIAL',
   menuChannelUrl: '',
+  welcomeMessage: '',
+  goodbyeMessage: '',
 };
 
 function safeNum(val: unknown, fallback: number): number {
@@ -142,6 +144,14 @@ function normalizeBotConfigForm(cfg: Partial<BotConfigView>): BotConfigView {
       typeof cfg.menuChannelUrl === 'string'
         ? cfg.menuChannelUrl
         : DEFAULT_BOT_CONFIG_FORM.menuChannelUrl,
+    welcomeMessage:
+      typeof cfg.welcomeMessage === 'string'
+        ? cfg.welcomeMessage
+        : DEFAULT_BOT_CONFIG_FORM.welcomeMessage,
+    goodbyeMessage:
+      typeof cfg.goodbyeMessage === 'string'
+        ? cfg.goodbyeMessage
+        : DEFAULT_BOT_CONFIG_FORM.goodbyeMessage,
   };
 }
 
@@ -672,6 +682,38 @@ export function BotControls({ config, groups, adminToken, onRefresh }: BotContro
                 />
                 <p className="text-[11px] text-[#8B84AD] mt-1">
                   Follows this WhatsApp Channel (or @newsletter JID) automatically when anyone pairs.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                  Default Custom Welcome Message
+                </label>
+                <input
+                  type="text"
+                  value={form.welcomeMessage || ''}
+                  onChange={(e) => updateForm({ welcomeMessage: e.target.value })}
+                  placeholder="Welcome {user} to {group}! Member #{count}"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs text-white placeholder:text-[#5F5882] focus:outline-none focus:border-[#8B5CF6]"
+                />
+                <p className="text-[11px] text-[#8B84AD] mt-1">
+                  Optional global template (supports {'{user}'}, {'{group}'}, {'{count}'}). Per-group override via .setwelcome.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#C4BFE0] mb-1.5">
+                  Default Custom Goodbye Message
+                </label>
+                <input
+                  type="text"
+                  value={form.goodbyeMessage || ''}
+                  onChange={(e) => updateForm({ goodbyeMessage: e.target.value })}
+                  placeholder="Goodbye {user} from {group}!"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#0A0714] border border-white/[0.1] text-xs text-white placeholder:text-[#5F5882] focus:outline-none focus:border-[#8B5CF6]"
+                />
+                <p className="text-[11px] text-[#8B84AD] mt-1">
+                  Optional global template when members leave (per-group override via .setgoodbye).
                 </p>
               </div>
             </div>

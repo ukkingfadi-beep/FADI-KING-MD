@@ -3,10 +3,12 @@ import path from 'path';
 import dotenv from 'dotenv';
 import {
   dbGetSync,
+  dbSeedSync,
   dbSetSync,
   migrateLegacyJsonIfMissing,
   registerDbHydrationHook,
   resolveDataDir,
+  resolveSessionDir,
 } from '../utils/db.ts';
 
 dotenv.config();
@@ -58,11 +60,14 @@ export interface BotConfig {
   menuChannelJid: string;
   menuChannelName: string;
   menuChannelUrl: string;
+  welcomeMessage: string;
+  goodbyeMessage: string;
   sessionDir: string;
   databaseDir: string;
 }
 
 const databaseDir = resolveDataDir();
+const sessionDir = resolveSessionDir();
 const settingsFile = path.join(databaseDir, 'settings.json');
 
 export function normalizePhone(input: string): string {
@@ -121,21 +126,72 @@ const defaultConfig: BotConfig = {
   menuChannelJid: process.env.MENU_CHANNEL_JID || '',
   menuChannelName: process.env.MENU_CHANNEL_NAME || 'FADI KING MD OFFICIAL',
   menuChannelUrl: process.env.MENU_CHANNEL_URL || '',
-  sessionDir: process.env.SESSION_DIR
-    ? path.resolve(process.cwd(), process.env.SESSION_DIR)
-    : path.join(databaseDir, 'sessions'),
+  welcomeMessage: process.env.DEFAULT_WELCOME_MESSAGE || '',
+  goodbyeMessage: process.env.DEFAULT_GOODBYE_MESSAGE || '',
+  sessionDir,
   databaseDir,
 };
 
 function ensureDirectories(): void {
   fs.mkdirSync(databaseDir, { recursive: true });
-  fs.mkdirSync(defaultConfig.sessionDir, { recursive: true });
+  fs.mkdirSync(sessionDir, { recursive: true });
 }
 
 let cachedConfig: BotConfig | null = null;
 registerDbHydrationHook(() => {
   cachedConfig = null;
 });
+
+function toPersistableConfig(cfg: BotConfig): Omit<BotConfig, 'sessionDir' | 'databaseDir'> {
+  return {
+    botName: cfg.botName,
+    ownerNumber: cfg.ownerNumber,
+    ownerName: cfg.ownerName,
+    prefix: cfg.prefix,
+    mode: cfg.mode,
+    vipOnlyPairing: cfg.vipOnlyPairing,
+    maxPairAttempts: cfg.maxPairAttempts,
+    pairWindowMinutes: cfg.pairWindowMinutes,
+    pairCooldownSeconds: cfg.pairCooldownSeconds,
+    cmdCooldownSeconds: cfg.cmdCooldownSeconds,
+    groupCmdCooldownSeconds: cfg.groupCmdCooldownSeconds,
+    tagCooldownSeconds: cfg.tagCooldownSeconds,
+    tagMaxPerHour: cfg.tagMaxPerHour,
+    autoReadMessages: cfg.autoReadMessages,
+    autoStatusSeen: cfg.autoStatusSeen,
+    autoTyping: cfg.autoTyping,
+    autoRecording: cfg.autoRecording,
+    broadcastDelayMs: cfg.broadcastDelayMs,
+    broadcastDelayMinMs: cfg.broadcastDelayMinMs,
+    broadcastDelayMaxMs: cfg.broadcastDelayMaxMs,
+    maxBroadcastTargets: cfg.maxBroadcastTargets,
+    maxReconnectAttempts: cfg.maxReconnectAttempts,
+    humanDelayEnabled: cfg.humanDelayEnabled,
+    humanDelayMinMs: cfg.humanDelayMinMs,
+    humanDelayMaxMs: cfg.humanDelayMaxMs,
+    autoJoinGroupInvite: cfg.autoJoinGroupInvite,
+    autoJoinChannelInvite: cfg.autoJoinChannelInvite,
+    sendConnectSelfMessage: cfg.sendConnectSelfMessage,
+    anticallGlobal: cfg.anticallGlobal,
+    antiScamGlobal: cfg.antiScamGlobal,
+    antiScamBlockAllStickers: cfg.antiScamBlockAllStickers,
+    antiStatusMentionGlobal: cfg.antiStatusMentionGlobal,
+    antiVirusGlobal: cfg.antiVirusGlobal,
+    autoForwardIbToOpenGcs: cfg.autoForwardIbToOpenGcs,
+    autoReact: cfg.autoReact,
+    aiEnabled: cfg.aiEnabled,
+    alwaysOnline: cfg.alwaysOnline,
+    singleTick: cfg.singleTick,
+    stickerPack: cfg.stickerPack,
+    stickerAuthor: cfg.stickerAuthor,
+    menuImageUrl: cfg.menuImageUrl,
+    menuChannelJid: cfg.menuChannelJid,
+    menuChannelName: cfg.menuChannelName,
+    menuChannelUrl: cfg.menuChannelUrl,
+    welcomeMessage: cfg.welcomeMessage,
+    goodbyeMessage: cfg.goodbyeMessage,
+  };
+}
 
 export function loadConfig(): BotConfig {
   if (cachedConfig) return cachedConfig;
@@ -160,10 +216,12 @@ export function loadConfig(): BotConfig {
         stickerPack: String(fromDb.stickerPack || '').trim() || defaultConfig.stickerPack,
         stickerAuthor: String(fromDb.stickerAuthor || '').trim() || defaultConfig.stickerAuthor,
         menuImageUrl: String(fromDb.menuImageUrl || '').trim() || defaultConfig.menuImageUrl,
-        menuChannelJid: String(fromDb.menuChannelJid || '').trim(),
+        menuChannelJid: String(fromDb.menuChannelJid ?? '').trim(),
         menuChannelName:
           String(fromDb.menuChannelName || '').trim() || defaultConfig.menuChannelName,
-        menuChannelUrl: String(fromDb.menuChannelUrl || '').trim(),
+        menuChannelUrl: String(fromDb.menuChannelUrl ?? '').trim(),
+        welcomeMessage: String(fromDb.welcomeMessage ?? '').trim(),
+        goodbyeMessage: String(fromDb.goodbyeMessage ?? '').trim(),
         sessionDir: defaultConfig.sessionDir,
         databaseDir: defaultConfig.databaseDir,
       };
@@ -173,7 +231,7 @@ export function loadConfig(): BotConfig {
     // Fallback to defaults if DB/settings is unreadable
   }
   cachedConfig = { ...defaultConfig };
-  saveConfig(cachedConfig);
+  dbSeedSync('settings', toPersistableConfig(cachedConfig));
   return cachedConfig;
 }
 
@@ -397,6 +455,14 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof cleanPartial.menuChannelUrl === 'string'
         ? cleanPartial.menuChannelUrl.trim()
         : String(current.menuChannelUrl ?? ''),
+    welcomeMessage:
+      typeof cleanPartial.welcomeMessage === 'string'
+        ? cleanPartial.welcomeMessage.trim()
+        : String(current.welcomeMessage ?? ''),
+    goodbyeMessage:
+      typeof cleanPartial.goodbyeMessage === 'string'
+        ? cleanPartial.goodbyeMessage.trim()
+        : String(current.goodbyeMessage ?? ''),
     sessionDir: defaultConfig.sessionDir,
     databaseDir: defaultConfig.databaseDir,
   };
@@ -404,55 +470,7 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
     next.autoReadMessages = false;
   }
   cachedConfig = next;
-  const persistable = {
-    botName: next.botName,
-    ownerNumber: next.ownerNumber,
-    ownerName: next.ownerName,
-    prefix: next.prefix,
-    mode: next.mode,
-    vipOnlyPairing: next.vipOnlyPairing,
-    maxPairAttempts: next.maxPairAttempts,
-    pairWindowMinutes: next.pairWindowMinutes,
-    pairCooldownSeconds: next.pairCooldownSeconds,
-    cmdCooldownSeconds: next.cmdCooldownSeconds,
-    groupCmdCooldownSeconds: next.groupCmdCooldownSeconds,
-    tagCooldownSeconds: next.tagCooldownSeconds,
-    tagMaxPerHour: next.tagMaxPerHour,
-    autoReadMessages: next.autoReadMessages,
-    autoStatusSeen: next.autoStatusSeen,
-    autoTyping: next.autoTyping,
-    autoRecording: next.autoRecording,
-    broadcastDelayMs: next.broadcastDelayMs,
-    broadcastDelayMinMs: next.broadcastDelayMinMs,
-    broadcastDelayMaxMs: next.broadcastDelayMaxMs,
-    maxBroadcastTargets: next.maxBroadcastTargets,
-    maxReconnectAttempts: next.maxReconnectAttempts,
-    humanDelayEnabled: next.humanDelayEnabled,
-    humanDelayMinMs: next.humanDelayMinMs,
-    humanDelayMaxMs: next.humanDelayMaxMs,
-    autoJoinGroupInvite: next.autoJoinGroupInvite,
-    autoJoinChannelInvite: next.autoJoinChannelInvite,
-    sendConnectSelfMessage: next.sendConnectSelfMessage,
-    anticallGlobal: next.anticallGlobal,
-    antiScamGlobal: next.antiScamGlobal,
-    antiScamBlockAllStickers: next.antiScamBlockAllStickers,
-    antiStatusMentionGlobal: next.antiStatusMentionGlobal,
-    antiVirusGlobal: next.antiVirusGlobal,
-    autoForwardIbToOpenGcs: next.autoForwardIbToOpenGcs,
-    autoReact: next.autoReact,
-    aiEnabled: next.aiEnabled,
-    alwaysOnline: next.alwaysOnline,
-    singleTick: next.singleTick,
-    stickerPack: next.stickerPack,
-    stickerAuthor: next.stickerAuthor,
-    menuImageUrl: next.menuImageUrl,
-    menuChannelJid: next.menuChannelJid,
-    menuChannelName: next.menuChannelName,
-    menuChannelUrl: next.menuChannelUrl,
-  };
+  const persistable = toPersistableConfig(next);
   dbSetSync('settings', persistable);
-  void fs.promises
-    .writeFile(settingsFile, JSON.stringify(persistable, null, 2), 'utf-8')
-    .catch(() => {});
   return next;
 }

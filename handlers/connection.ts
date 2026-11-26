@@ -1924,6 +1924,7 @@ export function closeAllSocketsGracefully(): void {
 export function initializeSavedSessionOnBoot(): void {
   const cfg = loadConfig();
   void getFastWaVersion();
+  logger.info('boot', `Baileys auth session directory: ${cfg.sessionDir}`);
 
   void (async () => {
     const restoredCount = await restoreAuthDirsFromDb(cfg.sessionDir);

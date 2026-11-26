@@ -888,9 +888,23 @@ async function processGroupParticipantsUpdate(
     if (cfg.mode === 'self') return;
 
     let cachedGroupMeta: Awaited<ReturnType<typeof getCachedGroupMetadata>> | null = null;
-    if (update.action === 'add' && groupCfg.welcomeImg) {
+    if (
+      (update.action === 'add' && (groupCfg.welcomeImg || groupCfg.welcome)) ||
+      (update.action === 'remove' && groupCfg.goodbye)
+    ) {
       cachedGroupMeta = await getCachedGroupMetadata(sock, groupId).catch(() => null);
     }
+
+    const formatMemberTemplate = (
+      template: string,
+      mentionTag: string,
+      groupSubject: string,
+      totalCount: number
+    ): string =>
+      template
+        .replace(/\{user\}/gi, mentionTag)
+        .replace(/\{group\}/gi, groupSubject)
+        .replace(/\{count\}/gi, String(totalCount));
 
     for (const participant of update.participants) {
       const pObj = typeof participant === 'string' ? { id: participant } : participant;
@@ -910,6 +924,11 @@ async function processGroupParticipantsUpdate(
 
       const num = jidUserPart(targetDm);
       const mentionUser = jidUserPart(rawJid) || num;
+      const mentionTag = mentionUser ? `@${mentionUser}` : num ? `@${num}` : 'Member';
+      const groupName = cachedGroupMeta?.subject || 'WhatsApp Group';
+      const memberCount = cachedGroupMeta?.participants?.length || 1;
+      const customWelcomeTpl = (groupCfg.welcomeMessage || cfg.welcomeMessage || '').trim();
+      const customGoodbyeTpl = (groupCfg.goodbyeMessage || cfg.goodbyeMessage || '').trim();
 
       if (update.action === 'add' && groupCfg.welcomeImg) {
         try {
@@ -941,8 +960,6 @@ async function processGroupParticipantsUpdate(
             lookupKnownUserName(rawJid) ||
             lookupKnownUserName(targetDm) ||
             (num ? `+${num}` : 'New Member');
-          const groupName = cachedGroupMeta?.subject || 'WhatsApp Group';
-          const memberCount = cachedGroupMeta?.participants?.length || 1;
 
           const cardBuffer = await generateWelcomeImageCard({
             memberName,
@@ -953,10 +970,14 @@ async function processGroupParticipantsUpdate(
             botName: cfg.botName || 'FADI KING MD',
           });
 
+          const captionText = customWelcomeTpl
+            ? formatMemberTemplate(customWelcomeTpl, mentionTag, groupName, memberCount)
+            : `🎉 *Welcome @${mentionUser || num} to ${groupName}!*\n• Member #${memberCount}`;
+
           await sock
             .sendMessage(groupId, {
               image: cardBuffer,
-              caption: `🎉 *Welcome @${mentionUser || num} to ${groupName}!*\n• Member #${memberCount}`,
+              caption: captionText,
               mentions: [rawJid],
             })
             .catch(() => {});
@@ -968,9 +989,12 @@ async function processGroupParticipantsUpdate(
       }
 
       if (update.action === 'add' && (groupCfg.welcome || groupCfg.welcomeImg)) {
+        const welcomeText = customWelcomeTpl
+          ? formatMemberTemplate(customWelcomeTpl, mentionTag, groupName, memberCount)
+          : `*_${mentionUser ? `@${mentionUser}` : 'Welcome'} joined the group, welcome!_* 🎉`;
         await sock
           .sendMessage(groupId, {
-            text: `*_${mentionUser ? `@${mentionUser}` : 'Welcome'} joined the group, welcome!_* 🎉`,
+            text: welcomeText,
             mentions: [rawJid],
           })
           .catch(() => {});
@@ -980,8 +1004,11 @@ async function processGroupParticipantsUpdate(
         !restoredUserParts.has(jidUserPart(rawJid)) &&
         !restoredUserParts.has(num)
       ) {
+        const goodbyeText = customGoodbyeTpl
+          ? formatMemberTemplate(customGoodbyeTpl, mentionTag, groupName, memberCount)
+          : `*Goodbye @${mentionUser || num}*\nWishing you all the best ahead.`;
         await sock.sendMessage(groupId, {
-          text: `*Goodbye @${mentionUser || num}*\nWishing you all the best ahead.`,
+          text: goodbyeText,
           mentions: [rawJid],
         });
       }

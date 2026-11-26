@@ -46,7 +46,7 @@ import {
 import { liveStore, type AlertLevel } from './utils/liveStore.ts';
 import { anticallStore } from './utils/anticallStore.ts';
 import { crashGuardStore } from './utils/crashGuard.ts';
-import { initDatabase } from './utils/db.ts';
+import { closeDatabase, flushDatabaseWrites, getDatabaseStatus, initDatabase } from './utils/db.ts';
 import { logger } from './utils/logger.ts';
 import { pairingRateLimiter } from './utils/rateLimiter.ts';
 import {
@@ -485,7 +485,10 @@ async function startServer(): Promise<void> {
         menuChannelJid: cfg.menuChannelJid,
         menuChannelName: cfg.menuChannelName,
         menuChannelUrl: cfg.menuChannelUrl,
+        welcomeMessage: cfg.welcomeMessage,
+        goodbyeMessage: cfg.goodbyeMessage,
       },
+      database: getDatabaseStatus(),
       stats: {
         serverOnline: true,
         botOnline,
@@ -611,6 +614,8 @@ async function startServer(): Promise<void> {
       menuChannelJid: typeof body.menuChannelJid === 'string' ? body.menuChannelJid : undefined,
       menuChannelName: typeof body.menuChannelName === 'string' ? body.menuChannelName : undefined,
       menuChannelUrl: typeof body.menuChannelUrl === 'string' ? body.menuChannelUrl : undefined,
+      welcomeMessage: typeof body.welcomeMessage === 'string' ? body.welcomeMessage : undefined,
+      goodbyeMessage: typeof body.goodbyeMessage === 'string' ? body.goodbyeMessage : undefined,
     });
 
     const explicitJidTyped =
@@ -796,7 +801,11 @@ async function startServer(): Promise<void> {
           ? Math.max(0, Math.min(3600, Math.round(req.body.slowModeSeconds)))
           : undefined,
       welcome: typeof req.body?.welcome === 'boolean' ? req.body.welcome : undefined,
+      welcomeMessage:
+        typeof req.body?.welcomeMessage === 'string' ? req.body.welcomeMessage : undefined,
       goodbye: typeof req.body?.goodbye === 'boolean' ? req.body.goodbye : undefined,
+      goodbyeMessage:
+        typeof req.body?.goodbyeMessage === 'string' ? req.body.goodbyeMessage : undefined,
     });
     if (updated.antiAdminKick && req.params.groupId.endsWith('@g.us')) {
       const activeSock = getPreferredActiveSocket();
@@ -1395,25 +1404,35 @@ async function startServer(): Promise<void> {
   httpServer.maxRequestsPerSocket = 0;
 
   let shuttingDown = false;
-  const gracefulShutdown = (signal: string) => {
+  const gracefulShutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info('server', `Received ${signal}. Closing WhatsApp sockets cleanly before exit...`);
+    logger.info('server', `Received ${signal}. Closing WhatsApp sockets & flushing database cleanly before exit...`);
     try {
       closeAllSocketsGracefully();
     } catch {
       // Ignore socket close error on shutdown
+    }
+    try {
+      await flushDatabaseWrites(1500);
+      await closeDatabase();
+    } catch {
+      // Ignore database close error on shutdown
     }
     void viteInstance?.close().catch(() => {});
     httpServer.closeAllConnections?.();
     httpServer.close(() => {
       process.exit(0);
     });
-    setTimeout(() => process.exit(0), 400).unref();
+    setTimeout(() => process.exit(0), 600).unref();
   };
 
-  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.once('SIGTERM', () => {
+    void gracefulShutdown('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    void gracefulShutdown('SIGINT');
+  });
 }
 
 void startServer();
