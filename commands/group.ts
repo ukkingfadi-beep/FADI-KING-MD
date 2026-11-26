@@ -1036,7 +1036,7 @@ export const groupCommands: BotCommand[] = [
   },
   {
     name: 'unmute',
-    aliases: ['opengc'],
+    aliases: ['unlockgc'],
     category: 'group',
     description: 'Group ko sab members ke liye open/unmute kare',
     usage: 'unmute',
@@ -1264,12 +1264,12 @@ export const groupCommands: BotCommand[] = [
         `• JID: \`${meta.id}\``,
         `• Members: ${meta.participants.length} (${admins.length} Admins)`,
         `• Antilink: ${antilinkLabel}`,
-        `• Anti-Admin: ${cfg.antiAdmin ? 'ON' : 'OFF'} | Anti-KickAll: ${cfg.antiKickAll ? 'ON' : 'OFF'}`,
+        `• Anti-Admin: ${cfg.antiAdmin ? 'ON' : 'OFF'} | Anti-AdminKick: ${cfg.antiAdminKick ? 'ON' : 'OFF'} | Anti-KickAll: ${cfg.antiKickAll ? 'ON' : 'OFF'}`,
         `• Anti-Scam: ${cfg.antiScam ? 'ON' : 'OFF'} | Anti-Add: ${cfg.antiAdd ? 'ON' : 'OFF'}`,
         `• Anti-Forward: ${cfg.antiForward ? 'ON' : 'OFF'} | Anti-Media: ${cfg.antiMedia ? 'ON' : 'OFF'}`,
         `• Anti-Sticker: ${cfg.antiSticker ? 'ON' : 'OFF'} | Anti-Bot: ${cfg.antiBot ? 'ON' : 'OFF'}`,
         `• Anti-PayMsg: ${cfg.antiPayMsg ? 'ON' : 'OFF'} | Anti-Mention Status: ${cfg.antiStatusMention ? 'ON' : 'OFF'}`,
-        `• Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
+        `• GC Status/Link Remove: ${cfg.gcStatusRemove ? 'ON' : 'OFF'} | Antidelete: ${cfg.antidelete ? 'ON' : 'OFF'}`,
         `• Welcome: ${cfg.welcome ? 'ON' : 'OFF'} | Welcome Card: ${cfg.welcomeImg ? 'ON' : 'OFF'} | Goodbye: ${cfg.goodbye ? 'ON' : 'OFF'}`,
         ...(meta.desc ? ['', `*Description:*\n${meta.desc.slice(0, 300)}`] : []),
       ].join('\n');
@@ -1331,7 +1331,7 @@ export const groupCommands: BotCommand[] = [
   },
   {
     name: 'poll',
-    aliases: ['fakepoll', 'fakevote', 'vote'],
+    aliases: ['pollcreate', 'newpoll', 'createpoll', 'fakepoll', 'fakevote', 'vote'],
     category: 'group',
     description: 'Real WhatsApp Poll ya custom vote counts ke sath Fake Poll banaye',
     usage: 'poll Question? | Opt1:95 | Opt2:12 (or Question? | Opt1 | Opt2)',
@@ -1479,20 +1479,10 @@ export const groupCommands: BotCommand[] = [
   },
   {
     name: 'approve',
-    aliases: ['acceptall'],
+    aliases: ['approveall', 'acceptall', 'acceptpending'],
     category: 'group',
     description: 'Current group ke tamam pending join requests ek sath approve kare',
     usage: 'approve',
-    groupOnly: true,
-    cooldownSeconds: 4,
-    execute: async (ctx) => bulkHandlePendingRequests(ctx, 'approve'),
-  },
-  {
-    name: 'approveall',
-    aliases: ['acceptpending'],
-    category: 'group',
-    description: 'Group ke tamam pending join requests bulk mein approve kare',
-    usage: 'approveall',
     groupOnly: true,
     cooldownSeconds: 4,
     execute: async (ctx) => bulkHandlePendingRequests(ctx, 'approve'),
@@ -1972,9 +1962,10 @@ export const groupCommands: BotCommand[] = [
       const groupCfg = vipStore.getGroupConfig(ctx.chatId);
       const warnings = { ...(groupCfg.warnings || {}) };
       const antiScamWarnings = { ...(groupCfg.antiScamWarnings || {}) };
+      const gcStatusWarnings = { ...(groupCfg.gcStatusWarnings || {}) };
       let clearedCount = 0;
 
-      for (const map of [warnings, antiScamWarnings]) {
+      for (const map of [warnings, antiScamWarnings, gcStatusWarnings]) {
         for (const key of Object.keys(map)) {
           if (candidateParts.has(key) || candidateParts.has(jidUserPart(key))) {
             clearedCount += Number(map[key] || 0);
@@ -1983,7 +1974,7 @@ export const groupCommands: BotCommand[] = [
         }
       }
 
-      vipStore.updateGroupConfig(ctx.chatId, { warnings, antiScamWarnings });
+      vipStore.updateGroupConfig(ctx.chatId, { warnings, antiScamWarnings, gcStatusWarnings });
       const display = jidUserPart(targetParticipant?.phoneNumber || targetJid);
       const text = `🧽 Cleared warnings (*${clearedCount}* total) for *@${display}* in this group.`;
 
@@ -2108,53 +2099,6 @@ export const groupCommands: BotCommand[] = [
     },
   },
   {
-    name: 'pollcreate',
-    aliases: ['newpoll', 'createpoll'],
-    category: 'group',
-    description: 'Group mein multi-option WhatsApp poll create kare (Question | Opt1 | Opt2)',
-    usage: 'pollcreate Question? | Option 1 | Option 2 | Option 3',
-    cooldownSeconds: 4,
-    execute: async (ctx) => {
-      const segments = ctx.text
-        .split('|')
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      if (segments.length < 3) {
-        const msg = `Provide a question and at least 2 options separated by \`|\`.\nExample: \`${ctx.prefix}pollcreate Best time for meeting? | 6 PM | 8 PM | 10 PM\``;
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      const question = segments[0].slice(0, 255);
-      const uniqueOptions = Array.from(new Set(segments.slice(1))).slice(0, 12);
-      if (uniqueOptions.length < 2) {
-        const msg = 'A poll requires at least 2 distinct options.';
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      if (!ctx.sock || ctx.isSimulated) {
-        const msg = `🗳️ *[Simulated Poll]* ${question}\n${uniqueOptions.map((o, i) => `${i + 1}. ${o}`).join('\n')}`;
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      await ctx.sock.sendMessage(
-        ctx.chatId,
-        {
-          poll: {
-            name: question,
-            values: uniqueOptions,
-            selectableCount: 1,
-          },
-        },
-        { quoted: ctx.msg ?? undefined }
-      );
-      return `Created poll "${question}" with ${uniqueOptions.length} options.`;
-    },
-  },
-  {
     name: 'welcomeimg',
     aliases: ['welcomeimage', 'wimg', 'imgwelcome', 'welcomecard'],
     category: 'group',
@@ -2206,6 +2150,40 @@ export const groupCommands: BotCommand[] = [
       ),
   },
   {
+    name: 'antiadminkick',
+    aliases: ['noadminkick', 'protectadmin', 'antiadminremove'],
+    category: 'group',
+    description: 'Agar koi admin dusre admin ko remove kare to bot us admin ko auto re-add + admin bana de aur attacker ko demote kare',
+    usage: 'antiadminkick <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'antiAdminKick',
+        'Anti-Admin-Kick Protection',
+        'If any admin removes or demotes another admin, the removed admin will be automatically re-added and promoted back to Admin.',
+        { requireBotAdminWhenOn: true }
+      ),
+  },
+  {
+    name: 'gcstatusremove',
+    aliases: ['gcstatusrem', 'statuslinkremove'],
+    category: 'group',
+    description: 'Group mein link ya group status mention karne wale member ko delete + 3 warnings ke baad remove kare',
+    usage: 'gcstatusremove <on|off>',
+    groupOnly: true,
+    cooldownSeconds: 3,
+    execute: async (ctx) =>
+      togglePerGroupProtection(
+        ctx,
+        'gcStatusRemove',
+        'GC Status & Link Remove (3-Warn Auto Kick)',
+        'Links and group status mentions sent by non-admins will be deleted immediately, with auto-removal after 3 warnings.',
+        { requireBotAdminWhenOn: true }
+      ),
+  },
+  {
     name: 'resetgroup',
     aliases: ['groupreset', 'resetgc', 'gcreset'],
     category: 'group',
@@ -2234,7 +2212,7 @@ export const groupCommands: BotCommand[] = [
         `• AI Chat: *OFF* | Welcome / Card / Goodbye: *OFF*`,
         `• Antilink / Antidelete / Slow Mode: *OFF*`,
         `• Anti-Add / Anti-Forward / Anti-Media / Anti-Sticker: *OFF*`,
-        `• Anti-Bot / Anti-PayMsg / Anti-Admin / Anti-KickAll: *OFF*`,
+        `• Anti-Bot / Anti-PayMsg / Anti-Admin / Anti-AdminKick / Anti-KickAll / GCStatusRemove: *OFF*`,
         `• Anti-Scam: *${reset.antiScam ? 'ON (Global Default)' : 'OFF'}* | Anti-Mention: *${reset.antiStatusMention ? 'ON (Global Default)' : 'OFF'}*`,
         `• Warnings & Mutes: *Cleared*`,
       ].join('\n');
@@ -2570,7 +2548,9 @@ async function togglePerGroupProtection(
     | 'antiBot'
     | 'antiPayMsg'
     | 'antiAdmin'
+    | 'antiAdminKick'
     | 'antiKickAll'
+    | 'gcStatusRemove'
     | 'welcomeImg',
   label: string,
   activeSummary: string,

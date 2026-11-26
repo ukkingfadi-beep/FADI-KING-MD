@@ -784,6 +784,12 @@ async function startServer(): Promise<void> {
       antiSticker: typeof req.body?.antiSticker === 'boolean' ? req.body.antiSticker : undefined,
       antiBot: typeof req.body?.antiBot === 'boolean' ? req.body.antiBot : undefined,
       antiPayMsg: typeof req.body?.antiPayMsg === 'boolean' ? req.body.antiPayMsg : undefined,
+      antiAdmin: typeof req.body?.antiAdmin === 'boolean' ? req.body.antiAdmin : undefined,
+      antiAdminKick:
+        typeof req.body?.antiAdminKick === 'boolean' ? req.body.antiAdminKick : undefined,
+      antiKickAll: typeof req.body?.antiKickAll === 'boolean' ? req.body.antiKickAll : undefined,
+      gcStatusRemove:
+        typeof req.body?.gcStatusRemove === 'boolean' ? req.body.gcStatusRemove : undefined,
       slowModeSeconds:
         typeof req.body?.slowModeSeconds === 'number' && Number.isFinite(req.body.slowModeSeconds)
           ? Math.max(0, Math.min(3600, Math.round(req.body.slowModeSeconds)))

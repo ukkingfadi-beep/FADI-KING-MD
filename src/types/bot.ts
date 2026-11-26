@@ -224,6 +224,10 @@ export interface GroupConfig {
   antiSticker?: boolean;
   antiBot?: boolean;
   antiPayMsg?: boolean;
+  antiAdmin?: boolean;
+  antiAdminKick?: boolean;
+  antiKickAll?: boolean;
+  gcStatusRemove?: boolean;
   slowModeSeconds?: number;
   aiEnabled?: boolean;
   welcome: boolean;

@@ -24,7 +24,9 @@ import {
   enforceAntilink,
   enforceAntiScam,
   enforceAntiStatusMention,
+  enforceGcStatusRemove,
   handleAntidelete,
+  syncGroupAdminSnapshot,
 } from './group.ts';
 
 const AUTO_REACT_EMOJIS = ['❤️', '🔥', '👍', '😂', '😮', '✨', '💯', '🤩', '👏', '🥳'];
@@ -172,8 +174,22 @@ export async function handleIncomingMessage(
 
     const body = extractBodyText(msg.message).trim();
 
-    // Enforce group Anti-Status-Mention & Anti-Scam BEFORE empty-body exit
+    // Enforce group GCstatusremove, Anti-Status-Mention & Anti-Scam BEFORE empty-body exit
     if (isGroup) {
+      if (vipStore.getGroupConfig(chatId).antiAdminKick) {
+        void syncGroupAdminSnapshot(sock, chatId);
+      }
+
+      const gcStatusBlocked = await enforceGcStatusRemove(
+        sock,
+        msg,
+        body,
+        chatId,
+        senderCandidates,
+        isOwner
+      );
+      if (gcStatusBlocked) return;
+
       const mentionBlocked = await enforceAntiStatusMention(
         sock,
         msg,

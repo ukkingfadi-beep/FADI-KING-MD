@@ -62,7 +62,9 @@ export interface GroupConfig {
   antiBot?: boolean;
   antiPayMsg?: boolean;
   antiAdmin?: boolean;
+  antiAdminKick?: boolean;
   antiKickAll?: boolean;
+  gcStatusRemove?: boolean;
   slowModeSeconds?: number;
   mutedUsers?: Record<string, MutedUserEntry>;
   aiEnabled?: boolean;
@@ -71,6 +73,7 @@ export interface GroupConfig {
   goodbye: boolean;
   warnings?: Record<string, number>;
   antiScamWarnings?: Record<string, number>;
+  gcStatusWarnings?: Record<string, number>;
 }
 
 export interface CommandTimingRule {
@@ -553,7 +556,9 @@ export const vipStore = {
         antiBot: false,
         antiPayMsg: false,
         antiAdmin: false,
+        antiAdminKick: false,
         antiKickAll: false,
+        gcStatusRemove: false,
         slowModeSeconds: 0,
         mutedUsers: {},
         aiEnabled: false,
@@ -579,7 +584,9 @@ export const vipStore = {
       antiBot: Boolean(found.antiBot),
       antiPayMsg: Boolean(found.antiPayMsg),
       antiAdmin: Boolean(found.antiAdmin),
+      antiAdminKick: Boolean(found.antiAdminKick),
       antiKickAll: Boolean(found.antiKickAll),
+      gcStatusRemove: Boolean(found.gcStatusRemove),
       slowModeSeconds: Math.max(0, Number(found.slowModeSeconds || 0)),
       mutedUsers: found.mutedUsers || {},
       aiEnabled: Boolean(found.aiEnabled),
@@ -608,7 +615,9 @@ export const vipStore = {
       antiBot: Boolean(g.antiBot),
       antiPayMsg: Boolean(g.antiPayMsg),
       antiAdmin: Boolean(g.antiAdmin),
+      antiAdminKick: Boolean(g.antiAdminKick),
       antiKickAll: Boolean(g.antiKickAll),
+      gcStatusRemove: Boolean(g.gcStatusRemove),
       slowModeSeconds: Math.max(0, Number(g.slowModeSeconds || 0)),
       mutedUsers: g.mutedUsers || {},
       aiEnabled: Boolean(g.aiEnabled),
@@ -651,7 +660,9 @@ export const vipStore = {
     if (typeof patch.antiBot === 'boolean') cleanPatch.antiBot = patch.antiBot;
     if (typeof patch.antiPayMsg === 'boolean') cleanPatch.antiPayMsg = patch.antiPayMsg;
     if (typeof patch.antiAdmin === 'boolean') cleanPatch.antiAdmin = patch.antiAdmin;
+    if (typeof patch.antiAdminKick === 'boolean') cleanPatch.antiAdminKick = patch.antiAdminKick;
     if (typeof patch.antiKickAll === 'boolean') cleanPatch.antiKickAll = patch.antiKickAll;
+    if (typeof patch.gcStatusRemove === 'boolean') cleanPatch.gcStatusRemove = patch.gcStatusRemove;
     if (typeof patch.slowModeSeconds === 'number' && Number.isFinite(patch.slowModeSeconds)) {
       cleanPatch.slowModeSeconds = Math.max(0, Math.min(3600, Math.floor(patch.slowModeSeconds)));
     }
@@ -665,6 +676,9 @@ export const vipStore = {
     if (patch.warnings && typeof patch.warnings === 'object') cleanPatch.warnings = patch.warnings;
     if (patch.antiScamWarnings && typeof patch.antiScamWarnings === 'object') {
       cleanPatch.antiScamWarnings = patch.antiScamWarnings;
+    }
+    if (patch.gcStatusWarnings && typeof patch.gcStatusWarnings === 'object') {
+      cleanPatch.gcStatusWarnings = patch.gcStatusWarnings;
     }
 
     const updated: GroupConfig = { ...current, ...cleanPatch, groupId };
@@ -692,7 +706,9 @@ export const vipStore = {
       antiBot: false,
       antiPayMsg: false,
       antiAdmin: false,
+      antiAdminKick: false,
       antiKickAll: false,
+      gcStatusRemove: false,
       slowModeSeconds: 0,
       mutedUsers: {},
       aiEnabled: false,
@@ -701,6 +717,7 @@ export const vipStore = {
       goodbye: false,
       warnings: {},
       antiScamWarnings: {},
+      gcStatusWarnings: {},
     };
     groups[groupId] = defaults;
     groupsCache = groups;

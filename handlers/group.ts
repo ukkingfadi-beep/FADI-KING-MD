@@ -7,6 +7,7 @@ import {
   findParticipant,
   getBotJids,
   getCachedGroupMetadata,
+  getGroupMetadataFromCacheOnly,
   invalidateGroupMetadataCache,
   isLidUser,
   isParticipantAdmin,
@@ -34,6 +35,50 @@ const BAD_MEDIA_LABEL_REGEX =
 const stickerFloodTracker = new Map<string, number[]>();
 const msgFloodTracker = new Map<string, number[]>();
 const kickAllTracker = new Map<string, number[]>();
+const knownGroupAdminsCache = new Map<string, Set<string>>();
+
+export function recordKnownGroupAdmins(
+  groupId: string,
+  participants: Array<{
+    id?: string | null;
+    lid?: string | null;
+    phoneNumber?: string | null;
+    admin?: string | null;
+    isAdmin?: boolean;
+    isSuperAdmin?: boolean;
+  }>
+): void {
+  if (!groupId || !Array.isArray(participants)) return;
+  const adminKeys = new Set<string>();
+  for (const p of participants) {
+    if (
+      p.admin === 'admin' ||
+      p.admin === 'superadmin' ||
+      p.isAdmin ||
+      p.isSuperAdmin
+    ) {
+      for (const raw of [p.id, p.lid, p.phoneNumber]) {
+        const part = jidUserPart(raw);
+        if (part) adminKeys.add(part);
+      }
+    }
+  }
+  knownGroupAdminsCache.set(groupId, adminKeys);
+  if (knownGroupAdminsCache.size > 2500) {
+    const oldest = knownGroupAdminsCache.keys().next().value;
+    if (oldest) knownGroupAdminsCache.delete(oldest);
+  }
+}
+
+export async function syncGroupAdminSnapshot(sock: WASocket, groupId: string): Promise<void> {
+  if (!groupId.endsWith('@g.us')) return;
+  try {
+    const meta = await getCachedGroupMetadata(sock, groupId);
+    recordKnownGroupAdmins(groupId, meta.participants || []);
+  } catch {
+    // Ignore transient group metadata error
+  }
+}
 
 function recordFloodHit(
   tracker: Map<string, number[]>,
@@ -95,6 +140,20 @@ export async function handleGroupParticipantsUpdate(
 ): Promise<void> {
   try {
     const groupId = update.id;
+    // Snapshot prior admins BEFORE invalidating cache so removed admins are still known
+    const priorMeta = await getGroupMetadataFromCacheOnly(groupId);
+    const priorAdminKeys = new Set<string>(knownGroupAdminsCache.get(groupId) || []);
+    if (priorMeta?.participants) {
+      for (const p of priorMeta.participants) {
+        if (isParticipantAdmin(p)) {
+          for (const raw of [p.id, p.lid, p.phoneNumber]) {
+            const u = jidUserPart(raw);
+            if (u) priorAdminKeys.add(u);
+          }
+        }
+      }
+    }
+
     invalidateGroupMetadataCache(groupId);
     const groupCfg = vipStore.getGroupConfig(groupId);
     const cfg = loadConfig();
@@ -102,6 +161,18 @@ export async function handleGroupParticipantsUpdate(
     const updateExtra = update as { author?: string; authorPn?: string };
     const authorRaw = updateExtra.author || '';
     const authorPnRaw = updateExtra.authorPn || '';
+
+    if (update.action === 'promote') {
+      const adminSet = new Set<string>(knownGroupAdminsCache.get(groupId) || priorAdminKeys);
+      for (const participant of update.participants) {
+        const pObj = typeof participant === 'string' ? { id: participant } : participant;
+        const rawJid = pObj.id;
+        const pnJid = (pObj as { phoneNumber?: string }).phoneNumber;
+        if (jidUserPart(rawJid)) adminSet.add(jidUserPart(rawJid));
+        if (jidUserPart(pnJid)) adminSet.add(jidUserPart(pnJid));
+      }
+      knownGroupAdminsCache.set(groupId, adminSet);
+    }
 
     // 1. Anti-Add & Anti-Bot check on newly added participants
     if (update.action === 'add' && (groupCfg.antiAdd || groupCfg.antiBot) && cfg.mode !== 'self') {
@@ -251,6 +322,151 @@ export async function handleGroupParticipantsUpdate(
         }
       } catch (err) {
         logger.warn('antiAdmin', `Anti-Admin check failed in ${groupId}: ${(err as Error).message}`);
+      }
+    }
+
+    // 2b. Anti-Admin-Kick Guard (.antiadminkick):
+    // If any admin (except Bot, Bot Owner, or Group Creator) removes or demotes another admin,
+    // immediately re-add + re-promote the kicked admin back to Admin and demote the offending admin.
+    if (
+      (update.action === 'remove' || update.action === 'demote') &&
+      groupCfg.antiAdminKick &&
+      cfg.mode !== 'self' &&
+      authorRaw
+    ) {
+      try {
+        const meta = await getCachedGroupMetadata(sock, groupId, true);
+        const botJids = await getBotJids(sock);
+        const botParticipant = findParticipant(meta.participants, botJids);
+        if (isParticipantAdmin(botParticipant)) {
+          const ownerNum = normalizePhone(cfg.ownerNumber);
+          const actorCandidates = await expandActorKeys(sock, authorRaw, authorPnRaw);
+          const actorParticipant = actorCandidates.length
+            ? findParticipant(meta.participants, actorCandidates)
+            : undefined;
+          const actorParts = new Set(
+            [
+              ...actorCandidates.map((c) => jidUserPart(c)),
+              jidUserPart(actorParticipant?.id),
+              jidUserPart(actorParticipant?.phoneNumber),
+            ].filter(Boolean)
+          );
+
+          const creatorParts = new Set(
+            [
+              jidUserPart(meta.owner),
+              jidUserPart(meta.ownerPn),
+              ...meta.participants
+                .filter((p) => p.admin === 'superadmin')
+                .flatMap((p) => [jidUserPart(p.id), jidUserPart(p.phoneNumber)]),
+            ].filter(Boolean)
+          );
+
+          const actorIsBot = botJids.some((b) => actorParts.has(jidUserPart(b)));
+          const actorIsOwner = Boolean(
+            ownerNum && Array.from(actorParts).some((u) => normalizePhone(u) === ownerNum)
+          );
+          const actorIsCreator =
+            actorParticipant?.admin === 'superadmin' ||
+            Array.from(actorParts).some((u) => creatorParts.has(u));
+
+          if (!actorIsBot && !actorIsOwner && !actorIsCreator) {
+            const kickedAdminsToRestore: string[] = [];
+            for (const participant of update.participants) {
+              const pObj = typeof participant === 'string' ? { id: participant } : participant;
+              const rawJid = pObj.id;
+              const pnFromObj = (pObj as { phoneNumber?: string }).phoneNumber;
+              const tUser = jidUserPart(rawJid);
+              const tPn = jidUserPart(pnFromObj);
+
+              // Ignore voluntary self-leave or bot itself
+              if (actorParts.has(tUser) || (tPn && actorParts.has(tPn))) continue;
+              if (
+                botJids.some((b) => {
+                  const bu = jidUserPart(b);
+                  return (bu && bu === tUser) || (tPn && bu === tPn);
+                })
+              ) {
+                continue;
+              }
+
+              let mappedPnPart = '';
+              if (isLidUser(rawJid) && sock.signalRepository?.lidMapping?.getPNForLID) {
+                try {
+                  const mapped = await sock.signalRepository.lidMapping.getPNForLID(rawJid);
+                  if (mapped) mappedPnPart = jidUserPart(mapped);
+                } catch {
+                  // Ignore unavailable LID mapping
+                }
+              }
+
+              const roleFromEvent = (pObj as { admin?: string | null }).admin;
+              const wasAdminInPriorMeta = Boolean(
+                priorMeta?.participants &&
+                  isParticipantAdmin(
+                    findParticipant(
+                      priorMeta.participants,
+                      [rawJid, pnFromObj || '', mappedPnPart ? `${mappedPnPart}@s.whatsapp.net` : ''].filter(Boolean)
+                    )
+                  )
+              );
+              const wasAdmin =
+                roleFromEvent === 'admin' ||
+                roleFromEvent === 'superadmin' ||
+                wasAdminInPriorMeta ||
+                Boolean(tUser && priorAdminKeys.has(tUser)) ||
+                Boolean(tPn && priorAdminKeys.has(tPn)) ||
+                Boolean(mappedPnPart && priorAdminKeys.has(mappedPnPart));
+
+              if (wasAdmin) {
+                kickedAdminsToRestore.push(rawJid);
+              }
+            }
+
+            if (kickedAdminsToRestore.length > 0) {
+              if (update.action === 'remove') {
+                await sock.groupParticipantsUpdate(groupId, kickedAdminsToRestore, 'add').catch(() => {});
+                await new Promise((r) => setTimeout(r, 450));
+              }
+              await sock.groupParticipantsUpdate(groupId, kickedAdminsToRestore, 'promote').catch(() => {});
+
+              const actorTargetJid = actorParticipant?.id || actorCandidates[0] || authorRaw;
+              if (actorTargetJid && isParticipantAdmin(actorParticipant)) {
+                await sock.groupParticipantsUpdate(groupId, [actorTargetJid], 'demote').catch(() => {});
+              }
+
+              invalidateGroupMetadataCache(groupId);
+              const updatedAdminSet = new Set<string>(priorAdminKeys);
+              if (actorTargetJid) updatedAdminSet.delete(jidUserPart(actorTargetJid));
+              for (const k of kickedAdminsToRestore) {
+                if (jidUserPart(k)) updatedAdminSet.add(jidUserPart(k));
+              }
+              knownGroupAdminsCache.set(groupId, updatedAdminSet);
+
+              const actorJid = actorTargetJid || '';
+              const actorTag = actorJid ? `@${jidUserPart(actorJid)}` : 'An admin';
+              const targetTags = kickedAdminsToRestore.map((t) => `@${jidUserPart(t)}`).join(', ');
+              const mentions = Array.from(
+                new Set([...kickedAdminsToRestore, ...(actorJid ? [actorJid] : [])])
+              );
+              await sock
+                .sendMessage(groupId, {
+                  text:
+                    update.action === 'remove'
+                      ? `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot remove other admins here!\n• Unauthorized removal by: ${actorTag}\n• Auto Re-Added & Restored as Admin: ${targetTags}${actorJid ? `\n• Offending admin demoted: ${actorTag}` : ''}`
+                      : `🛡️ *Anti-Admin-Kick Shield*\nAdmins cannot demote other admins here!\n• Unauthorized demotion by: ${actorTag}\n• Restored as Admin: ${targetTags}${actorJid ? `\n• Offending admin demoted: ${actorTag}` : ''}`,
+                  mentions,
+                })
+                .catch(() => {});
+              logger.security(
+                'antiAdminKick',
+                `Restored admin(s) [${kickedAdminsToRestore.join(', ')}] after ${update.action} by ${actorJid || 'unknown'} in ${groupId}`
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn('antiAdminKick', `Anti-Admin-Kick check failed in ${groupId}: ${(err as Error).message}`);
       }
     }
 
@@ -697,18 +913,7 @@ export async function enforceAntiScam(
   return false;
 }
 
-export async function enforceAntiStatusMention(
-  sock: WASocket,
-  msg: WAMessage,
-  body: string,
-  chatId: string,
-  senderCandidates: string[],
-  isOwner: boolean
-): Promise<boolean> {
-  if (!chatId.endsWith('@g.us') || isOwner || msg.key?.fromMe) return false;
-  const groupCfg = vipStore.getGroupConfig(chatId);
-  if (!groupCfg.antiStatusMention) return false;
-
+export function isStatusMentionPayload(msg: WAMessage, body: string): boolean {
   const inner = unwrapMessage(msg.message);
   const ctxInfo = extractContextInfo(msg.message) as
     | (Record<string, unknown> & { statusMentionMessageInfo?: unknown; statusMentions?: unknown[] })
@@ -718,7 +923,7 @@ export async function enforceAntiStatusMention(
     | { statusMentionMessageInfo?: unknown; statusMentions?: unknown[] }
     | undefined;
 
-  const isStatusMention = Boolean(
+  return Boolean(
     rawMsg.groupStatusMentionMessage ||
       rawMsg.statusMentionMessage ||
       rawMsg.groupStatusMessage ||
@@ -734,8 +939,99 @@ export async function enforceAntiStatusMention(
       (Array.isArray(ctxInfo?.statusMentions) && ctxInfo.statusMentions.length > 0) ||
       (body && /status\s*mention|mentioned\s+this\s+group\s+in\s+(?:their|a)\s+status/i.test(body))
   );
+}
 
-  if (!isStatusMention) return false;
+export async function enforceGcStatusRemove(
+  sock: WASocket,
+  msg: WAMessage,
+  body: string,
+  chatId: string,
+  senderCandidates: string[],
+  isOwner: boolean
+): Promise<boolean> {
+  if (!chatId.endsWith('@g.us') || isOwner || msg.key?.fromMe) return false;
+  const groupCfg = vipStore.getGroupConfig(chatId);
+  if (!groupCfg.gcStatusRemove) return false;
+
+  const hasLink = Boolean(body && (LINK_REGEX.test(body) || extractFirstUrl(body)));
+  const hasStatusMention = isStatusMentionPayload(msg, body);
+  if (!hasLink && !hasStatusMention) return false;
+
+  try {
+    let meta = await getCachedGroupMetadata(sock, chatId);
+    recordKnownGroupAdmins(chatId, meta.participants || []);
+    const senderParticipant = findParticipant(meta.participants, senderCandidates);
+    if (isParticipantAdmin(senderParticipant)) return false;
+
+    const botJids = await getBotJids(sock);
+    let botParticipant = findParticipant(meta.participants, botJids);
+
+    if (!isParticipantAdmin(botParticipant)) {
+      meta = await getCachedGroupMetadata(sock, chatId, true);
+      recordKnownGroupAdmins(chatId, meta.participants || []);
+      botParticipant = findParticipant(meta.participants, botJids);
+    }
+
+    if (!isParticipantAdmin(botParticipant)) {
+      logger.warn('gcStatusRemove', `Link/Status detected in ${chatId} but bot is not Group Admin.`);
+      return false;
+    }
+
+    const senderJid = senderParticipant?.id || senderCandidates[0] || chatId;
+    const senderDisplay = jidUserPart(senderParticipant?.phoneNumber || senderJid);
+
+    const deleteKey = {
+      remoteJid: chatId,
+      fromMe: false,
+      id: msg.key.id,
+      participant: msg.key.participant || senderParticipant?.id || senderJid,
+    };
+    await sock.sendMessage(chatId, { delete: deleteKey });
+
+    const warnKey = jidUserPart(senderJid);
+    const gcStatusWarnings = { ...(groupCfg.gcStatusWarnings || {}) };
+    const count = (gcStatusWarnings[warnKey] || 0) + 1;
+    const violationLabel = hasStatusMention ? 'status/group status mention' : 'group/external link';
+
+    if (count >= 3) {
+      delete gcStatusWarnings[warnKey];
+      vipStore.updateGroupConfig(chatId, { gcStatusWarnings });
+      await sock.sendMessage(chatId, {
+        text: `🚫 *GC Status/Link Warning 3/3 — Removed*\n@${senderDisplay} reached 3 warnings for sending a ${violationLabel} and has been automatically removed.`,
+        mentions: [senderJid],
+      });
+      await sock.groupParticipantsUpdate(chatId, [senderJid], 'remove').catch(() => {});
+      invalidateGroupMetadataCache(chatId);
+      logger.security('gcStatusRemove', `Deleted ${violationLabel} & removed +${senderDisplay} after 3/3 warnings in ${chatId}`);
+    } else {
+      gcStatusWarnings[warnKey] = count;
+      vipStore.updateGroupConfig(chatId, { gcStatusWarnings });
+      await sock.sendMessage(chatId, {
+        text: `⚠️ *GC Status/Link Warning ${count}/3*\n@${senderDisplay}, sending links or group status mentions is not allowed here. Message deleted (after 3 warnings you will be removed).`,
+        mentions: [senderJid],
+      });
+      logger.security('gcStatusRemove', `Deleted ${violationLabel} & issued warning ${count}/3 to +${senderDisplay} in ${chatId}`);
+    }
+    return true;
+  } catch (err) {
+    logger.warn('gcStatusRemove', `GCstatusremove check failed: ${(err as Error).message}`);
+  }
+  return false;
+}
+
+export async function enforceAntiStatusMention(
+  sock: WASocket,
+  msg: WAMessage,
+  body: string,
+  chatId: string,
+  senderCandidates: string[],
+  isOwner: boolean
+): Promise<boolean> {
+  if (!chatId.endsWith('@g.us') || isOwner || msg.key?.fromMe) return false;
+  const groupCfg = vipStore.getGroupConfig(chatId);
+  if (!groupCfg.antiStatusMention) return false;
+
+  if (!isStatusMentionPayload(msg, body)) return false;
 
   try {
     let meta = await getCachedGroupMetadata(sock, chatId);
