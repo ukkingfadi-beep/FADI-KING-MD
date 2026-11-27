@@ -100,6 +100,7 @@ export interface BotConfigView {
   menuChannelJid: string;
   menuChannelName: string;
   menuChannelUrl: string;
+  botPortalUrl?: string;
   welcomeMessage?: string;
   goodbyeMessage?: string;
 }

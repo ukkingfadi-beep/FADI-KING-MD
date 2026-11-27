@@ -485,6 +485,7 @@ async function startServer(): Promise<void> {
         menuChannelJid: cfg.menuChannelJid,
         menuChannelName: cfg.menuChannelName,
         menuChannelUrl: cfg.menuChannelUrl,
+        botPortalUrl: cfg.botPortalUrl,
         welcomeMessage: cfg.welcomeMessage,
         goodbyeMessage: cfg.goodbyeMessage,
       },
@@ -614,6 +615,7 @@ async function startServer(): Promise<void> {
       menuChannelJid: typeof body.menuChannelJid === 'string' ? body.menuChannelJid : undefined,
       menuChannelName: typeof body.menuChannelName === 'string' ? body.menuChannelName : undefined,
       menuChannelUrl: typeof body.menuChannelUrl === 'string' ? body.menuChannelUrl : undefined,
+      botPortalUrl: typeof body.botPortalUrl === 'string' ? body.botPortalUrl : undefined,
       welcomeMessage: typeof body.welcomeMessage === 'string' ? body.welcomeMessage : undefined,
       goodbyeMessage: typeof body.goodbyeMessage === 'string' ? body.goodbyeMessage : undefined,
     });

@@ -48,6 +48,7 @@ const MENU_SECTIONS: MenuSectionSpec[] = [
       'owner',
       'jid',
       'botlink',
+      'setbotlink',
       'botinfo',
       'reminder',
       'afkon',
@@ -212,6 +213,7 @@ const commandEmojiMap: Record<string, string> = {
   owner: '👑',
   jid: '🆔',
   botlink: '🌐',
+  setbotlink: '🔗',
   botinfo: '📊',
   reminder: '⏰',
   afkon: '🌙',
@@ -750,7 +752,12 @@ export const generalCommands: BotCommand[] = [
       const officialBotUrl = 'https://fadi-king-md-production-29665dad.up.railway.app';
       const railwayDomain =
         process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || process.env.RAILWAY_STATIC_URL?.trim();
+      const configuredPortalUrl = String(cfg.botPortalUrl || '').trim();
       const portalUrl =
+        (configuredPortalUrl &&
+        configuredPortalUrl !== 'https://github.com/fadiking/fadi-king-md'
+          ? configuredPortalUrl
+          : '') ||
         process.env.PUBLIC_PORTAL_URL?.trim() ||
         (railwayDomain
           ? railwayDomain.startsWith('http')
@@ -790,6 +797,27 @@ export const generalCommands: BotCommand[] = [
 
       await ctx.reply(output);
       return output;
+    },
+  },
+  {
+    name: 'setbotlink',
+    aliases: ['setportal', 'setwebsite'],
+    category: 'general',
+    description: 'Bot ke official Web Pairing Portal (.botlink) ka link update kare',
+    usage: 'setbotlink <https://...>',
+    ownerOnly: true,
+    cooldownSeconds: 2,
+    execute: async (ctx) => {
+      const nextUrl = ctx.text.trim();
+      if (!nextUrl || !/^https?:\/\/\S+$/i.test(nextUrl)) {
+        const msg = `Usage: \`${ctx.prefix}setbotlink https://your-bot-domain.up.railway.app\``;
+        await ctx.reply(msg);
+        return msg;
+      }
+      const updated = saveConfig({ botPortalUrl: nextUrl });
+      const msg = `🌐 Web Pairing Portal link updated!\n• New \`.botlink\`: ${updated.botPortalUrl}`;
+      await ctx.reply(msg);
+      return msg;
     },
   },
   {

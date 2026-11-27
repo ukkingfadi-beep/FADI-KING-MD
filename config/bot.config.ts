@@ -60,6 +60,7 @@ export interface BotConfig {
   menuChannelJid: string;
   menuChannelName: string;
   menuChannelUrl: string;
+  botPortalUrl: string;
   welcomeMessage: string;
   goodbyeMessage: string;
   sessionDir: string;
@@ -126,6 +127,9 @@ const defaultConfig: BotConfig = {
   menuChannelJid: process.env.MENU_CHANNEL_JID || '',
   menuChannelName: process.env.MENU_CHANNEL_NAME || 'FADI KING MD OFFICIAL',
   menuChannelUrl: process.env.MENU_CHANNEL_URL || '',
+  botPortalUrl:
+    process.env.PUBLIC_PORTAL_URL?.trim() ||
+    'https://fadi-king-md-production-29665dad.up.railway.app',
   welcomeMessage: process.env.DEFAULT_WELCOME_MESSAGE || '',
   goodbyeMessage: process.env.DEFAULT_GOODBYE_MESSAGE || '',
   sessionDir,
@@ -188,6 +192,7 @@ function toPersistableConfig(cfg: BotConfig): Omit<BotConfig, 'sessionDir' | 'da
     menuChannelJid: cfg.menuChannelJid,
     menuChannelName: cfg.menuChannelName,
     menuChannelUrl: cfg.menuChannelUrl,
+    botPortalUrl: cfg.botPortalUrl,
     welcomeMessage: cfg.welcomeMessage,
     goodbyeMessage: cfg.goodbyeMessage,
   };
@@ -220,6 +225,11 @@ export function loadConfig(): BotConfig {
         menuChannelName:
           String(fromDb.menuChannelName || '').trim() || defaultConfig.menuChannelName,
         menuChannelUrl: String(fromDb.menuChannelUrl ?? '').trim(),
+        botPortalUrl:
+          String(fromDb.botPortalUrl || '').trim() &&
+          String(fromDb.botPortalUrl || '').trim() !== 'https://github.com/fadiking/fadi-king-md'
+            ? String(fromDb.botPortalUrl || '').trim()
+            : defaultConfig.botPortalUrl,
         welcomeMessage: String(fromDb.welcomeMessage ?? '').trim(),
         goodbyeMessage: String(fromDb.goodbyeMessage ?? '').trim(),
         sessionDir: defaultConfig.sessionDir,
@@ -455,6 +465,10 @@ export function saveConfig(partial: Partial<BotConfig>): BotConfig {
       typeof cleanPartial.menuChannelUrl === 'string'
         ? cleanPartial.menuChannelUrl.trim()
         : String(current.menuChannelUrl ?? ''),
+    botPortalUrl:
+      typeof cleanPartial.botPortalUrl === 'string'
+        ? cleanPartial.botPortalUrl.trim() || defaultConfig.botPortalUrl
+        : String(current.botPortalUrl || '').trim() || defaultConfig.botPortalUrl,
     welcomeMessage:
       typeof cleanPartial.welcomeMessage === 'string'
         ? cleanPartial.welcomeMessage.trim()
