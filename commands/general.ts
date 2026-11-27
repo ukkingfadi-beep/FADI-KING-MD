@@ -747,17 +747,17 @@ export const generalCommands: BotCommand[] = [
     cooldownSeconds: 3,
     execute: async (ctx) => {
       const cfg = loadConfig();
+      const officialBotUrl = 'https://fadi-king-md-production-29665dad.up.railway.app';
       const railwayDomain =
         process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || process.env.RAILWAY_STATIC_URL?.trim();
       const portalUrl =
-        process.env.APP_URL?.trim() ||
+        process.env.PUBLIC_PORTAL_URL?.trim() ||
         (railwayDomain
           ? railwayDomain.startsWith('http')
             ? railwayDomain
             : `https://${railwayDomain}`
           : '') ||
-        process.env.PUBLIC_PORTAL_URL?.trim() ||
-        'https://github.com/fadiking/fadi-king-md';
+        officialBotUrl;
 
       const channelLine = cfg.menuChannelUrl?.trim()
         ? `• Official Channel: ${cfg.menuChannelUrl.trim()}`
