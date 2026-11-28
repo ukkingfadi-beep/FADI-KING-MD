@@ -389,6 +389,7 @@ export function extractContextInfo(
     inner.audioMessage?.contextInfo ||
     inner.stickerMessage?.contextInfo ||
     inner.documentMessage?.contextInfo ||
+    (inner as { contextInfo?: proto.IContextInfo }).contextInfo ||
     undefined
   );
 }
@@ -417,10 +418,6 @@ export function extractRawTargetCandidates(
   const mentioned = ctxInfo?.mentionedJid || [];
   if (mentioned.length > 0) return mentioned.map((j) => normalizeBareJid(j));
 
-  if (ctxInfo?.participant) {
-    return [normalizeBareJid(ctxInfo.participant)];
-  }
-
   const rawArg = (args[0] || '').trim();
   if (rawArg) {
     if (/^[0-9]{5,30}@(s\.whatsapp\.net|lid)$/i.test(rawArg)) {
@@ -432,5 +429,10 @@ export function extractRawTargetCandidates(
       return [`${num}@s.whatsapp.net`];
     }
   }
+
+  if (ctxInfo?.participant) {
+    return [normalizeBareJid(ctxInfo.participant)];
+  }
+
   return [];
 }

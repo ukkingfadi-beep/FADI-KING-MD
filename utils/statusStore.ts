@@ -2,6 +2,7 @@ import type { proto, WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { isValidPhone, normalizePhone } from '../config/bot.config.ts';
 import {
   extractBodyText,
+  extractContextInfo,
   hasValidMediaPayload,
   isLidUser,
   jidUserPart,
@@ -64,6 +65,16 @@ export interface ExtractedStatusMedia {
   isViewOnce: boolean;
 }
 
+export interface StatusMentionRecord {
+  mentionMsgId: string;
+  chatId: string;
+  referencedStatusIds: string[];
+  senderJids: string[];
+  senderPhone: string;
+  pushName: string;
+  timestampMs: number;
+}
+
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_STATUS_ENTRIES = 250;
 const MAX_BUFFER_CACHE_ITEMS = 28;
@@ -72,6 +83,10 @@ const MAX_TOTAL_BUFFER_BYTES = 36 * 1024 * 1024;
 
 const statusesById = new Map<string, CachedStatusEntry>();
 const statusIdsByUserKey = new Map<string, string[]>();
+const statusIdsByGroupKey = new Map<string, string[]>();
+const statusIdAliases = new Map<string, string>();
+const mentionRecordsByMsgId = new Map<string, StatusMentionRecord>();
+const mentionIdsByGroupKey = new Map<string, string[]>();
 const statusInflight = new Map<string, Promise<Buffer | null>>();
 
 function toTimestampMs(rawTs: unknown): number {
@@ -114,6 +129,17 @@ function removeStatusById(id: string): void {
       statusIdsByUserKey.set(key, filtered);
     }
   }
+  for (const [groupKey, arr] of statusIdsByGroupKey.entries()) {
+    const filtered = arr.filter((item) => item !== id);
+    if (filtered.length === 0) {
+      statusIdsByGroupKey.delete(groupKey);
+    } else if (filtered.length !== arr.length) {
+      statusIdsByGroupKey.set(groupKey, filtered);
+    }
+  }
+  for (const [alias, target] of statusIdAliases.entries()) {
+    if (target === id) statusIdAliases.delete(alias);
+  }
 }
 
 function pruneExpiredStatuses(now = Date.now()): void {
@@ -122,10 +148,26 @@ function pruneExpiredStatuses(now = Date.now()): void {
       removeStatusById(id);
     }
   }
+  for (const [mId, rec] of mentionRecordsByMsgId.entries()) {
+    if (now - rec.timestampMs > STATUS_TTL_MS) {
+      mentionRecordsByMsgId.delete(mId);
+      const arr = mentionIdsByGroupKey.get(rec.chatId);
+      if (arr) {
+        const filtered = arr.filter((x) => x !== mId);
+        if (filtered.length === 0) mentionIdsByGroupKey.delete(rec.chatId);
+        else mentionIdsByGroupKey.set(rec.chatId, filtered);
+      }
+    }
+  }
   while (statusesById.size > MAX_STATUS_ENTRIES) {
     const oldest = statusesById.keys().next().value;
     if (!oldest) break;
     removeStatusById(oldest);
+  }
+  while (mentionRecordsByMsgId.size > MAX_STATUS_ENTRIES) {
+    const oldest = mentionRecordsByMsgId.keys().next().value;
+    if (!oldest) break;
+    mentionRecordsByMsgId.delete(oldest);
   }
 }
 
@@ -194,6 +236,18 @@ export function extractStatusMediaPayload(
     };
   }
 
+  const msgCtx = extractContextInfo(message);
+  const rawRecord = message as Record<string, unknown>;
+  const rawCtxInfo = rawRecord.contextInfo as
+    | (proto.IContextInfo & { statusMentionMessageInfo?: { quotedStatus?: proto.IMessage | null } | null })
+    | undefined;
+  const quotedStatusFromCtx =
+    (msgCtx as { statusMentionMessageInfo?: { quotedStatus?: proto.IMessage | null } | null } | undefined)
+      ?.statusMentionMessageInfo?.quotedStatus ||
+    rawCtxInfo?.statusMentionMessageInfo?.quotedStatus ||
+    (rawRecord.statusMentionMessageInfo as { quotedStatus?: proto.IMessage | null } | undefined)
+      ?.quotedStatus;
+
   const candidateWrappers: Array<proto.IMessage | null | undefined> = [
     unwrapViewOnce(message),
     unwrapMessage(message),
@@ -206,7 +260,9 @@ export function extractStatusMediaPayload(
     message.documentWithCaptionMessage?.message,
     message.deviceSentMessage?.message,
     message.botInvokeMessage?.message,
+    message.protocolMessage?.editedMessage,
     message.editedMessage?.message?.protocolMessage?.editedMessage,
+    quotedStatusFromCtx,
   ];
 
   for (const child of candidateWrappers) {
@@ -233,12 +289,169 @@ export function extractStatusMediaPayload(
   return null;
 }
 
-export function hasGroupStatusMedia(message: proto.IMessage | null | undefined): boolean {
-  if (!message) return false;
+export function extractReferencedStatusIds(
+  message: proto.IMessage | null | undefined,
+  depth = 0,
+  visited = new Set<object>()
+): string[] {
+  if (!message || typeof message !== 'object' || depth > 6 || visited.has(message)) return [];
+  visited.add(message);
+  const ids = new Set<string>();
+
+  if (message.protocolMessage?.key?.id) ids.add(String(message.protocolMessage.key.id));
+  if (message.statusNotificationMessage?.originalMessageKey?.id) {
+    ids.add(String(message.statusNotificationMessage.originalMessageKey.id));
+  }
+  if (message.statusNotificationMessage?.responseMessageKey?.id) {
+    ids.add(String(message.statusNotificationMessage.responseMessageKey.id));
+  }
+  if (message.statusQuotedMessage?.originalStatusId?.id) {
+    ids.add(String(message.statusQuotedMessage.originalStatusId.id));
+  }
+
+  const children: Array<proto.IMessage | null | undefined> = [
+    message.groupStatusMessage?.message,
+    message.groupStatusMessageV2?.message,
+    message.groupStatusMentionMessage?.message,
+    message.statusMentionMessage?.message,
+    message.associatedChildMessage?.message,
+    message.ephemeralMessage?.message,
+    message.deviceSentMessage?.message,
+    message.botInvokeMessage?.message,
+    message.protocolMessage?.editedMessage,
+  ];
+  for (const child of children) {
+    if (child) {
+      for (const id of extractReferencedStatusIds(child, depth + 1, visited)) {
+        ids.add(id);
+      }
+    }
+  }
+  return Array.from(ids).filter(Boolean);
+}
+
+export function extractStatusMentionTargets(
+  message: proto.IMessage | null | undefined,
+  depth = 0,
+  visited = new Set<object>()
+): string[] {
+  if (!message || typeof message !== 'object' || depth > 6 || visited.has(message)) return [];
+  visited.add(message);
+  const targets = new Set<string>();
+
+  const collectFromCtx = (ctx?: proto.IContextInfo | null) => {
+    if (!ctx) return;
+    const extended = ctx as proto.IContextInfo & {
+      statusMentions?: string[] | null;
+      statusMentionSources?: string[] | null;
+    };
+    for (const j of [
+      ...(extended.statusMentions || []),
+      ...(extended.statusMentionSources || []),
+      ...(extended.mentionedJid || []),
+    ]) {
+      const bare = normalizeBareJid(j);
+      if (bare) targets.add(bare);
+    }
+  };
+
+  collectFromCtx(extractContextInfo(message));
+  collectFromCtx((message as { contextInfo?: proto.IContextInfo }).contextInfo);
+  collectFromCtx(message.extendedTextMessage?.contextInfo);
+  collectFromCtx(message.imageMessage?.contextInfo);
+  collectFromCtx(message.videoMessage?.contextInfo);
+  collectFromCtx(message.audioMessage?.contextInfo);
+
+  const children: Array<proto.IMessage | null | undefined> = [
+    message.groupStatusMessage?.message,
+    message.groupStatusMessageV2?.message,
+    message.groupStatusMentionMessage?.message,
+    message.statusMentionMessage?.message,
+    message.associatedChildMessage?.message,
+    message.ephemeralMessage?.message,
+    message.deviceSentMessage?.message,
+  ];
+  for (const child of children) {
+    if (child) {
+      for (const t of extractStatusMentionTargets(child, depth + 1, visited)) {
+        targets.add(t);
+      }
+    }
+  }
+  return Array.from(targets);
+}
+
+export function isStatusMentionStubMessage(
+  message: proto.IMessage | null | undefined,
+  depth = 0
+): boolean {
+  if (!message || typeof message !== 'object' || depth > 6) return false;
+  if (
+    message.groupStatusMentionMessage?.message ||
+    message.statusMentionMessage?.message ||
+    message.statusNotificationMessage ||
+    message.statusQuotedMessage ||
+    message.protocolMessage?.type === 25
+  ) {
+    return true;
+  }
+  const ctx = extractContextInfo(message) as
+    | (proto.IContextInfo & {
+        statusMentionMessageInfo?: unknown;
+        statusMentions?: unknown[];
+      })
+    | undefined;
+  if (
+    ctx?.statusMentionMessageInfo ||
+    (Array.isArray(ctx?.statusMentions) && ctx.statusMentions.length > 0)
+  ) {
+    return true;
+  }
   return Boolean(
-    message.groupStatusMessage?.message ||
-      message.groupStatusMessageV2?.message
+    isStatusMentionStubMessage(message.ephemeralMessage?.message, depth + 1) ||
+      isStatusMentionStubMessage(message.deviceSentMessage?.message, depth + 1) ||
+      isStatusMentionStubMessage(message.associatedChildMessage?.message, depth + 1)
   );
+}
+
+export function hasGroupStatusMedia(
+  message: proto.IMessage | null | undefined,
+  depth = 0
+): boolean {
+  if (!message || typeof message !== 'object' || depth > 6) return false;
+  if (
+    message.groupStatusMessage?.message ||
+    message.groupStatusMessageV2?.message ||
+    message.groupStatusMentionMessage?.message ||
+    message.statusMentionMessage?.message ||
+    message.statusNotificationMessage ||
+    message.statusQuotedMessage ||
+    message.protocolMessage?.type === 25
+  ) {
+    return true;
+  }
+  const ctx = extractContextInfo(message) as
+    | (proto.IContextInfo & { statusMentionMessageInfo?: { quotedStatus?: unknown } | null })
+    | undefined;
+  if (ctx?.statusMentionMessageInfo?.quotedStatus) return true;
+  return Boolean(
+    hasGroupStatusMedia(message.ephemeralMessage?.message, depth + 1) ||
+      hasGroupStatusMedia(message.deviceSentMessage?.message, depth + 1) ||
+      hasGroupStatusMedia(message.associatedChildMessage?.message, depth + 1)
+  );
+}
+
+function indexStatusForGroup(groupJid: string, statusId: string): void {
+  const bare = normalizeBareJid(groupJid);
+  if (!bare.endsWith('@g.us') || !statusId) return;
+  const list = statusIdsByGroupKey.get(bare) || [];
+  if (!list.includes(statusId)) {
+    list.push(statusId);
+  }
+  list.sort(
+    (a, b) => (statusesById.get(b)?.timestampMs || 0) - (statusesById.get(a)?.timestampMs || 0)
+  );
+  statusIdsByGroupKey.set(bare, list.slice(0, 30));
 }
 
 export async function recordBroadcastStatus(
@@ -249,10 +462,9 @@ export async function recordBroadcastStatus(
   try {
     if (!msg.key?.id) return null;
     const isBroadcastStatus = msg.key.remoteJid === 'status@broadcast';
-    const isGroupStatus =
-      Boolean(msg.key.remoteJid?.endsWith('@g.us')) && hasGroupStatusMedia(msg.message);
+    const isGroupOrMentionStatus = hasGroupStatusMedia(msg.message);
 
-    if (!isBroadcastStatus && !isGroupStatus) {
+    if (!isBroadcastStatus && !isGroupOrMentionStatus) {
       return null;
     }
 
@@ -270,28 +482,6 @@ export async function recordBroadcastStatus(
       return null;
     }
 
-    // Extract image, video, audio, or text status payload
-    const extracted = extractStatusMediaPayload(msg.message);
-    let textBody: string | undefined;
-    let backgroundArgb: number | undefined;
-
-    if (!extracted) {
-      const unwrapped = unwrapMessage(msg.message) || msg.message;
-      const textPreview = extractBodyText(msg.message).trim();
-      if (!textPreview) {
-        logger.info('statusStore', `Ignored non-media empty status update (${msg.key.id}).`);
-        return null;
-      }
-      textBody = textPreview;
-      backgroundArgb = unwrapped.extendedTextMessage?.backgroundArgb ?? undefined;
-    } else if (!hasValidMediaPayload(extracted.inner)) {
-      logger.info(
-        'statusStore',
-        `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${msg.key.id}).`
-      );
-      return null;
-    }
-
     const rawSenders = new Set<string>();
     const addRaw = (val?: string | null) => {
       if (!val) return;
@@ -305,6 +495,11 @@ export async function recordBroadcastStatus(
     addRaw(msg.key.participantAlt);
     addRaw(msg.key.remoteJidAlt);
     addRaw((msg as { participant?: string }).participant);
+    if (!isBroadcastStatus && msg.key.remoteJid && !msg.key.remoteJid.endsWith('@g.us')) {
+      addRaw(msg.key.remoteJid);
+    }
+    const referencedCtx = extractContextInfo(msg.message);
+    if (referencedCtx?.participant) addRaw(referencedCtx.participant);
     if (msg.key.fromMe) {
       addRaw(sock.user?.id);
       addRaw(sock.user?.lid);
@@ -332,9 +527,6 @@ export async function recordBroadcastStatus(
     }
 
     const senderJids = Array.from(rawSenders);
-    if (senderJids.length === 0) return null;
-
-    // Only extract senderPhone from verified @s.whatsapp.net JIDs (never format @lid as a phone number!)
     const pnJid = senderJids.find((j) => j.endsWith('@s.whatsapp.net')) || '';
     const candidatePhone = pnJid ? normalizePhone(jidUserPart(pnJid)) : '';
     const senderPhone = isValidPhone(candidatePhone) ? candidatePhone : '';
@@ -350,6 +542,89 @@ export async function recordBroadcastStatus(
       }
       if (senderPhone) rememberUserName(senderPhone, msg.pushName);
     }
+
+    const msgTimestampMs = toTimestampMs(msg.messageTimestamp);
+    const referencedIds = extractReferencedStatusIds(msg.message);
+    const mentionTargets = extractStatusMentionTargets(msg.message);
+    const chatBare = msg.key.remoteJid ? normalizeBareJid(msg.key.remoteJid) : '';
+
+    // Always link group/DM status mention cards even when WhatsApp sends them as stubs without inline media
+    if (!isBroadcastStatus && isGroupOrMentionStatus && msg.key.id) {
+      const mentionRec: StatusMentionRecord = {
+        mentionMsgId: msg.key.id,
+        chatId: chatBare,
+        referencedStatusIds: referencedIds,
+        senderJids,
+        senderPhone,
+        pushName: cleanPush,
+        timestampMs: msgTimestampMs,
+      };
+      mentionRecordsByMsgId.delete(msg.key.id);
+      mentionRecordsByMsgId.set(msg.key.id, mentionRec);
+
+      if (chatBare.endsWith('@g.us')) {
+        const gList = mentionIdsByGroupKey.get(chatBare) || [];
+        if (!gList.includes(msg.key.id)) gList.unshift(msg.key.id);
+        mentionIdsByGroupKey.set(chatBare, gList.slice(0, 30));
+      }
+
+      for (const refId of referencedIds) {
+        statusIdAliases.set(msg.key.id, refId);
+        if (chatBare.endsWith('@g.us') && statusesById.has(refId)) {
+          indexStatusForGroup(chatBare, refId);
+        }
+      }
+
+      // Retroactively link matching broadcast statuses already cached from this author
+      if (senderJids.length > 0 && referencedIds.length === 0) {
+        const senderKeySet = new Set(buildUserKeys([...senderJids, senderPhone]));
+        let closestId = '';
+        let closestDelta = Infinity;
+        for (const candidate of statusesById.values()) {
+          if (candidate.mediaType === 'text') continue;
+          const candidateKeys = buildUserKeys([...candidate.senderJids, candidate.senderPhone]);
+          if (!candidateKeys.some((k) => senderKeySet.has(k))) continue;
+          const delta = Math.abs(candidate.timestampMs - msgTimestampMs);
+          if (delta <= 120_000 && delta < closestDelta) {
+            closestDelta = delta;
+            closestId = candidate.id;
+          }
+        }
+        if (closestId) {
+          statusIdAliases.set(msg.key.id, closestId);
+          if (chatBare.endsWith('@g.us')) indexStatusForGroup(chatBare, closestId);
+        }
+      }
+    }
+
+    // Extract image, video, audio, or text status payload
+    const extracted = extractStatusMediaPayload(msg.message);
+    let textBody: string | undefined;
+    let backgroundArgb: number | undefined;
+
+    if (!extracted) {
+      // Do not mistake an empty groupStatusMentionMessage stub for a text status!
+      if (isStatusMentionStubMessage(msg.message)) {
+        pruneExpiredStatuses();
+        return null;
+      }
+      const unwrapped = unwrapMessage(msg.message) || msg.message;
+      const textPreview = extractBodyText(msg.message).trim();
+      if (!textPreview) {
+        logger.info('statusStore', `Ignored non-media empty status update (${msg.key.id}).`);
+        return null;
+      }
+      textBody = textPreview;
+      backgroundArgb = unwrapped.extendedTextMessage?.backgroundArgb ?? undefined;
+    } else if (!hasValidMediaPayload(extracted.inner)) {
+      logger.info(
+        'statusStore',
+        `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${msg.key.id}).`
+      );
+      return null;
+    }
+
+    if (senderJids.length === 0) return null;
 
     const prev = statusesById.get(msg.key.id);
     const mergedSessionKeys = Array.from(
@@ -370,7 +645,7 @@ export async function recordBroadcastStatus(
       senderJids,
       senderPhone,
       pushName: cleanPush,
-      timestampMs: toTimestampMs(msg.messageTimestamp),
+      timestampMs: msgTimestampMs,
       sessionKeys: mergedSessionKeys,
       cachedBuffer: prev?.cachedBuffer,
     };
@@ -387,6 +662,35 @@ export async function recordBroadcastStatus(
         (a, b) => (statusesById.get(b)?.timestampMs || 0) - (statusesById.get(a)?.timestampMs || 0)
       );
       statusIdsByUserKey.set(key, list.slice(0, 15));
+    }
+
+    // Index group statuses & statuses that mention groups
+    if (chatBare.endsWith('@g.us')) {
+      indexStatusForGroup(chatBare, entry.id);
+    }
+    for (const target of mentionTargets) {
+      if (target.endsWith('@g.us')) {
+        indexStatusForGroup(target, entry.id);
+      }
+    }
+
+    // Back-link any mention cards that arrived just before this status@broadcast message
+    const entryKeys = new Set(buildUserKeys([...senderJids, senderPhone]));
+    for (const rec of mentionRecordsByMsgId.values()) {
+      if (rec.referencedStatusIds.includes(entry.id)) {
+        statusIdAliases.set(rec.mentionMsgId, entry.id);
+        if (rec.chatId.endsWith('@g.us')) indexStatusForGroup(rec.chatId, entry.id);
+        continue;
+      }
+      if (rec.referencedStatusIds.length === 0 && Math.abs(rec.timestampMs - entry.timestampMs) <= 120_000) {
+        const recKeys = buildUserKeys([...rec.senderJids, rec.senderPhone]);
+        if (recKeys.some((k) => entryKeys.has(k))) {
+          if (!statusIdAliases.has(rec.mentionMsgId)) {
+            statusIdAliases.set(rec.mentionMsgId, entry.id);
+          }
+          if (rec.chatId.endsWith('@g.us')) indexStatusForGroup(rec.chatId, entry.id);
+        }
+      }
     }
 
     pruneExpiredStatuses();
@@ -452,10 +756,35 @@ export async function getOrDownloadStatusBuffer(
 export function getStatusById(msgId: string): CachedStatusEntry | undefined {
   if (!msgId) return undefined;
   pruneExpiredStatuses();
-  return statusesById.get(msgId);
+  const direct = statusesById.get(msgId);
+  if (direct) return direct;
+
+  const aliasedId = statusIdAliases.get(msgId);
+  if (aliasedId) {
+    const aliased = statusesById.get(aliasedId);
+    if (aliased) return aliased;
+  }
+
+  const mentionRec = mentionRecordsByMsgId.get(msgId);
+  if (mentionRec) {
+    for (const refId of mentionRec.referencedStatusIds) {
+      const hit = statusesById.get(refId);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
 }
 
-export function findStatusesForUser(candidates: string[]): CachedStatusEntry[] {
+export function getStatusMentionMeta(msgId: string): StatusMentionRecord | undefined {
+  if (!msgId) return undefined;
+  pruneExpiredStatuses();
+  return mentionRecordsByMsgId.get(msgId);
+}
+
+export function findStatusesForUser(
+  candidates: string[],
+  includeText = false
+): CachedStatusEntry[] {
   pruneExpiredStatuses();
   const keys = buildUserKeys(candidates);
   const found = new Map<string, CachedStatusEntry>();
@@ -464,11 +793,70 @@ export function findStatusesForUser(candidates: string[]): CachedStatusEntry[] {
     const ids = statusIdsByUserKey.get(key) || [];
     for (const id of ids) {
       const entry = statusesById.get(id);
-      if (entry && entry.mediaType !== 'text') found.set(id, entry);
+      if (entry && (includeText || entry.mediaType !== 'text')) found.set(id, entry);
     }
   }
 
   return Array.from(found.values()).sort((a, b) => b.timestampMs - a.timestampMs);
+}
+
+export function findStatusesForGroup(
+  groupId: string,
+  authorCandidates?: string[],
+  includeText = false
+): CachedStatusEntry[] {
+  pruneExpiredStatuses();
+  const bareGroup = normalizeBareJid(groupId);
+  if (!bareGroup.endsWith('@g.us')) return [];
+
+  const authorKeys =
+    authorCandidates && authorCandidates.length > 0
+      ? new Set(buildUserKeys(authorCandidates))
+      : null;
+
+  const found = new Map<string, CachedStatusEntry>();
+  const groupStatusIds = statusIdsByGroupKey.get(bareGroup) || [];
+  for (const id of groupStatusIds) {
+    const entry = statusesById.get(id);
+    if (!entry) continue;
+    if (!includeText && entry.mediaType === 'text') continue;
+    if (authorKeys) {
+      const entryKeys = buildUserKeys([...entry.senderJids, entry.senderPhone]);
+      if (!entryKeys.some((k) => authorKeys.has(k))) continue;
+    }
+    found.set(id, entry);
+  }
+
+  // Also check authors who posted a groupStatusMentionMessage in this group
+  if (!authorKeys) {
+    const mentionIds = mentionIdsByGroupKey.get(bareGroup) || [];
+    for (const mId of mentionIds) {
+      const direct = getStatusById(mId);
+      if (direct && (includeText || direct.mediaType !== 'text')) {
+        found.set(direct.id, direct);
+        continue;
+      }
+      const rec = mentionRecordsByMsgId.get(mId);
+      if (rec?.senderJids.length) {
+        for (const s of findStatusesForUser(rec.senderJids, includeText)) {
+          found.set(s.id, s);
+        }
+      }
+    }
+  }
+
+  return Array.from(found.values()).sort((a, b) => b.timestampMs - a.timestampMs);
+}
+
+export function findLatestGroupMentionAuthors(groupId: string): StatusMentionRecord[] {
+  pruneExpiredStatuses();
+  const bareGroup = normalizeBareJid(groupId);
+  if (!bareGroup.endsWith('@g.us')) return [];
+  const ids = mentionIdsByGroupKey.get(bareGroup) || [];
+  return ids
+    .map((id) => mentionRecordsByMsgId.get(id))
+    .filter((r): r is StatusMentionRecord => Boolean(r))
+    .sort((a, b) => b.timestampMs - a.timestampMs);
 }
 
 export function listActiveStatusPosters(limit = 8): Array<{

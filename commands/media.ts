@@ -40,10 +40,16 @@ import {
   waitForViewOnceInflight,
 } from '../utils/mediaHelper.ts';
 import {
+  extractReferencedStatusIds,
   extractStatusMediaPayload,
+  extractStatusMentionTargets,
+  findLatestGroupMentionAuthors,
+  findStatusesForGroup,
   findStatusesForUser,
   getOrDownloadStatusBuffer,
   getStatusById,
+  getStatusMentionMeta,
+  isStatusMentionStubMessage,
   listActiveStatusPosters,
   type CachedStatusEntry,
 } from '../utils/statusStore.ts';
@@ -135,6 +141,561 @@ const VIP_QUOTES = [
   'Har mushkil waqt sirf is liye aata hai taake aap aur zyada mazboot ban sako.',
   'Protect your peace, focus on your craft, and never settle for average.',
 ];
+
+async function executeSaveStatusCommand(
+  ctx: CommandContext,
+  groupFirst: boolean
+): Promise<string> {
+  const cmdLabel = groupFirst ? `${ctx.prefix}gcstatussave` : `${ctx.prefix}savestatus`;
+  if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
+    const msg = groupFirst
+      ? 'Tag/reply to a group status mention card (`@ This group was mentioned`), mention `@user`, or run `.gcstatussave` inside a group to save the status to this chat and your IB.'
+      : 'Mention `@user`, pass a phone number, or reply to a WhatsApp Status / status mention with `.savestatus` to save their status in both this chat and your IB.';
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  const sock = ctx.sock;
+  const incomingMsg = ctx.msg;
+  const ctxInfo = extractContextInfo(incomingMsg.message);
+  const stanzaId = ctxInfo?.stanzaId || '';
+  const quotedRaw = ctxInfo?.quotedMessage;
+  const quoted = extractQuotedMessage(incomingMsg);
+
+  const ownBotPhone = normalizePhone(jidUserPart(sock.user?.id));
+  const targetDm =
+    incomingMsg.key?.fromMe && ownBotPhone
+      ? `${ownBotPhone}@s.whatsapp.net`
+      : isValidPhone(ctx.senderNumber)
+        ? `${ctx.senderNumber}@s.whatsapp.net`
+        : normalizeBareJid(ctx.senderJid);
+
+  const sameAsCurrentChat =
+    Boolean(targetDm) &&
+    (normalizeBareJid(targetDm) === normalizeBareJid(ctx.chatId) ||
+      (Boolean(jidUserPart(targetDm)) && jidUserPart(targetDm) === jidUserPart(ctx.chatId)));
+
+  const resolveVerifiedPhone = async (jids: string[], fallbackPhone: string): Promise<string> => {
+    if (isValidPhone(fallbackPhone)) return fallbackPhone;
+    for (const jid of jids) {
+      if (jid.endsWith('@s.whatsapp.net')) {
+        const p = normalizePhone(jidUserPart(jid));
+        if (isValidPhone(p)) return p;
+      }
+    }
+    for (const jid of jids) {
+      if (isLidUser(jid) && sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await sock.signalRepository.lidMapping.getPNForLID(normalizeBareJid(jid));
+          const p = normalizePhone(jidUserPart(pn));
+          if (isValidPhone(p)) return p;
+        } catch {
+          // Ignore LID mapping miss
+        }
+      }
+    }
+    if (ctx.isGroup && jids.length > 0) {
+      try {
+        const meta = await getCachedGroupMetadata(sock, ctx.chatId);
+        for (const participant of meta.participants) {
+          if (participantMatchesAny(participant, jids)) {
+            const candidate =
+              participant.phoneNumber ||
+              (participant.id?.endsWith('@s.whatsapp.net') ? participant.id : '');
+            const p = normalizePhone(jidUserPart(candidate));
+            if (isValidPhone(p)) return p;
+          }
+        }
+      } catch {
+        // Ignore group metadata lookup error
+      }
+    }
+    return '';
+  };
+
+  const expandAuthorCandidates = async (seeds: string[]): Promise<string[]> => {
+    const resolved = new Set<string>();
+    for (const raw of seeds) {
+      if (!raw) continue;
+      const bare = normalizeBareJid(raw);
+      if (!bare || bare === 'status@broadcast' || bare.endsWith('@g.us')) continue;
+      resolved.add(bare);
+      if (isLidUser(bare) && sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await sock.signalRepository.lidMapping.getPNForLID(bare);
+          if (pn) resolved.add(normalizeBareJid(pn));
+        } catch {
+          // Ignore LID mapping error
+        }
+      } else if (
+        bare.endsWith('@s.whatsapp.net') &&
+        sock.signalRepository?.lidMapping?.getLIDForPN
+      ) {
+        try {
+          const lid = await sock.signalRepository.lidMapping.getLIDForPN(bare);
+          if (lid) resolved.add(normalizeBareJid(lid));
+        } catch {
+          // Ignore PN mapping error
+        }
+      }
+    }
+
+    if (ctx.isGroup && resolved.size > 0) {
+      try {
+        const meta = await getCachedGroupMetadata(sock, ctx.chatId);
+        for (const p of meta.participants) {
+          if (participantMatchesAny(p, Array.from(resolved))) {
+            if (p.id) resolved.add(normalizeBareJid(p.id));
+            if (p.lid) resolved.add(normalizeBareJid(p.lid));
+            if (p.phoneNumber) resolved.add(normalizeBareJid(p.phoneNumber));
+          }
+        }
+      } catch {
+        // Ignore group metadata lookup failure
+      }
+    }
+
+    return Array.from(resolved);
+  };
+
+  const deliverStatusToBoth = async (
+    entry: CachedStatusEntry,
+    footerNote?: string
+  ): Promise<void> => {
+    const verifiedPhone = await resolveVerifiedPhone(entry.senderJids, entry.senderPhone);
+    const phoneSuffix =
+      verifiedPhone && !entry.pushName.includes(verifiedPhone) ? ` • +${verifiedPhone}` : '';
+
+    if (entry.mediaType === 'text') {
+      const textCard = [
+        `*Saved Text Status* (${entry.pushName}${phoneSuffix})`,
+        entry.textBody ? `\n${entry.textBody}` : '',
+        footerNote ? `\n\n_${footerNote}_` : '',
+      ]
+        .filter(Boolean)
+        .join('')
+        .trim();
+      await sock.sendMessage(ctx.chatId, { text: textCard }, { quoted: incomingMsg });
+      if (!sameAsCurrentChat && targetDm) {
+        await sock.sendMessage(targetDm, { text: textCard });
+      }
+      return;
+    }
+
+    const buf = await getOrDownloadStatusBuffer(sock, entry);
+    if (!buf || buf.length === 0) {
+      throw new Error('Status media download or decryption failed (payload may have expired).');
+    }
+
+    const header = `*Saved Status* (${entry.pushName}${phoneSuffix})`;
+    const noteSuffix = footerNote ? `\n_${footerNote}_` : '';
+    const caption = [header, entry.caption ? `\n${entry.caption}` : '', noteSuffix]
+      .filter(Boolean)
+      .join('')
+      .trim();
+
+    if (entry.mediaType === 'image') {
+      await sock.sendMessage(
+        ctx.chatId,
+        { image: buf, mimetype: entry.mimetype || 'image/jpeg', caption },
+        { quoted: incomingMsg }
+      );
+      if (!sameAsCurrentChat && targetDm) {
+        await sock.sendMessage(targetDm, {
+          image: buf,
+          mimetype: entry.mimetype || 'image/jpeg',
+          caption,
+        });
+      }
+      return;
+    }
+
+    if (entry.mediaType === 'video') {
+      await sock.sendMessage(
+        ctx.chatId,
+        { video: buf, mimetype: entry.mimetype || 'video/mp4', caption },
+        { quoted: incomingMsg }
+      );
+      if (!sameAsCurrentChat && targetDm) {
+        await sock.sendMessage(targetDm, {
+          video: buf,
+          mimetype: entry.mimetype || 'video/mp4',
+          caption,
+        });
+      }
+      return;
+    }
+
+    // Audio / voice status
+    await sock.sendMessage(
+      ctx.chatId,
+      {
+        audio: buf,
+        mimetype: entry.mimetype || 'audio/mp4',
+        ptt: entry.ptt ?? false,
+        seconds: entry.seconds,
+      },
+      { quoted: incomingMsg }
+    );
+    if (caption) {
+      await sock.sendMessage(ctx.chatId, { text: caption }, { quoted: incomingMsg });
+    }
+    if (!sameAsCurrentChat && targetDm) {
+      await sock.sendMessage(targetDm, {
+        audio: buf,
+        mimetype: entry.mimetype || 'audio/mp4',
+        ptt: entry.ptt ?? false,
+        seconds: entry.seconds,
+      });
+      if (caption) {
+        await sock.sendMessage(targetDm, { text: caption });
+      }
+    }
+  };
+
+  const formatDisplayTarget = (candidates: string[], fallback?: string): string => {
+    const verifiedPn = candidates.find((c) => c.endsWith('@s.whatsapp.net'));
+    const verifiedDigits = verifiedPn ? normalizePhone(jidUserPart(verifiedPn)) : '';
+    return (
+      candidates.map((c) => lookupKnownUserName(c)).find(Boolean) ||
+      fallback ||
+      (isValidPhone(verifiedDigits) ? `+${verifiedDigits}` : 'this contact')
+    );
+  };
+
+  const wantAll = ctx.args.some((a) => a.toLowerCase() === 'all');
+  const cleanedArgs = ctx.args.filter((a) => a.toLowerCase() !== 'all');
+  const hasExplicitMentionOrArg = Boolean(
+    ctxInfo?.mentionedJid?.length || cleanedArgs.length > 0
+  );
+
+  // Mode A: Direct reply to a status@broadcast message, group status, or status-mention notification card
+  if (stanzaId && !hasExplicitMentionOrArg) {
+    const mentionMeta = getStatusMentionMeta(stanzaId);
+    const cachedBroadcast = ctx.getCachedMessage?.('status@broadcast', stanzaId);
+    const cachedChatMsg = ctx.getCachedMessage?.(ctx.chatId, stanzaId);
+    const cachedRemoteMsg = ctxInfo?.remoteJid
+      ? ctx.getCachedMessage?.(ctxInfo.remoteJid, stanzaId)
+      : undefined;
+    const cachedReplyTarget = cachedBroadcast || cachedChatMsg || cachedRemoteMsg;
+
+    // 1. Direct or alias hit in statusStore (covers groupStatusMentionMessage -> status@broadcast aliases)
+    let storeHit = getStatusById(stanzaId);
+    const refIds = Array.from(
+      new Set([
+        ...extractReferencedStatusIds(cachedReplyTarget?.message),
+        ...extractReferencedStatusIds(quotedRaw),
+        ...extractReferencedStatusIds(quoted),
+      ])
+    );
+    if (!storeHit) {
+      for (const refId of refIds) {
+        const hit = getStatusById(refId);
+        if (hit) {
+          storeHit = hit;
+          break;
+        }
+      }
+    }
+
+    if (storeHit && storeHit.mediaType !== 'text') {
+      try {
+        await deliverStatusToBoth(storeHit);
+        return sameAsCurrentChat
+          ? 'Status media saved in this chat.'
+          : 'Status media saved in this chat and sent to your IB.';
+      } catch (err) {
+        const msg = `Save status failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    }
+
+    // 2. Inline media inside replied message, cached message, or statusMentionMessageInfo.quotedStatus
+    let refBroadcastMsg = cachedBroadcast;
+    if (!refBroadcastMsg) {
+      for (const refId of refIds) {
+        const hit = ctx.getCachedMessage?.('status@broadcast', refId);
+        if (hit) {
+          refBroadcastMsg = hit;
+          break;
+        }
+      }
+    }
+    const ctxQuotedStatus = (
+      ctxInfo as { statusMentionMessageInfo?: { quotedStatus?: unknown } } | undefined
+    )?.statusMentionMessageInfo?.quotedStatus as WAMessage['message'] | undefined;
+
+    const extracted =
+      extractStatusMediaPayload(refBroadcastMsg?.message) ||
+      extractStatusMediaPayload(cachedReplyTarget?.message) ||
+      extractStatusMediaPayload(quotedRaw) ||
+      extractStatusMediaPayload(quoted) ||
+      extractStatusMediaPayload(ctxQuotedStatus);
+
+    if (extracted && hasValidMediaPayload(extracted.inner)) {
+      const authorSeeds = [
+        ...(mentionMeta?.senderJids || []),
+        ctxInfo?.participant || '',
+        (ctxInfo as { participantAlt?: string } | undefined)?.participantAlt || '',
+        refBroadcastMsg?.key?.participant || '',
+        refBroadcastMsg?.key?.participantAlt || '',
+        cachedReplyTarget?.key?.participant || '',
+        cachedReplyTarget?.key?.participantAlt || '',
+      ].filter(Boolean);
+      const senderJids = await expandAuthorCandidates(authorSeeds);
+      const verifiedPhone = await resolveVerifiedPhone(senderJids, mentionMeta?.senderPhone || '');
+      const pushName =
+        mentionMeta?.pushName ||
+        senderJids.map((j) => lookupKnownUserName(j)).find(Boolean) ||
+        (verifiedPhone ? `+${verifiedPhone}` : 'Contact');
+
+      const keySource = refBroadcastMsg?.key || cachedReplyTarget?.key || incomingMsg.key;
+      const syntheticEntry: CachedStatusEntry = {
+        id: refIds[0] || stanzaId,
+        msg: { key: keySource, message: extracted.inner },
+        inner: extracted.inner,
+        mediaType: extracted.mediaType,
+        caption: extracted.caption,
+        mimetype: extracted.mimetype,
+        ptt: extracted.ptt,
+        seconds: extracted.seconds,
+        senderJids,
+        senderPhone: verifiedPhone,
+        pushName,
+        timestampMs: Date.now(),
+      };
+
+      try {
+        await deliverStatusToBoth(syntheticEntry);
+        return sameAsCurrentChat
+          ? 'Status media saved in this chat.'
+          : 'Status media saved in this chat and sent to your IB.';
+      } catch (err) {
+        const msg = `Save status failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    }
+
+    // 3. Status-mention reply fallback: resolve the author/group from the mention card and fetch their cached status
+    const isStatusOrMentionReply = Boolean(
+      mentionMeta ||
+        ctxInfo?.remoteJid === 'status@broadcast' ||
+        isStatusMentionStubMessage(cachedReplyTarget?.message) ||
+        isStatusMentionStubMessage(quotedRaw) ||
+        isStatusMentionStubMessage(quoted)
+    );
+
+    const replyAuthorSeeds = Array.from(
+      new Set(
+        [
+          ...(mentionMeta?.senderJids || []),
+          ctxInfo?.participant || '',
+          (ctxInfo as { participantAlt?: string } | undefined)?.participantAlt || '',
+          cachedReplyTarget?.key?.participant || '',
+          cachedReplyTarget?.key?.participantAlt || '',
+          cachedReplyTarget?.key?.remoteJidAlt || '',
+          ...extractStatusMentionTargets(cachedReplyTarget?.message),
+          ...extractStatusMentionTargets(quotedRaw),
+        ].filter((j) => Boolean(j) && !String(j).endsWith('@g.us') && j !== 'status@broadcast')
+      )
+    );
+
+    const candidateList = await expandAuthorCandidates(replyAuthorSeeds);
+    if (candidateList.length > 0) {
+      let userStatuses = findStatusesForUser(candidateList);
+      if (userStatuses.length === 0 && ctx.isGroup) {
+        userStatuses = findStatusesForGroup(ctx.chatId, candidateList);
+      }
+      if (userStatuses.length > 0) {
+        let chosen = userStatuses[0];
+        if (!wantAll && mentionMeta?.timestampMs && userStatuses.length > 1) {
+          const sortedByDelta = [...userStatuses].sort(
+            (a, b) =>
+              Math.abs(a.timestampMs - mentionMeta.timestampMs) -
+              Math.abs(b.timestampMs - mentionMeta.timestampMs)
+          );
+          if (Math.abs(sortedByDelta[0].timestampMs - mentionMeta.timestampMs) <= 300_000) {
+            chosen = sortedByDelta[0];
+          }
+        }
+        const toSend = wantAll ? userStatuses.slice(0, 5) : [chosen];
+        try {
+          for (let i = 0; i < toSend.length; i += 1) {
+            const note =
+              !wantAll && userStatuses.length > 1
+                ? `1 of ${userStatuses.length} cached media statuses — send ${cmdLabel} @user all to get all`
+                : wantAll && toSend.length > 1
+                  ? `Status ${i + 1} of ${toSend.length}`
+                  : undefined;
+            await deliverStatusToBoth(toSend[i], note);
+          }
+          return `Delivered ${toSend.length} status update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
+        } catch (err) {
+          const msg = `Save status failed: ${(err as Error).message}`;
+          await ctx.reply(msg);
+          return msg;
+        }
+      }
+    }
+
+    // 4. Genuine text status fallback (either cached text status or non-stub broadcast text)
+    if (storeHit?.mediaType === 'text' && storeHit.textBody) {
+      await deliverStatusToBoth(storeHit);
+      return sameAsCurrentChat
+        ? 'Text status saved in this chat.'
+        : 'Text status saved in this chat and sent to your IB.';
+    }
+    if (candidateList.length > 0) {
+      const textHits = findStatusesForUser(candidateList, true).filter(
+        (s) => s.mediaType === 'text' && s.textBody
+      );
+      if (textHits.length > 0) {
+        await deliverStatusToBoth(textHits[0]);
+        return sameAsCurrentChat
+          ? 'Text status saved in this chat.'
+          : 'Text status saved in this chat and sent to your IB.';
+      }
+    }
+
+    if (
+      ctxInfo?.remoteJid === 'status@broadcast' &&
+      !isStatusOrMentionReply &&
+      !extracted
+    ) {
+      const plainText = extractBodyText(cachedReplyTarget?.message || quoted || quotedRaw).trim();
+      if (plainText) {
+        const verifiedPhone = await resolveVerifiedPhone(candidateList, '');
+        const pushName = formatDisplayTarget(candidateList, 'Contact');
+        await deliverStatusToBoth({
+          id: stanzaId,
+          msg: incomingMsg,
+          inner: cachedReplyTarget?.message || quoted || quotedRaw || {},
+          mediaType: 'text',
+          textBody: plainText,
+          senderJids: candidateList,
+          senderPhone: verifiedPhone,
+          pushName,
+          timestampMs: Date.now(),
+        });
+        return sameAsCurrentChat
+          ? 'Text status saved in this chat.'
+          : 'Text status saved in this chat and sent to your IB.';
+      }
+    }
+
+    if (isStatusOrMentionReply || extracted) {
+      const displayTarget = formatDisplayTarget(candidateList, mentionMeta?.pushName);
+      const msg =
+        extracted?.isViewOnce
+          ? 'Unsupported View-Once status media cannot be decrypted from this reply.'
+          : `No cached status media found for *${displayTarget}* yet.\n• WhatsApp only includes a preview inside a group status-mention tag when the original \`status@broadcast\` update wasn't delivered to the bot (or was posted while offline / hidden by status privacy). Ask *${displayTarget}* to view/repost the status while the bot is online, or ensure the bot number is saved in their contacts.`;
+      await ctx.reply(msg);
+      return msg;
+    }
+  }
+
+  // Mode B: Target user via @mention, phone number, replied message's sender, group latest, or 1-on-1 DM peer
+  const rawTargets = extractRawTargetCandidates(incomingMsg, cleanedArgs);
+
+  if (rawTargets.length === 0 && !ctx.isGroup) {
+    const peer = incomingMsg.key?.remoteJidAlt || ctx.chatId;
+    if (peer) rawTargets.push(normalizeBareJid(peer));
+  }
+
+  // In a group with no @user/reply target, look up statuses posted in or mentioning this group
+  if (rawTargets.length === 0 && ctx.isGroup) {
+    let groupStatuses = findStatusesForGroup(ctx.chatId);
+    if (groupStatuses.length === 0) {
+      const mentionAuthors = findLatestGroupMentionAuthors(ctx.chatId);
+      for (const author of mentionAuthors) {
+        const expanded = await expandAuthorCandidates(author.senderJids);
+        const hits = findStatusesForUser(expanded);
+        if (hits.length > 0) {
+          groupStatuses = hits;
+          break;
+        }
+      }
+    }
+    if (groupStatuses.length === 0) {
+      groupStatuses = findStatusesForGroup(ctx.chatId, undefined, true);
+    }
+
+    if (groupStatuses.length > 0) {
+      const toSend = wantAll ? groupStatuses.slice(0, 5) : [groupStatuses[0]];
+      try {
+        for (let i = 0; i < toSend.length; i += 1) {
+          const note =
+            !wantAll && groupStatuses.length > 1
+              ? `1 of ${groupStatuses.length} group status updates — send ${cmdLabel} all to get all`
+              : wantAll && toSend.length > 1
+                ? `Status ${i + 1} of ${toSend.length}`
+                : undefined;
+          await deliverStatusToBoth(toSend[i], note);
+        }
+        return `Delivered ${toSend.length} group status update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
+      } catch (err) {
+        const msg = `Save status failed: ${(err as Error).message}`;
+        await ctx.reply(msg);
+        return msg;
+      }
+    }
+  }
+
+  if (rawTargets.length === 0) {
+    const posters = listActiveStatusPosters(5);
+    const activeHint =
+      posters.length > 0
+        ? `\n\n*Recent cached media status posters:*\n${posters
+            .map((p) =>
+              p.phone
+                ? `• ${p.pushName} (+${p.phone}) — ${p.count} status(es)`
+                : `• ${p.pushName} — ${p.count} status(es)`
+            )
+            .join('\n')}`
+        : '';
+    const msg = groupFirst
+      ? `Reply/tag any group status mention card, or mention someone with \`${ctx.prefix}gcstatussave @user\` (or \`${ctx.prefix}gcstatussave 923001234567\`).${activeHint}`
+      : `Mention someone, pass a phone number, or reply to a status/mention card.\nUsage: \`${ctx.prefix}savestatus @user\` or \`${ctx.prefix}savestatus 923001234567\`${activeHint}`;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  const candidateList = await expandAuthorCandidates(rawTargets);
+  let userStatuses = findStatusesForUser(candidateList);
+  if (userStatuses.length === 0 && ctx.isGroup) {
+    userStatuses = findStatusesForGroup(ctx.chatId, candidateList);
+  }
+  if (userStatuses.length === 0) {
+    userStatuses = findStatusesForUser(candidateList, true);
+  }
+
+  if (userStatuses.length === 0) {
+    const displayTarget = formatDisplayTarget(candidateList);
+    const msg = `No cached status found for *${displayTarget}* yet.\n• Ask them to post a status while the bot is online (and make sure the bot's number is visible in their status privacy), or reply directly to their status mention card with \`${cmdLabel}\`.`;
+    await ctx.reply(msg);
+    return msg;
+  }
+
+  const toSend = wantAll ? userStatuses.slice(0, 5) : [userStatuses[0]];
+  try {
+    for (let i = 0; i < toSend.length; i += 1) {
+      const note =
+        !wantAll && userStatuses.length > 1
+          ? `1 of ${userStatuses.length} cached statuses — send ${cmdLabel} @user all to get all`
+          : wantAll && toSend.length > 1
+            ? `Status ${i + 1} of ${toSend.length}`
+            : undefined;
+      await deliverStatusToBoth(toSend[i], note);
+    }
+    return `Delivered ${toSend.length} status update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
+  } catch (err) {
+    const msg = `Save status failed: ${(err as Error).message}`;
+    await ctx.reply(msg);
+    return msg;
+  }
+}
 
 export const mediaCommands: BotCommand[] = [
   {
@@ -719,323 +1280,17 @@ export const mediaCommands: BotCommand[] = [
       'Kisi ko bhi mention/number/reply karke uska WhatsApp Status media (photo/video/audio) isi chat aur aapke inbox (IB) mein save kare',
     usage: 'savestatus [@user | number | reply] [all]',
     cooldownSeconds: 2,
-    execute: async (ctx) => {
-      if (!ctx.sock || !ctx.msg || ctx.isSimulated) {
-        const msg =
-          'Mention `@user`, pass a phone number, or reply to a WhatsApp Status/message with `.savestatus` to save their status media in both this chat and your IB.';
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      const sock = ctx.sock;
-      const incomingMsg = ctx.msg;
-      const ctxInfo = extractContextInfo(incomingMsg.message);
-      const stanzaId = ctxInfo?.stanzaId || '';
-      const quoted = extractQuotedMessage(incomingMsg);
-
-      const ownBotPhone = normalizePhone(jidUserPart(sock.user?.id));
-      const targetDm =
-        incomingMsg.key?.fromMe && ownBotPhone
-          ? `${ownBotPhone}@s.whatsapp.net`
-          : isValidPhone(ctx.senderNumber)
-            ? `${ctx.senderNumber}@s.whatsapp.net`
-            : normalizeBareJid(ctx.senderJid);
-
-      const sameAsCurrentChat =
-        Boolean(targetDm) &&
-        (normalizeBareJid(targetDm) === normalizeBareJid(ctx.chatId) ||
-          (Boolean(jidUserPart(targetDm)) && jidUserPart(targetDm) === jidUserPart(ctx.chatId)));
-
-      const resolveVerifiedPhone = async (jids: string[], fallbackPhone: string): Promise<string> => {
-        if (isValidPhone(fallbackPhone)) return fallbackPhone;
-        for (const jid of jids) {
-          if (jid.endsWith('@s.whatsapp.net')) {
-            const p = normalizePhone(jidUserPart(jid));
-            if (isValidPhone(p)) return p;
-          }
-        }
-        for (const jid of jids) {
-          if (isLidUser(jid) && sock.signalRepository?.lidMapping?.getPNForLID) {
-            try {
-              const pn = await sock.signalRepository.lidMapping.getPNForLID(normalizeBareJid(jid));
-              const p = normalizePhone(jidUserPart(pn));
-              if (isValidPhone(p)) return p;
-            } catch {
-              // Ignore LID mapping miss
-            }
-          }
-        }
-        if (ctx.isGroup && jids.length > 0) {
-          try {
-            const meta = await getCachedGroupMetadata(sock, ctx.chatId);
-            for (const participant of meta.participants) {
-              if (participantMatchesAny(participant, jids)) {
-                const candidate = participant.phoneNumber || (participant.id?.endsWith('@s.whatsapp.net') ? participant.id : '');
-                const p = normalizePhone(jidUserPart(candidate));
-                if (isValidPhone(p)) return p;
-              }
-            }
-          } catch {
-            // Ignore group metadata lookup error
-          }
-        }
-        return '';
-      };
-
-      const deliverStatusToBoth = async (
-        entry: CachedStatusEntry,
-        footerNote?: string
-      ): Promise<void> => {
-        const buf = await getOrDownloadStatusBuffer(sock, entry);
-        if (!buf || buf.length === 0) {
-          throw new Error('Status media download or decryption failed (payload may have expired).');
-        }
-
-        const verifiedPhone = await resolveVerifiedPhone(entry.senderJids, entry.senderPhone);
-        const header = `*Saved Status* (${entry.pushName}${verifiedPhone && !entry.pushName.includes(verifiedPhone) ? ` • +${verifiedPhone}` : ''})`;
-        const noteSuffix = footerNote ? `\n_${footerNote}_` : '';
-        const caption = [header, entry.caption ? `\n${entry.caption}` : '', noteSuffix]
-          .filter(Boolean)
-          .join('')
-          .trim();
-
-        if (entry.mediaType === 'image') {
-          await sock.sendMessage(
-            ctx.chatId,
-            { image: buf, mimetype: entry.mimetype || 'image/jpeg', caption },
-            { quoted: incomingMsg }
-          );
-          if (!sameAsCurrentChat && targetDm) {
-            await sock.sendMessage(targetDm, {
-              image: buf,
-              mimetype: entry.mimetype || 'image/jpeg',
-              caption,
-            });
-          }
-          return;
-        }
-
-        if (entry.mediaType === 'video') {
-          await sock.sendMessage(
-            ctx.chatId,
-            { video: buf, mimetype: entry.mimetype || 'video/mp4', caption },
-            { quoted: incomingMsg }
-          );
-          if (!sameAsCurrentChat && targetDm) {
-            await sock.sendMessage(targetDm, {
-              video: buf,
-              mimetype: entry.mimetype || 'video/mp4',
-              caption,
-            });
-          }
-          return;
-        }
-
-        // Audio / voice status: always send the downloaded audio buffer + sender/caption details
-        await sock.sendMessage(
-          ctx.chatId,
-          {
-            audio: buf,
-            mimetype: entry.mimetype || 'audio/mp4',
-            ptt: entry.ptt ?? false,
-            seconds: entry.seconds,
-          },
-          { quoted: incomingMsg }
-        );
-        if (caption) {
-          await sock.sendMessage(ctx.chatId, { text: caption }, { quoted: incomingMsg });
-        }
-        if (!sameAsCurrentChat && targetDm) {
-          await sock.sendMessage(targetDm, {
-            audio: buf,
-            mimetype: entry.mimetype || 'audio/mp4',
-            ptt: entry.ptt ?? false,
-            seconds: entry.seconds,
-          });
-          if (caption) {
-            await sock.sendMessage(targetDm, { text: caption });
-          }
-        }
-      };
-
-      // Mode A: Direct reply to a status@broadcast message (or cached status ID)
-      const isDirectStatusReply = Boolean(
-        stanzaId &&
-          (ctxInfo?.remoteJid === 'status@broadcast' ||
-            getStatusById(stanzaId) ||
-            ctx.getCachedMessage?.('status@broadcast', stanzaId))
-      );
-
-      if (isDirectStatusReply) {
-        const storeHit = getStatusById(stanzaId);
-        if (storeHit) {
-          try {
-            await deliverStatusToBoth(storeHit);
-            return sameAsCurrentChat
-              ? 'Status media saved in this chat.'
-              : 'Status media saved in this chat and sent to your IB.';
-          } catch (err) {
-            const msg = `Save status failed: ${(err as Error).message}`;
-            await ctx.reply(msg);
-            return msg;
-          }
-        }
-
-        const cachedBroadcast = ctx.getCachedMessage?.('status@broadcast', stanzaId);
-        const sourceMsg = cachedBroadcast?.message || quoted || ctxInfo?.quotedMessage;
-        const extracted = extractStatusMediaPayload(sourceMsg);
-
-        if (!extracted) {
-          logger.info('savestatus', `Ignored text-only or non-media status reply (${stanzaId}).`);
-          const msg =
-            'Text-only statuses are ignored — only WhatsApp status photos, videos, and audio statuses can be downloaded.';
-          await ctx.reply(msg);
-          return msg;
-        }
-
-        if (!hasValidMediaPayload(extracted.inner)) {
-          logger.info(
-            'savestatus',
-            `Ignored ${extracted.isViewOnce ? 'unsupported view-once' : 'incomplete'} status media (${stanzaId}).`
-          );
-          const msg = extracted.isViewOnce
-            ? 'Unsupported View-Once status media cannot be decrypted from this reply.'
-            : 'Status media key is missing or expired. Ask the contact to repost or view the status while the bot is online.';
-          await ctx.reply(msg);
-          return msg;
-        }
-
-        const participantBare = ctxInfo?.participant ? normalizeBareJid(ctxInfo.participant) : '';
-        const senderJids = participantBare ? [participantBare] : [];
-        const verifiedPhone = await resolveVerifiedPhone(senderJids, '');
-        const pushName =
-          lookupKnownUserName(ctxInfo?.participant) ||
-          (verifiedPhone ? `+${verifiedPhone}` : 'Contact');
-
-        const syntheticEntry: CachedStatusEntry = {
-          id: stanzaId,
-          msg: cachedBroadcast
-            ? { key: cachedBroadcast.key, message: extracted.inner }
-            : { key: incomingMsg.key, message: extracted.inner },
-          inner: extracted.inner,
-          mediaType: extracted.mediaType,
-          caption: extracted.caption,
-          mimetype: extracted.mimetype,
-          ptt: extracted.ptt,
-          seconds: extracted.seconds,
-          senderJids,
-          senderPhone: verifiedPhone,
-          pushName,
-          timestampMs: Date.now(),
-        };
-
-        try {
-          await deliverStatusToBoth(syntheticEntry);
-          return sameAsCurrentChat
-            ? 'Status media saved in this chat.'
-            : 'Status media saved in this chat and sent to your IB.';
-        } catch (err) {
-          const msg = `Save status failed: ${(err as Error).message}`;
-          await ctx.reply(msg);
-          return msg;
-        }
-      }
-
-      // Mode B: Target user via @mention, phone number, replied message's sender, or 1-on-1 DM peer
-      const wantAll = ctx.args.some((a) => a.toLowerCase() === 'all');
-      const cleanedArgs = ctx.args.filter((a) => a.toLowerCase() !== 'all');
-      const rawTargets = extractRawTargetCandidates(incomingMsg, cleanedArgs);
-
-      if (rawTargets.length === 0 && !ctx.isGroup) {
-        const peer = incomingMsg.key?.remoteJidAlt || ctx.chatId;
-        if (peer) rawTargets.push(normalizeBareJid(peer));
-      }
-
-      if (rawTargets.length === 0) {
-        const posters = listActiveStatusPosters(5);
-        const activeHint =
-          posters.length > 0
-            ? `\n\n*Recent cached media status posters:*\n${posters
-                .map((p) =>
-                  p.phone
-                    ? `• ${p.pushName} (+${p.phone}) — ${p.count} status(es)`
-                    : `• ${p.pushName} — ${p.count} status(es)`
-                )
-                .join('\n')}`
-            : '';
-        const msg = `Mention someone, pass a phone number, or reply to a status/message.\nUsage: \`${ctx.prefix}savestatus @user\` or \`${ctx.prefix}savestatus 923001234567\`${activeHint}`;
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      const resolvedCandidates = new Set<string>(rawTargets);
-      for (const raw of rawTargets) {
-        const bare = normalizeBareJid(raw);
-        if (!bare) continue;
-        resolvedCandidates.add(bare);
-        if (isLidUser(bare) && sock.signalRepository?.lidMapping?.getPNForLID) {
-          try {
-            const pn = await sock.signalRepository.lidMapping.getPNForLID(bare);
-            if (pn) resolvedCandidates.add(normalizeBareJid(pn));
-          } catch {
-            // Ignore LID mapping error
-          }
-        } else if (bare.endsWith('@s.whatsapp.net') && sock.signalRepository?.lidMapping?.getLIDForPN) {
-          try {
-            const lid = await sock.signalRepository.lidMapping.getLIDForPN(bare);
-            if (lid) resolvedCandidates.add(normalizeBareJid(lid));
-          } catch {
-            // Ignore PN mapping error
-          }
-        }
-      }
-
-      if (ctx.isGroup) {
-        try {
-          const meta = await getCachedGroupMetadata(sock, ctx.chatId);
-          for (const p of meta.participants) {
-            if (participantMatchesAny(p, Array.from(resolvedCandidates))) {
-              if (p.id) resolvedCandidates.add(normalizeBareJid(p.id));
-              if (p.lid) resolvedCandidates.add(normalizeBareJid(p.lid));
-              if (p.phoneNumber) resolvedCandidates.add(normalizeBareJid(p.phoneNumber));
-            }
-          }
-        } catch {
-          // Ignore group metadata lookup failure
-        }
-      }
-
-      const candidateList = Array.from(resolvedCandidates);
-      const userStatuses = findStatusesForUser(candidateList);
-      if (userStatuses.length === 0) {
-        const verifiedPn = candidateList.find((c) => c.endsWith('@s.whatsapp.net'));
-        const verifiedDigits = verifiedPn ? normalizePhone(jidUserPart(verifiedPn)) : '';
-        const displayTarget =
-          candidateList.map((c) => lookupKnownUserName(c)).find(Boolean) ||
-          (isValidPhone(verifiedDigits) ? `+${verifiedDigits}` : 'this contact');
-        const msg = `No cached photo/video/audio status found for *${displayTarget}* yet.\n• Text-only statuses are ignored. Ask them to post a photo/video/audio status while the bot is online, or reply directly to their status with \`${ctx.prefix}savestatus\`.`;
-        await ctx.reply(msg);
-        return msg;
-      }
-
-      const toSend = wantAll ? userStatuses.slice(0, 5) : [userStatuses[0]];
-      try {
-        for (let i = 0; i < toSend.length; i += 1) {
-          const note =
-            !wantAll && userStatuses.length > 1
-              ? `1 of ${userStatuses.length} cached media statuses — send ${ctx.prefix}savestatus @user all to get all`
-              : wantAll && toSend.length > 1
-                ? `Status ${i + 1} of ${toSend.length}`
-                : undefined;
-          await deliverStatusToBoth(toSend[i], note);
-        }
-        return `Delivered ${toSend.length} status media update(s) in chat${sameAsCurrentChat ? '' : ' and IB'}.`;
-      } catch (err) {
-        const msg = `Save status failed: ${(err as Error).message}`;
-        await ctx.reply(msg);
-        return msg;
-      }
-    },
+    execute: async (ctx) => executeSaveStatusCommand(ctx, false),
+  },
+  {
+    name: 'gcstatussave',
+    aliases: ['savestatusgc', 'gcstatusdl', 'statussavegc', 'gcsavestatus'],
+    category: 'media',
+    description:
+      'Group mein lagaya ya mention kiya hua WhatsApp Status tag/reply ya @mention karke isi chat aur IB mein save kare',
+    usage: 'gcstatussave [reply to status mention | @user | number] [all]',
+    cooldownSeconds: 2,
+    execute: async (ctx) => executeSaveStatusCommand(ctx, true),
   },
   {
     name: 'save',
@@ -1091,8 +1346,26 @@ export const mediaCommands: BotCommand[] = [
       }
 
       const quoted = extractQuotedMessage(ctx.msg);
-      const statusHit = stanzaId ? getStatusById(stanzaId) : undefined;
-      if (statusHit) {
+      let statusHit = stanzaId ? getStatusById(stanzaId) : undefined;
+      const cachedReplyTarget = stanzaId
+        ? ctx.getCachedMessage?.('status@broadcast', stanzaId) ||
+          ctx.getCachedMessage?.(ctx.chatId, stanzaId) ||
+          (ctxInfo?.remoteJid ? ctx.getCachedMessage?.(ctxInfo.remoteJid, stanzaId) : undefined)
+        : undefined;
+      if (!statusHit) {
+        for (const refId of [
+          ...extractReferencedStatusIds(cachedReplyTarget?.message),
+          ...extractReferencedStatusIds(ctxInfo?.quotedMessage),
+          ...extractReferencedStatusIds(quoted),
+        ]) {
+          const hit = getStatusById(refId);
+          if (hit) {
+            statusHit = hit;
+            break;
+          }
+        }
+      }
+      if (statusHit && statusHit.mediaType !== 'text') {
         try {
           const buf = await getOrDownloadStatusBuffer(ctx.sock, statusHit);
           if (!buf || buf.length === 0) {
@@ -1134,9 +1407,12 @@ export const mediaCommands: BotCommand[] = [
         }
       }
 
-      const extractedQuotedStatus = extractStatusMediaPayload(quoted || ctxInfo?.quotedMessage);
+      const extractedQuotedStatus =
+        extractStatusMediaPayload(cachedReplyTarget?.message) ||
+        extractStatusMediaPayload(ctxInfo?.quotedMessage) ||
+        extractStatusMediaPayload(quoted);
       let inner = extractedQuotedStatus?.inner || unwrapViewOnce(quoted) || unwrapMessage(quoted) || quoted;
-      let origKey = ctx.msg.key;
+      let origKey = cachedReplyTarget?.key || ctx.msg.key;
 
       // Check chat cache, status@broadcast cache, and disk metadata if WhatsApp stripped directPath/url
       if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
@@ -1166,6 +1442,54 @@ export const mediaCommands: BotCommand[] = [
           if (diskMeta?.message && hasValidMediaPayload(diskMeta.message)) {
             inner = diskMeta.message;
             origKey = diskMeta.key || origKey;
+          }
+        }
+      }
+
+      // If replying to a status-mention stub without inline media, look up the author's cached status
+      if ((!inner || !hasValidMediaPayload(inner)) && stanzaId) {
+        const mentionMeta = getStatusMentionMeta(stanzaId);
+        const isMentionReply =
+          Boolean(mentionMeta) ||
+          ctxInfo?.remoteJid === 'status@broadcast' ||
+          isStatusMentionStubMessage(cachedReplyTarget?.message) ||
+          isStatusMentionStubMessage(ctxInfo?.quotedMessage);
+        if (isMentionReply) {
+          const authorCandidates = new Set<string>([
+            ...(mentionMeta?.senderJids || []),
+            ...(ctxInfo?.participant ? [normalizeBareJid(ctxInfo.participant)] : []),
+            ...(cachedReplyTarget?.key?.participant
+              ? [normalizeBareJid(cachedReplyTarget.key.participant)]
+              : []),
+          ]);
+          for (const raw of Array.from(authorCandidates)) {
+            if (isLidUser(raw) && ctx.sock.signalRepository?.lidMapping?.getPNForLID) {
+              const pn = await ctx.sock.signalRepository.lidMapping.getPNForLID(raw).catch(() => null);
+              if (pn) authorCandidates.add(normalizeBareJid(pn));
+            }
+          }
+          const hits = findStatusesForUser(Array.from(authorCandidates));
+          const fallbackEntry = hits[0] || (ctx.isGroup ? findStatusesForGroup(ctx.chatId, Array.from(authorCandidates))[0] : undefined);
+          if (fallbackEntry) {
+            const buf = await getOrDownloadStatusBuffer(ctx.sock, fallbackEntry).catch(() => null);
+            if (buf && buf.length > 0) {
+              const senderTag = fallbackEntry.senderPhone
+                ? `${fallbackEntry.pushName} (+${fallbackEntry.senderPhone})`
+                : fallbackEntry.pushName;
+              const caption = `*Saved Status* (${senderTag})${fallbackEntry.caption ? `\n${fallbackEntry.caption}` : ''}`;
+              if (fallbackEntry.mediaType === 'image') {
+                await ctx.sock.sendMessage(targetDm, { image: buf, mimetype: fallbackEntry.mimetype || 'image/jpeg', caption });
+              } else if (fallbackEntry.mediaType === 'video') {
+                await ctx.sock.sendMessage(targetDm, { video: buf, mimetype: fallbackEntry.mimetype || 'video/mp4', caption });
+              } else {
+                await ctx.sock.sendMessage(targetDm, { audio: buf, mimetype: fallbackEntry.mimetype || 'audio/mp4', ptt: fallbackEntry.ptt ?? false, seconds: fallbackEntry.seconds });
+                await ctx.sock.sendMessage(targetDm, { text: caption });
+              }
+              if (targetDm !== ctx.chatId) {
+                await ctx.reply(`Saved ${fallbackEntry.mediaType} status to your inbox.`);
+              }
+              return `Saved ${fallbackEntry.mediaType} status to inbox.`;
+            }
           }
         }
       }
